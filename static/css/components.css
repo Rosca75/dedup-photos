@@ -1,0 +1,153 @@
+/* components.css — Buttons, badges, toast, confirm dialog, browse dialog. */
+
+/* Buttons */
+.btn {
+  padding: 0.5rem 1.2rem;
+  border: none;
+  border-radius: 6px;
+  font-family: var(--font);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-primary { background: var(--accent); color: var(--bg); }
+.btn-primary:hover { filter: brightness(1.15); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-danger { background: var(--danger); color: #fff; }
+.btn-danger:hover { filter: brightness(1.15); }
+.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Settings toggle button in top bar */
+.settings-toggle {
+  padding: 0.4rem 0.7rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  font-family: var(--font);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.settings-toggle:hover { border-color: var(--accent); color: var(--text); }
+
+/* Mismatch report button */
+.btn-mismatch {
+  padding: 0.25rem 0.5rem;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font-family: var(--font);
+  font-size: 0.68rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-mismatch:hover { border-color: var(--danger); color: var(--danger); }
+
+/* Toast notifications */
+#toast-container {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 0.5rem;
+  z-index: 9999;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  padding: 0.65rem 1rem;
+  border-radius: 8px;
+  font-family: var(--font);
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #fff;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  animation: toastIn 0.25s ease forwards;
+  max-width: 380px;
+  word-break: break-word;
+}
+.toast.removing { animation: toastOut 0.2s ease forwards; }
+.toast-success { background: var(--success); }
+.toast-error { background: var(--danger); }
+@keyframes toastIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes toastOut { from { opacity: 1; transform: translateY(0); } to { opacity: 0; transform: translateY(12px); } }
+
+/* Confirm overlay dialog */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+}
+.confirm-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.5rem;
+  max-width: 420px;
+  width: 90%;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  text-align: center;
+}
+.confirm-box p { margin-bottom: 1rem; font-size: 0.85rem; word-break: break-all; }
+.confirm-box .btn-row { display: flex; gap: 0.5rem; justify-content: center; }
+
+/* Browse modal dialog */
+.browse-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+}
+.browse-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.25rem;
+  max-width: 520px;
+  width: 90%;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+.browse-box h3 { font-size: 0.95rem; margin-bottom: 0.75rem; }
+.browse-current { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.5rem; word-break: break-all; }
+.browse-list {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 40vh;
+}
+.browse-item {
+  padding: 0.4rem 0.65rem;
+  cursor: pointer;
+  font-size: 0.78rem;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.15s;
+}
+.browse-item:hover { background: var(--bg); }
+.browse-item:last-child { border-bottom: none; }
+.browse-actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; justify-content: flex-end; }
+
+/* Responsive: collapse sidebar on small screens */
+@media (max-width: 768px) {
+  .app-layout {
+    grid-template-areas: "topbar" "main" "status";
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr auto;
+  }
+  .sidebar { display: none; }
+  .settings-pane { display: none; }
+}

@@ -1,0 +1,38 @@
+/* base.css — CSS variables, reset, typography, body styling. */
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:         #0f1419;
+  --bg-card:    #1a2332;
+  --bg-hover:   #253345;
+  --border:     #2a3a4e;
+  --text:       #e2e8f0;
+  --muted:      #5a6a7a;
+  --accent:     #2dd4bf;
+  --danger:     #ef4444;
+  --success:    #22c55e;
+  --warning:    #f59e0b;
+  --exact:      #8b5cf6;
+  --perceptual: #06b6d4;
+  --font:       'SF Mono', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+}
+
+html { font-size: 14px; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  line-height: 1.6;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+a { color: var(--accent); text-decoration: none; }
+
+/* Scrollbar styling for dark theme */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
