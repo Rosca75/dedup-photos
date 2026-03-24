@@ -435,10 +435,69 @@ func HashAllImages(paths []string, numWorkers int) []ImageHash {
 }
 
 // =============================================================================
-// HashAllImagesWithContext — Like HashAllImages but supports cancellation
+// ComputePHash — Average-based perceptual hash (alternative algorithm)
 // =============================================================================
 
-func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int) []ImageHash {
+// ComputePHash computes a simple average-based perceptual hash. Unlike dHash
+// which compares adjacent pixels, pHash compares each pixel to the overall
+// average brightness. This can be more robust for certain types of edits.
+func ComputePHash(path string) (uint64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open image %s: %w", path, err)
+	}
+	defer file.Close()
+
+	img, _, err := image.Decode(file)
+	if err != nil {
+		return 0, fmt.Errorf("failed to decode image %s: %w", path, err)
+	}
+
+	bounds := img.Bounds()
+	srcWidth := bounds.Max.X - bounds.Min.X
+	srcHeight := bounds.Max.Y - bounds.Min.Y
+
+	const size = 8
+	gray := make([][]uint32, size)
+	for y := 0; y < size; y++ {
+		gray[y] = make([]uint32, size)
+	}
+
+	var total uint64
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			srcX := bounds.Min.X + (x * srcWidth / size)
+			srcY := bounds.Min.Y + (y * srcHeight / size)
+			r, g, b, _ := img.At(srcX, srcY).RGBA()
+			luminance := (299*r + 587*g + 114*b) / 1000
+			gray[y][x] = luminance
+			total += uint64(luminance)
+		}
+	}
+
+	avg := total / (size * size)
+
+	var hash uint64
+	bitPosition := 0
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			if uint64(gray[y][x]) > avg {
+				hash |= 1 << uint(bitPosition)
+			}
+			bitPosition++
+		}
+	}
+
+	return hash, nil
+}
+
+// =============================================================================
+// HashAllImagesWithContext — Parallel hashing with cancellation support
+// =============================================================================
+
+// HashAllImagesWithContext is like HashAllImages but supports cancellation via
+// a context. It also supports choosing the perceptual hash algorithm.
+func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int, algorithm string) []ImageHash {
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
 	}
@@ -448,7 +507,7 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 		return []ImageHash{}
 	}
 
-	fmt.Printf("[hasher] Starting %d workers to hash %d images (with cancellation support)...\n", numWorkers, totalImages)
+	fmt.Printf("[hasher] Starting %d workers to hash %d images (algorithm: %s)...\n", numWorkers, totalImages, algorithm)
 
 	jobs := make(chan string, totalImages)
 	results := make(chan ImageHash, totalImages)
@@ -460,11 +519,9 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 		go func() {
 			defer wg.Done()
 			for path := range jobs {
-				// Check for cancellation before processing each image.
-				select {
-				case <-ctx.Done():
+				// Check for cancellation.
+				if ctx.Err() != nil {
 					return
-				default:
 				}
 
 				result := ImageHash{Path: path}
@@ -477,27 +534,54 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 				}
 				result.XXHash = xxh
 
-				dh, err := ComputeDHash(path)
-				if err != nil {
-					result.Error = err
-					results <- result
-					continue
+				// Choose perceptual hash algorithm.
+				switch algorithm {
+				case "phash":
+					ph, err := ComputePHash(path)
+					if err != nil {
+						result.Error = err
+						results <- result
+						continue
+					}
+					result.DHash = ph // Store in same field for compatibility.
+				case "both":
+					// Use combined hash: XOR of dHash and pHash for stricter matching.
+					dh, err1 := ComputeDHash(path)
+					ph, err2 := ComputePHash(path)
+					if err1 != nil && err2 != nil {
+						result.Error = err1
+						results <- result
+						continue
+					}
+					if err1 == nil && err2 == nil {
+						result.DHash = dh ^ ph
+					} else if err1 == nil {
+						result.DHash = dh
+					} else {
+						result.DHash = ph
+					}
+				default: // "dhash"
+					dh, err := ComputeDHash(path)
+					if err != nil {
+						result.Error = err
+						results <- result
+						continue
+					}
+					result.DHash = dh
 				}
-				result.DHash = dh
 
 				results <- result
 			}
 		}()
 	}
 
-	// Send jobs, but stop early if cancelled.
+	// Send jobs, checking for cancellation.
 	go func() {
 		for _, path := range paths {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				break
-			case jobs <- path:
 			}
+			jobs <- path
 		}
 		close(jobs)
 	}()
@@ -511,8 +595,15 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 	processed := 0
 
 	for result := range results {
+		if ctx.Err() != nil {
+			// Drain remaining results.
+			for range results {
+			}
+			break
+		}
 		allResults = append(allResults, result)
 		processed++
+
 		if processed%100 == 0 || processed == totalImages {
 			fmt.Printf("[hasher] Progress: %d / %d images hashed\n", processed, totalImages)
 		}
@@ -521,10 +612,6 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 	fmt.Printf("[hasher] Done! Hashed %d images.\n", len(allResults))
 	return allResults
 }
-
-// =============================================================================
-// HammingDistance — Count the number of differing bits between two hashes
-// =============================================================================
 
 // HammingDistance computes the Hamming distance between two 64-bit integers.
 // The Hamming distance is the number of bit positions where the two values
