@@ -1,0 +1,23 @@
+<!-- components/browse.html -->
+<div class="scan-bar">
+  <input type="text" id="scan-path" placeholder="/path/to/photos" aria-label="Folder path">
+  <button class="btn btn-primary" id="browse-button">Browse...</button>
+</div>
+
+<script type="module">
+document.getElementById('browse-button').addEventListener('click', async () => {
+  try {
+    const dirHandle = await window.showDirectoryPicker();
+    const path = dirHandle.name;
+    document.getElementById('scan-path').value = path;
+    const response = await fetch('/api/set-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path })
+    });
+    if (!response.ok) throw new Error('Failed to set folder');
+  } catch (error) {
+    console.error('Error:', error);
+  }
+});
+</script>
