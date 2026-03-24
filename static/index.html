@@ -7,60 +7,96 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="container">
-    <!-- Header -->
-    <header>
-      <h1>DedupPhotos</h1>
-      <p>Find and remove duplicate photos across your library</p>
-    </header>
+<div class="container">
 
-    <!-- Scan Input Bar -->
-    <div id="scan-section"></div>
+  <header>
+    <h1>DedupPhotos</h1>
+    <p>Find and remove duplicate photos across your library</p>
+  </header>
 
-    <!-- Stats Bar -->
-    <div class="stats-bar" id="stats-bar" style="display:none">
-      <div class="stat-card">
-        <div class="label">Files Scanned</div>
-        <div class="value" id="stat-files">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Duplicate Groups</div>
-        <div class="value" id="stat-groups">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Space Savings</div>
-        <div class="value" id="stat-savings">0 B</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Duration</div>
-        <div class="value" id="stat-duration">--</div>
-      </div>
+  <!-- Scan Bar -->
+  <div class="scan-bar">
+    <input type="text" id="scan-path" placeholder="/path/to/photos" aria-label="Folder path">
+    <button class="btn" style="background:var(--card);border:1px solid var(--border);color:var(--text)" id="browse-btn">Browse</button>
+    <div class="threshold-group">
+      <label for="scan-threshold">Threshold:</label>
+      <input type="number" id="scan-threshold" value="10" min="0" max="64" aria-label="Similarity threshold">
     </div>
+    <button class="settings-toggle" id="settings-toggle-btn">Settings</button>
+    <button class="btn btn-primary" id="scan-btn">Scan</button>
+    <button class="btn btn-danger" id="cancel-btn" style="display:none">Cancel</button>
+  </div>
 
-    <!-- Progress -->
-    <div class="progress-section" id="progress-section">
-      <div class="progress-header">
-        <span id="progress-phase">Scanning...</span>
-        <span id="progress-counts">0 / 0</span>
+  <!-- Settings Panel (hidden by default) -->
+  <div class="settings-panel" id="settings-panel">
+    <div class="settings-grid">
+      <div class="settings-field">
+        <label for="setting-algorithm">Algorithm</label>
+        <select id="setting-algorithm">
+          <option value="dhash">dHash (default)</option>
+          <option value="phash">pHash</option>
+          <option value="both">Both (dHash fallback)</option>
+        </select>
       </div>
-      <div class="progress-track">
-        <div class="progress-fill" id="progress-fill"></div>
+      <div class="settings-field">
+        <label for="setting-extensions">Extensions (comma-separated)</label>
+        <input type="text" id="setting-extensions" placeholder="jpg,png,tiff,webp" value="">
       </div>
-    </div>
-
-    <!-- Results -->
-    <div id="results-area">
-      <div class="empty-state" id="empty-state">
-        <div class="icon">&#128247;</div>
-        <p>Enter a folder path above and click Scan to find duplicate photos.</p>
+      <div class="settings-field">
+        <label for="setting-min-width">Min width (px, 0=none)</label>
+        <input type="number" id="setting-min-width" value="0" min="0">
       </div>
-      <div class="groups" id="groups-container"></div>
+      <div class="settings-field">
+        <label for="setting-max-height">Max height (px, 0=none)</label>
+        <input type="number" id="setting-max-height" value="0" min="0">
+      </div>
     </div>
   </div>
 
-  <!-- Toast Container -->
-  <div id="toast-container"></div>
+  <!-- Stats Bar -->
+  <div class="stats-bar" id="stats-bar" style="display:none">
+    <div class="stat-card">
+      <div class="label">Files Scanned</div>
+      <div class="value" id="stat-files">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Duplicate Groups</div>
+      <div class="value" id="stat-groups">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Space Savings</div>
+      <div class="value" id="stat-savings">0 B</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Duration</div>
+      <div class="value" id="stat-duration">--</div>
+    </div>
+  </div>
 
-  <script src="/static/app.js"></script>
+  <!-- Progress -->
+  <div class="progress-section" id="progress-section">
+    <div class="progress-header">
+      <span id="progress-phase">Scanning...</span>
+      <span id="progress-counts">0 / 0</span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div id="results-area">
+    <div class="empty-state" id="empty-state">
+      <div class="icon">&#128247;</div>
+      <p>Enter a folder path above and click Scan to find duplicate photos.</p>
+    </div>
+    <div class="groups" id="groups-container"></div>
+  </div>
+
+</div>
+
+<div id="toast-container"></div>
+
+<script src="/static/app.js"></script>
 </body>
 </html>
