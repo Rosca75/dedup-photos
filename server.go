@@ -19,7 +19,7 @@
 //   The frontend (index.html) communicates with this server via JSON APIs:
 //   - POST /api/scan     → Start scanning a directory for duplicates.
 //   - GET  /api/results  → Poll for scan progress and results.
-//   - POST /api/delete   → Delete (rename) a duplicate file.
+//   - POST /api/delete   → Permanently delete a duplicate file.
 //   - GET  /api/thumbnail→ Get a resized thumbnail of an image.
 //
 // THREAD SAFETY:
@@ -550,12 +550,9 @@ func handleResults(w http.ResponseWriter, r *http.Request) {
 // handleDelete — Delete (rename) a file
 // =============================================================================
 
-// handleDelete handles POST requests to /api/delete. Instead of permanently
-// deleting the file (which is scary and irreversible!), we rename it by
-// appending ".deleted" to the filename. This way, the user can manually
-// recover the file if they change their mind.
-//
-// For example: /photos/sunset.jpg → /photos/sunset.jpg.deleted
+// handleDelete handles POST requests to /api/delete. It permanently removes
+// the file from disk. This is irreversible — the file cannot be recovered
+// after deletion (unless the user has backups).
 func handleDelete(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 
@@ -611,22 +608,17 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// -------------------------------------------------------------------------
-	// SAFETY: Rename the file instead of deleting it
+	// Permanently delete the file from disk
 	// -------------------------------------------------------------------------
 	//
-	// os.Rename moves/renames a file. We append ".deleted" to the filename
-	// so the user can find and recover it later. This is much safer than
-	// os.Remove which would permanently delete the file.
-	//
-	// Example: /photos/sunset.jpg → /photos/sunset.jpg.deleted
-	deletedPath := req.Path + ".deleted"
-	err = os.Rename(req.Path, deletedPath)
+	// os.Remove deletes the file. This is irreversible.
+	err = os.Remove(req.Path)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
-			"error":   fmt.Sprintf("failed to rename file: %v", err),
+			"error":   fmt.Sprintf("failed to delete file: %v", err),
 		})
 		return
 	}
@@ -634,12 +626,12 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	// Remove the thumbnail from cache since the file is gone.
 	thumbnailCache.Delete(req.Path)
 
-	log.Printf("POST /api/delete — renamed %s to %s", req.Path, deletedPath)
+	log.Printf("POST /api/delete — permanently deleted %s", req.Path)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"message": fmt.Sprintf("File renamed to %s", deletedPath),
+		"message": fmt.Sprintf("File permanently deleted: %s", req.Path),
 	})
 }
 
