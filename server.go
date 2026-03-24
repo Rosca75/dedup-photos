@@ -38,10 +38,9 @@
 package main
 
 import (
-	"bytes"   // For working with byte buffers (thumbnail encoding).
-	_ "embed" // Required for the //go:embed directive below. The blank import
-	// ("_") tells Go "I need this package's side effects but won't call
-	// any of its functions directly."
+	"bytes"    // For working with byte buffers (thumbnail encoding).
+	"context"  // For cancellation support.
+	_ "embed"  // Required for the //go:embed directive below.
 	"encoding/json" // For encoding/decoding JSON (API communication).
 	"fmt"           // Formatted I/O.
 	"image"         // Standard image interface.
@@ -49,7 +48,10 @@ import (
 	"log"           // Logging with timestamps.
 	"net/http"      // HTTP server and client.
 	"os"            // File operations.
+	"path/filepath" // For directory browsing.
 	"runtime"       // Runtime info (number of CPUs).
+	"sort"          // For sorting directory entries.
+	"strings"       // For string operations.
 	"sync"          // Synchronization primitives (Mutex, Map).
 	"time"          // Time measurement.
 
@@ -96,9 +98,38 @@ var scanMutex sync.Mutex
 var scanResult ScanResult
 
 // thumbnailCache stores generated thumbnails to avoid re-computing them.
-// sync.Map is a concurrent-safe map that doesn't need a mutex.
-// Keys are file paths (string), values are JPEG byte slices ([]byte).
 var thumbnailCache sync.Map
+
+// scanCancel holds the cancel function for the current scan.
+// Calling it aborts the scan in progress.
+var scanCancel context.CancelFunc
+
+// appSettings holds the current application settings.
+var appSettings AppSettings
+
+// AppSettings holds user-configurable settings for the application.
+type AppSettings struct {
+	Algorithm       string            `json:"algorithm"`        // "dhash", "phash", or "ahash"
+	Threshold       int               `json:"threshold"`        // Hamming distance threshold
+	MinWidth        int               `json:"min_width"`        // Minimum image width (0 = no limit)
+	MaxHeight       int               `json:"max_height"`       // Maximum image height (0 = no limit)
+	Extensions      map[string]bool   `json:"extensions"`       // Extension -> enabled
+}
+
+func init() {
+	// Initialize default settings.
+	appSettings = AppSettings{
+		Algorithm: "dhash",
+		Threshold: 10,
+		MinWidth:  0,
+		MaxHeight: 0,
+		Extensions: map[string]bool{
+			".jpg": true, ".jpeg": true, ".png": true,
+			".tiff": true, ".tif": true, ".bmp": true,
+			".webp": true, ".gif": true, ".heic": true, ".heif": true,
+		},
+	}
+}
 
 // =============================================================================
 // Types — JSON request/response structures
@@ -178,6 +209,18 @@ func StartServer(port int) {
 
 	// GET /api/thumbnail?path=<filepath> → Get a resized thumbnail of an image.
 	http.HandleFunc("/api/thumbnail", handleThumbnail)
+
+	// GET /api/browse?path=<dirpath> → List directories for folder browser.
+	http.HandleFunc("/api/browse", handleBrowse)
+
+	// POST /api/cancel → Cancel the current scan.
+	http.HandleFunc("/api/cancel", handleCancel)
+
+	// POST /api/report-mismatch → Generate a mismatch report for two images.
+	http.HandleFunc("/api/report-mismatch", handleReportMismatch)
+
+	// GET/POST /api/settings → Get or update application settings.
+	http.HandleFunc("/api/settings", handleSettings)
 
 	// -------------------------------------------------------------------------
 	// Start the HTTP server
@@ -330,22 +373,27 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	// Clear the thumbnail cache for the new scan.
 	thumbnailCache = sync.Map{}
 
-	// -------------------------------------------------------------------------
-	// Launch the scan in a background goroutine
-	// -------------------------------------------------------------------------
-	//
-	// We use "go func() { ... }()" to run the scan in a separate goroutine.
-	// This means handleScan returns immediately (the HTTP response is sent
-	// to the client), while the actual scanning happens in the background.
-	// The frontend polls /api/results to track progress.
+	// Cancel any previous scan.
+	if scanCancel != nil {
+		scanCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	scanCancel = cancel
+
+	// Use settings threshold if request doesn't specify one, or use the request value.
+	threshold := req.Threshold
+	if threshold <= 0 {
+		threshold = appSettings.Threshold
+		if threshold <= 0 {
+			threshold = 10
+		}
+	}
+
 	go func() {
 		startTime := time.Now()
 
-		log.Printf("[scan] Starting scan of: %s (threshold: %d)", req.Path, req.Threshold)
+		log.Printf("[scan] Starting scan of: %s (threshold: %d)", req.Path, threshold)
 
-		// -----------------------------------------------------------------
-		// Phase 1: Scan the directory for image files
-		// -----------------------------------------------------------------
 		scanMutex.Lock()
 		scanResult.Progress.Phase = "Scanning directory for images..."
 		scanMutex.Unlock()
@@ -360,8 +408,17 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Filter paths based on settings (extensions, min width, max height).
+		paths = filterPathsBySettings(paths)
+
 		totalFiles := len(paths)
-		log.Printf("[scan] Found %d image files", totalFiles)
+		log.Printf("[scan] Found %d image files (after filtering)", totalFiles)
+
+		// Check for cancellation.
+		if ctx.Err() != nil {
+			setScanCancelled()
+			return
+		}
 
 		scanMutex.Lock()
 		scanResult.Progress.Total = totalFiles
@@ -369,7 +426,6 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		scanMutex.Unlock()
 
 		if totalFiles == 0 {
-			// No images found — complete immediately with empty results.
 			scanMutex.Lock()
 			scanResult.Status = "complete"
 			scanResult.Progress.Phase = "No images found"
@@ -381,35 +437,32 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// -----------------------------------------------------------------
-		// Phase 2: Hash all images using the worker pool
-		// -----------------------------------------------------------------
-		//
-		// We use runtime.NumCPU() workers to parallelize hashing across
-		// all CPU cores. This is the most time-consuming phase.
 		numWorkers := runtime.NumCPU()
-		hashes := HashAllImages(paths, numWorkers)
+		hashes := HashAllImagesWithContext(ctx, paths, numWorkers)
+
+		// Check for cancellation.
+		if ctx.Err() != nil {
+			setScanCancelled()
+			return
+		}
 
 		scanMutex.Lock()
 		scanResult.Progress.Current = totalFiles
 		scanResult.Progress.Phase = "Grouping duplicates..."
 		scanMutex.Unlock()
 
-		// -----------------------------------------------------------------
-		// Phase 3: Group duplicates
-		// -----------------------------------------------------------------
-		groups := GroupDuplicates(hashes, req.Threshold)
+		groups := GroupDuplicates(hashes, threshold)
 
-		// -----------------------------------------------------------------
-		// Phase 4: Compute statistics
-		// -----------------------------------------------------------------
-		//
-		// Calculate "wasted bytes" — the total size of all duplicate files
-		// (excluding the best one in each group, which we'd keep).
+		// Check for cancellation.
+		if ctx.Err() != nil {
+			setScanCancelled()
+			return
+		}
+
 		var wastedBytes int64
 		for _, group := range groups {
 			for i, img := range group.Images {
-				if i > 0 { // Skip the first image (the "best" one to keep).
+				if i > 0 {
 					wastedBytes += img.Size
 				}
 			}
@@ -417,9 +470,6 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 
 		duration := time.Since(startTime)
 
-		// -----------------------------------------------------------------
-		// Store final results
-		// -----------------------------------------------------------------
 		scanMutex.Lock()
 		scanResult = ScanResult{
 			Status: "complete",
@@ -577,6 +627,290 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"message": fmt.Sprintf("File renamed to %s", deletedPath),
 	})
+}
+
+// =============================================================================
+// setScanCancelled — Helper to mark scan as cancelled
+// =============================================================================
+
+func setScanCancelled() {
+	scanMutex.Lock()
+	scanResult.Status = "cancelled"
+	scanResult.Progress.Phase = "Scan cancelled by user"
+	scanMutex.Unlock()
+	log.Printf("[scan] Scan cancelled by user")
+}
+
+// =============================================================================
+// filterPathsBySettings — Filter image paths based on current app settings
+// =============================================================================
+
+func filterPathsBySettings(paths []string) []string {
+	var filtered []string
+	for _, p := range paths {
+		ext := strings.ToLower(filepath.Ext(p))
+		if enabled, ok := appSettings.Extensions[ext]; ok && !enabled {
+			continue // Extension is disabled in settings.
+		}
+		filtered = append(filtered, p)
+	}
+
+	// If min width or max height is set, we need to check image dimensions.
+	if appSettings.MinWidth > 0 || appSettings.MaxHeight > 0 {
+		var dimFiltered []string
+		for _, p := range filtered {
+			f, err := os.Open(p)
+			if err != nil {
+				dimFiltered = append(dimFiltered, p) // Keep on error.
+				continue
+			}
+			config, _, err := image.DecodeConfig(f)
+			f.Close()
+			if err != nil {
+				dimFiltered = append(dimFiltered, p) // Keep on error.
+				continue
+			}
+			if appSettings.MinWidth > 0 && config.Width < appSettings.MinWidth {
+				continue
+			}
+			if appSettings.MaxHeight > 0 && config.Height > appSettings.MaxHeight {
+				continue
+			}
+			dimFiltered = append(dimFiltered, p)
+		}
+		return dimFiltered
+	}
+
+	return filtered
+}
+
+// =============================================================================
+// handleBrowse — List directories for folder browser
+// =============================================================================
+
+func handleBrowse(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	requestedPath := r.URL.Query().Get("path")
+	if requestedPath == "" {
+		// Default to user's home directory.
+		home, err := os.UserHomeDir()
+		if err != nil {
+			requestedPath = "/"
+		} else {
+			requestedPath = home
+		}
+	}
+
+	// Clean and resolve the path.
+	requestedPath = filepath.Clean(requestedPath)
+
+	info, err := os.Stat(requestedPath)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Path not found: " + requestedPath})
+		return
+	}
+	if !info.IsDir() {
+		requestedPath = filepath.Dir(requestedPath)
+	}
+
+	entries, err := os.ReadDir(requestedPath)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Cannot read directory: " + err.Error()})
+		return
+	}
+
+	type DirEntry struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+
+	var dirs []DirEntry
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue // Skip hidden directories.
+		}
+		dirs = append(dirs, DirEntry{
+			Name: entry.Name(),
+			Path: filepath.Join(requestedPath, entry.Name()),
+		})
+	}
+
+	sort.Slice(dirs, func(i, j int) bool {
+		return strings.ToLower(dirs[i].Name) < strings.ToLower(dirs[j].Name)
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"current": requestedPath,
+		"parent":  filepath.Dir(requestedPath),
+		"dirs":    dirs,
+	})
+}
+
+// =============================================================================
+// handleCancel — Cancel the current scan
+// =============================================================================
+
+func handleCancel(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if scanCancel != nil {
+		scanCancel()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Scan cancellation requested",
+	})
+}
+
+// =============================================================================
+// handleReportMismatch — Generate a mismatch report
+// =============================================================================
+
+func handleReportMismatch(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		GroupID string   `json:"group_id"`
+		Paths   []string `json:"paths"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	type ImageReport struct {
+		Path       string `json:"path"`
+		Filename   string `json:"filename"`
+		Size       int64  `json:"size"`
+		Width      int    `json:"width"`
+		Height     int    `json:"height"`
+		XXHash     string `json:"xxhash"`
+		DHash      string `json:"dhash"`
+		DateTaken  string `json:"date_taken"`
+		Camera     string `json:"camera"`
+	}
+
+	var images []ImageReport
+	for _, p := range req.Paths {
+		meta := ExtractMetadata(p)
+		xxh, _ := ComputeXXHash(p)
+		dh, _ := ComputeDHash(p)
+		images = append(images, ImageReport{
+			Path:      meta.Path,
+			Filename:  meta.Filename,
+			Size:      meta.Size,
+			Width:     meta.Width,
+			Height:    meta.Height,
+			XXHash:    fmt.Sprintf("%016x", xxh),
+			DHash:     fmt.Sprintf("%016x", dh),
+			DateTaken: meta.DateTaken,
+			Camera:    meta.Camera,
+		})
+	}
+
+	// Compute hamming distance between the pair if exactly 2 images.
+	hammingDist := -1
+	if len(req.Paths) == 2 {
+		dh1, err1 := ComputeDHash(req.Paths[0])
+		dh2, err2 := ComputeDHash(req.Paths[1])
+		if err1 == nil && err2 == nil {
+			hammingDist = HammingDistance(dh1, dh2)
+		}
+	}
+
+	report := map[string]interface{}{
+		"report_type":      "mismatch",
+		"group_id":         req.GroupID,
+		"images":           images,
+		"hamming_distance":  hammingDist,
+		"threshold_used":   appSettings.Threshold,
+		"algorithm":        appSettings.Algorithm,
+		"generated_at":     time.Now().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename=mismatch_report.json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.Encode(report)
+}
+
+// =============================================================================
+// handleSettings — Get or update application settings
+// =============================================================================
+
+func handleSettings(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method == "GET" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(appSettings)
+		return
+	}
+
+	if r.Method == "POST" {
+		var newSettings AppSettings
+		if err := json.NewDecoder(r.Body).Decode(&newSettings); err != nil {
+			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+		// Validate.
+		if newSettings.Algorithm == "" {
+			newSettings.Algorithm = "dhash"
+		}
+		if newSettings.Threshold <= 0 {
+			newSettings.Threshold = 10
+		}
+		if newSettings.Extensions == nil {
+			newSettings.Extensions = appSettings.Extensions
+		}
+		appSettings = newSettings
+		log.Printf("[settings] Updated: algorithm=%s threshold=%d minWidth=%d maxHeight=%d",
+			appSettings.Algorithm, appSettings.Threshold, appSettings.MinWidth, appSettings.MaxHeight)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"settings": appSettings,
+		})
+		return
+	}
+
+	http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 }
 
 // =============================================================================
