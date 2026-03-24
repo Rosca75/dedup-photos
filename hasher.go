@@ -28,6 +28,7 @@
 package main
 
 import (
+	"context"   // For cancellation support.
 	"fmt"       // Formatted I/O (printing).
 	"image"     // Go's standard image interface and decoding registry.
 	"math/bits" // Bit counting functions (like popcount).
@@ -430,6 +431,94 @@ func HashAllImages(paths []string, numWorkers int) []ImageHash {
 
 	fmt.Printf("[hasher] Done! Hashed %d images.\n", len(allResults))
 
+	return allResults
+}
+
+// =============================================================================
+// HashAllImagesWithContext — Like HashAllImages but supports cancellation
+// =============================================================================
+
+func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int) []ImageHash {
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+	}
+
+	totalImages := len(paths)
+	if totalImages == 0 {
+		return []ImageHash{}
+	}
+
+	fmt.Printf("[hasher] Starting %d workers to hash %d images (with cancellation support)...\n", numWorkers, totalImages)
+
+	jobs := make(chan string, totalImages)
+	results := make(chan ImageHash, totalImages)
+
+	var wg sync.WaitGroup
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				// Check for cancellation before processing each image.
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				result := ImageHash{Path: path}
+
+				xxh, err := ComputeXXHash(path)
+				if err != nil {
+					result.Error = err
+					results <- result
+					continue
+				}
+				result.XXHash = xxh
+
+				dh, err := ComputeDHash(path)
+				if err != nil {
+					result.Error = err
+					results <- result
+					continue
+				}
+				result.DHash = dh
+
+				results <- result
+			}
+		}()
+	}
+
+	// Send jobs, but stop early if cancelled.
+	go func() {
+		for _, path := range paths {
+			select {
+			case <-ctx.Done():
+				break
+			case jobs <- path:
+			}
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	allResults := make([]ImageHash, 0, totalImages)
+	processed := 0
+
+	for result := range results {
+		allResults = append(allResults, result)
+		processed++
+		if processed%100 == 0 || processed == totalImages {
+			fmt.Printf("[hasher] Progress: %d / %d images hashed\n", processed, totalImages)
+		}
+	}
+
+	fmt.Printf("[hasher] Done! Hashed %d images.\n", len(allResults))
 	return allResults
 }
 
