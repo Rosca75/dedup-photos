@@ -1,0 +1,30 @@
+# Binary outputs
+dedup-photos
+dedup-photos.exe
+
+# Go build artifacts
+*.o
+*.a
+*.so
+*.test
+*.out
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Test coverage
+coverage.out
+coverage.html
+*.coverprofile
+
+# Vendor directory
+vendor/
