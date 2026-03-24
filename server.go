@@ -38,14 +38,15 @@
 package main
 
 import (
-	"bytes"         // For working with byte buffers (thumbnail encoding).
-	"context"       // For scan cancellation support.
-	"embed"         // For embedding static files into the binary.
+	"bytes"   // For working with byte buffers (thumbnail encoding).
+	"context" // For scan cancellation support.
+	_ "embed" // Required for the //go:embed directive below. The blank import
+	// ("_") tells Go "I need this package's side effects but won't call
+	// any of its functions directly."
 	"encoding/json" // For encoding/decoding JSON (API communication).
 	"fmt"           // Formatted I/O.
 	"image"         // Standard image interface.
 	"image/jpeg"    // JPEG encoder (for thumbnails).
-	"io/fs"         // For sub-filesystem of embedded files.
 	"log"           // Logging with timestamps.
 	"net/http"      // HTTP server and client.
 	"os"            // File operations.
@@ -68,15 +69,16 @@ import (
 // Embedded static files
 // =============================================================================
 
-// go:embed embeds files into the binary at compile time.
-// This means the compiled binary contains all frontend files (HTML, CSS, JS)
-// and you don't need to ship them separately.
+// go:embed is a Go compiler directive that reads a file at compile time and
+// stores its contents in a variable. This means the compiled binary contains
+// the HTML file — you don't need to ship it separately. Very convenient for
+// single-binary deployment.
+//
+// The comment MUST be exactly "//go:embed <path>" (no space after //).
+// The path is relative to the Go source file.
 //
 //go:embed static/index.html
 var indexHTML []byte // The raw bytes of the index.html file.
-
-//go:embed static/*
-var staticFiles embed.FS // Embedded filesystem containing all static assets.
 
 // =============================================================================
 // Global state — protected by a mutex
@@ -194,15 +196,9 @@ func StartServer(port int) {
 	//   - w: http.ResponseWriter — used to send the response.
 	//   - r: *http.Request — contains the request details (method, URL, body).
 
-	// Serve static files (CSS, JS) from the embedded filesystem.
-	// fs.Sub strips the "static" prefix so /static/style.css maps to static/style.css.
-	staticSub, err := fs.Sub(staticFiles, "static")
-	if err != nil {
-		log.Fatalf("Failed to create static sub-filesystem: %v", err)
-	}
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticSub))))
-
 	// GET / → Serve the embedded HTML page.
+	// This is the main entry point: when you visit http://localhost:8080/,
+	// you get the DedupPhotos web interface.
 	http.HandleFunc("/", handleIndex)
 
 	// POST /api/scan → Start scanning a directory for duplicates.
@@ -240,7 +236,8 @@ func StartServer(port int) {
 	// http.ListenAndServe starts the server. It blocks forever, processing
 	// incoming requests. If it returns, something went wrong (e.g., the
 	// port is already in use).
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	err := http.ListenAndServe(addr, nil)
+	if err != nil {
 		// log.Fatalf prints an error message and exits the program.
 		log.Fatalf("Server failed to start: %v", err)
 	}
@@ -283,8 +280,14 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Set the Content-Type header so the browser knows to render it as HTML.
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Write the embedded HTML bytes to the response.
+	// w.Write sends data to the client (browser).
 	w.Write(indexHTML)
+
+	log.Printf("GET / — served index.html (%d bytes)", len(indexHTML))
 }
 
 // =============================================================================

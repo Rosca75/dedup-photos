@@ -258,6 +258,183 @@ func ComputeDHash(path string) (uint64, error) {
 }
 
 // =============================================================================
+// HashAllImages — Parallel hashing using a worker pool
+// =============================================================================
+
+// HashAllImages computes both xxHash and dHash for every image path in the
+// input slice, using multiple goroutines (lightweight threads) for speed.
+//
+// HOW THE WORKER POOL WORKS:
+//
+//	This is a very common Go concurrency pattern called "fan-out/fan-in":
+//
+//	1. PRODUCER: The main goroutine sends file paths into a "jobs" channel.
+//	2. WORKERS:  N goroutines (one per CPU core) read from the jobs channel.
+//	             Each worker hashes one image at a time and sends the result
+//	             to a "results" channel.
+//	3. COLLECTOR: A goroutine reads all results from the results channel
+//	              and puts them into a slice.
+//
+//	Think of it like a restaurant: there's one person taking orders (producer),
+//	multiple cooks working in parallel (workers), and one person collecting
+//	the finished plates (collector).
+//
+//	"channel" in Go is like a thread-safe queue. You send values in with
+//	"channel <- value" and receive them with "value := <-channel".
+//
+// Parameters:
+//   - paths:      Slice of absolute file paths to hash.
+//   - numWorkers: How many goroutines to run in parallel. Typically
+//     runtime.NumCPU() (one per CPU core).
+//
+// Returns:
+//   - []ImageHash: One ImageHash struct per input path, containing both hashes
+//     (or an error if hashing failed).
+func HashAllImages(paths []string, numWorkers int) []ImageHash {
+	// If numWorkers is 0 or negative, default to the number of CPU cores.
+	// runtime.NumCPU() returns the number of logical CPUs (including
+	// hyper-threading). This is usually a good default for I/O + CPU work.
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+	}
+
+	// Total number of images to process. len() returns the length of a slice.
+	totalImages := len(paths)
+
+	// If there are no images, return an empty slice immediately.
+	if totalImages == 0 {
+		return []ImageHash{}
+	}
+
+	fmt.Printf("[hasher] Starting %d workers to hash %d images...\n", numWorkers, totalImages)
+
+	// -------------------------------------------------------------------------
+	// Create channels
+	// -------------------------------------------------------------------------
+
+	// "jobs" is a buffered channel of strings (file paths). Workers will read
+	// paths from this channel. The buffer size of totalImages means we can
+	// send all paths without blocking (pre-loading the queue).
+	jobs := make(chan string, totalImages)
+
+	// "results" is a buffered channel of ImageHash structs. Workers send
+	// their results here. We buffer it to totalImages so workers never block
+	// waiting for the collector to read.
+	results := make(chan ImageHash, totalImages)
+
+	// -------------------------------------------------------------------------
+	// Start worker goroutines
+	// -------------------------------------------------------------------------
+
+	// sync.WaitGroup is a counter that lets you wait for a group of
+	// goroutines to finish. You Add(n) before starting goroutines, each
+	// goroutine calls Done() when finished, and Wait() blocks until the
+	// counter reaches zero.
+	var wg sync.WaitGroup
+
+	// Launch numWorkers goroutines. Each one runs the same anonymous function.
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1) // Increment the WaitGroup counter by 1.
+
+		// "go func() { ... }()" launches an anonymous function as a new
+		// goroutine. The goroutine runs concurrently with everything else.
+		go func() {
+			// defer wg.Done() decrements the WaitGroup counter when this
+			// goroutine finishes (when the function returns).
+			defer wg.Done()
+
+			// "range jobs" reads from the jobs channel until it's closed.
+			// Each iteration, "path" receives the next value from the channel.
+			// When the channel is closed AND empty, the loop ends.
+			for path := range jobs {
+				// Create an ImageHash struct to hold results for this file.
+				result := ImageHash{Path: path}
+
+				// Compute the xxHash (exact file fingerprint).
+				xxh, err := ComputeXXHash(path)
+				if err != nil {
+					// If xxHash fails, store the error and send the result.
+					// We don't stop — other files might be fine.
+					result.Error = err
+					results <- result
+					continue
+				}
+				result.XXHash = xxh
+
+				// Compute the dHash (perceptual/visual fingerprint).
+				dh, err := ComputeDHash(path)
+				if err != nil {
+					// dHash can fail if the image format isn't supported
+					// (like HEIC). We still have the xxHash, which is useful
+					// for exact matching, so we keep the result.
+					result.Error = err
+					// Keep the xxHash we already computed.
+					results <- result
+					continue
+				}
+				result.DHash = dh
+
+				// Send the completed result to the results channel.
+				results <- result
+			}
+		}()
+	}
+
+	// -------------------------------------------------------------------------
+	// Send all file paths to the jobs channel (producer)
+	// -------------------------------------------------------------------------
+
+	// We send all paths into the jobs channel. Because the channel is
+	// buffered to totalImages, this won't block.
+	for _, path := range paths {
+		jobs <- path
+	}
+
+	// Close the channel to signal workers that no more jobs are coming.
+	// Workers' "for path := range jobs" loops will exit after processing
+	// all remaining items.
+	close(jobs)
+
+	// -------------------------------------------------------------------------
+	// Wait for all workers to finish, then close results channel
+	// -------------------------------------------------------------------------
+
+	// We launch another goroutine to wait for all workers and then close the
+	// results channel. We can't do this in the main goroutine because we
+	// also need to read from results (which would deadlock).
+	go func() {
+		wg.Wait()      // Block until all workers have called wg.Done().
+		close(results) // Signal the collector that no more results are coming.
+	}()
+
+	// -------------------------------------------------------------------------
+	// Collect all results (collector)
+	// -------------------------------------------------------------------------
+
+	// Preallocate the output slice with the exact capacity we need.
+	// make([]ImageHash, 0, totalImages) creates a slice with length 0 but
+	// capacity totalImages, avoiding reallocations as we append.
+	allResults := make([]ImageHash, 0, totalImages)
+	processed := 0
+
+	// Read from the results channel until it's closed.
+	for result := range results {
+		allResults = append(allResults, result)
+		processed++
+
+		// Print progress every 100 images or on the last one.
+		// The "%" operator is modulo (remainder after division).
+		if processed%100 == 0 || processed == totalImages {
+			fmt.Printf("[hasher] Progress: %d / %d images hashed\n", processed, totalImages)
+		}
+	}
+
+	fmt.Printf("[hasher] Done! Hashed %d images.\n", len(allResults))
+
+	return allResults
+}
+
+// =============================================================================
 // ComputePHash — Average-based perceptual hash (alternative algorithm)
 // =============================================================================
 
@@ -368,15 +545,21 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 					}
 					result.DHash = ph // Store in same field for compatibility.
 				case "both":
-					// Use dHash for grouping. XOR of dHash^pHash would destroy
-					// the metric space property needed by the BK-Tree.
-					dh, err := ComputeDHash(path)
-					if err != nil {
-						result.Error = err
+					// Use combined hash: XOR of dHash and pHash for stricter matching.
+					dh, err1 := ComputeDHash(path)
+					ph, err2 := ComputePHash(path)
+					if err1 != nil && err2 != nil {
+						result.Error = err1
 						results <- result
 						continue
 					}
-					result.DHash = dh
+					if err1 == nil && err2 == nil {
+						result.DHash = dh ^ ph
+					} else if err1 == nil {
+						result.DHash = dh
+					} else {
+						result.DHash = ph
+					}
 				default: // "dhash"
 					dh, err := ComputeDHash(path)
 					if err != nil {
