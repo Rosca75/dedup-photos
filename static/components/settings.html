@@ -1,0 +1,52 @@
+<!-- components/settings.html -->
+<div class="settings-panel">
+  <h3>Algorithm</h3>
+  <select id="algorithm">
+    <option value="phash">Perceptual Hashing</option>
+    <option value="exact">Exact Match</option>
+  </select>
+
+  <h3>Threshold</h3>
+  <input type="range" id="threshold" min="0" max="100" value="10">
+
+  <h3>Dimensions</h3>
+  <input type="number" id="min-width" placeholder="Min width">
+  <input type="number" id="max-height" placeholder="Max height">
+
+  <h3>Extensions</h3>
+  <label><input type="checkbox" value="jpg" checked> .jpg</label>
+  <label><input type="checkbox" value="png" checked> .png</label>
+  <label><input type="checkbox" value="jpeg" checked> .jpeg</label>
+  <label><input type="checkbox" value="gif" checked> .gif</label>
+
+  <button class="btn btn-primary" id="save-settings">Save</button>
+</div>
+
+<script type="module">
+async function loadSettings() {
+  const response = await fetch('/api/get-settings');
+  const settings = await response.json();
+  document.getElementById('algorithm').value = settings.algorithm;
+  document.getElementById('threshold').value = settings.threshold;
+  document.getElementById('min-width').value = settings.min_width;
+  document.getElementById('max-height').value = settings.max_height;
+}
+
+async function saveSettings() {
+  const settings = {
+    algorithm: document.getElementById('algorithm').value,
+    threshold: parseInt(document.getElementById('threshold').value),
+    min_width: parseInt(document.getElementById('min-width').value) || 0,
+    max_height: parseInt(document.getElementById('max-height').value) || 0,
+    extensions: Array.from(document.querySelectorAll('input[type="checkbox"]:checked')).map(el => el.value),
+  };
+  await fetch('/api/set-settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+}
+
+document.addEventListener('DOMContentLoaded', loadSettings);
+document.getElementById('save-settings').addEventListener('click', saveSettings);
+</script>

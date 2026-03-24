@@ -1,0 +1,99 @@
+<!-- components/results.html -->
+<div class="groups" id="groups-container"></div>
+
+<script type="module">
+window.loadResults = function() {
+  fetch('/api/results')
+  .then(r => r.json())
+  .then(data => {
+    if(data.status === 'complete') { renderResults(data); }
+  })
+  .catch(err => console.error('Failed to load results:', err));
+};
+
+function renderResults(data) {
+  const container = document.getElementById('groups-container');
+  container.innerHTML = '';
+  if(data.groups && data.groups.length > 0) {
+    for(const group of data.groups) {
+      container.appendChild(buildGroup(group));
+    }
+  } else {
+    document.getElementById('empty-state').style.display = 'block';
+    document.getElementById('empty-state').querySelector('p').textContent = 'No duplicates found. Your library is clean!';
+  }
+}
+
+function buildGroup(group) {
+  const card = document.createElement('div');
+  card.className = 'group-card';
+  card.innerHTML = `
+    <div class="group-header">
+      <span class="group-title">Group</span>
+      <span class="badge ${group.match_type === 'exact' ? 'badge-exact' : 'badge-perceptual'}">${group.match_type === 'exact' ? 'Exact' : 'Perceptual'}</span>
+      <span class="confidence">${group.confidence != null ? group.confidence.toFixed(1) + '% match' : ''}</span>
+    </div>
+    <div class="group-images">
+      ${group.images.map(img => buildImageCard(img)).join('')}
+    </div>
+  `;
+  return card;
+}
+
+function buildImageCard(img) {
+  return `
+    <div class="image-card" data-path="${img.path || ''}">
+      <div class="thumb-wrap">
+        <img src="/api/thumbnail?path=${encodeURIComponent(img.path || '')}" alt="${img.filename || 'thumbnail'}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.textContent='No preview'">
+      </div>
+      <div class="filename">${img.filename || 'Unknown'}</div>
+      <div class="filepath">${img.path || ''}</div>
+      <div class="meta-grid">
+        <div class="meta-item">
+          <span class="meta-label">Resolution</span>
+          <span class="meta-value">${img.width && img.height ? img.width + 'x' + img.height : '--'}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">File Size</span>
+          <span class="meta-value">${formatBytes(img.size)}</span>
+        </div>
+        ${img.date_taken ? `<div class="meta-item">
+          <span class="meta-label">Date Taken</span>
+          <span class="meta-value">${formatDate(img.date_taken)}</span>
+        </div>` : ''}
+        ${img.gps_lat || img.gps_lon ? `<div class="meta-item">
+          <span class="meta-label">GPS</span>
+          <span class="meta-value">${formatGPS(img.gps_lat, img.gps_lon)}</span>
+        </div>` : ''}
+        ${img.camera ? `<div class="meta-item">
+          <span class="meta-label">Camera</span>
+          <span class="meta-value">${img.camera}</span>
+        </div>` : ''}
+        ${img.lens ? `<div class="meta-item">
+          <span class="meta-label">Lens</span>
+          <span class="meta-value">${img.lens}</span>
+        </div>` : ''}
+        ${img.iso != null ? `<div class="meta-item">
+          <span class="meta-label">ISO</span>
+          <span class="meta-value">${img.iso}</span>
+        </div>` : ''}
+        ${img.quality_score != null ? `<div class="meta-item">
+          <span class="meta-label">Quality Score</span>
+          <span class="meta-value">${img.quality_score}/100</span>
+        </div>` : ''}
+      </div>
+      ${img.quality_score != null ? `
+        <div class="quality-section">
+          <span class="qlabel">Quality</span>
+          <div class="quality-track"><div class="quality-fill" style="width:${img.quality_score}%;background:${qualityColor(img.quality_score)}"></div></div>
+          <span class="qval" style="color:${qualityColor(img.quality_score)}">${img.quality_score}</span>
+        </div>
+      ` : ''}
+      <div class="card-actions">
+        ${img.is_best ? '<span class="badge badge-keep">KEEP</span>' : '<span class="badge badge-delete">DELETE</span>'}
+        <button class="btn btn-danger" style="margin-left:auto" onclick="window.deleteFile('${img.path}')">Delete</button>
+      </div>
+    </div>
+  `;
+}
+</script>
