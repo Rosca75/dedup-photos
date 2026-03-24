@@ -68,12 +68,15 @@ import (
 // Embedded static files
 // =============================================================================
 
-// go:embed embeds the entire static directory into the binary at compile time.
+// go:embed embeds files into the binary at compile time.
 // This means the compiled binary contains all frontend files (HTML, CSS, JS)
 // and you don't need to ship them separately.
 //
-//go:embed static
-var staticFiles embed.FS
+//go:embed static/index.html
+var indexHTML []byte // The raw bytes of the index.html file.
+
+//go:embed static/*
+var staticFiles embed.FS // Embedded filesystem containing all static assets.
 
 // =============================================================================
 // Global state — protected by a mutex
@@ -277,13 +280,6 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	// "/favicon.ico") should get a 404.
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
-		return
-	}
-
-	// Read index.html from the embedded filesystem.
-	indexHTML, err := staticFiles.ReadFile("static/index.html")
-	if err != nil {
-		http.Error(w, "index.html not found", http.StatusInternalServerError)
 		return
 	}
 
