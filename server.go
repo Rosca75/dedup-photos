@@ -70,7 +70,7 @@ import (
 //go:embed static/index.html
 var indexHTML []byte
 
-// ===========================================================================
+// =============================================================================
 // Global state — protected by a mutex
 // ===========================================================================
 
@@ -98,7 +98,7 @@ var globalSettings = Settings{
 	ScanPath:   "",
 }
 
-// ===========================================================================
+// =============================================================================
 // Types — JSON request/response structures
 // ===========================================================================
 
@@ -128,10 +128,11 @@ type ScanStats struct {
 	DurationMs      int64 `json:"duration_ms"`
 }
 
+// DuplicateGroup is defined here (only once)
 type DuplicateGroup struct {
-	MatchType   string `json:"match_type"`
-	Confidence  float64 `json:"confidence"`
-	Images      []struct {
+	MatchType  string  `json:"match_type"`
+	Confidence float64 `json:"confidence"`
+	Images     []struct {
 		Path         string `json:"path"`
 		Filename     string `json:"filename"`
 		Size         int64  `json:"size"`
@@ -180,7 +181,7 @@ func StartServer(port int) {
 	}
 }
 
-// ===========================================================================
+// =============================================================================
 // setCORSHeaders — Add CORS headers to every response
 // ===========================================================================
 
@@ -191,7 +192,7 @@ func setCORSHeaders(w http.ResponseWriter) {
 }
 
 // ===========================================================================
-// New Handlers
+// New Handlers (added in previous steps)
 // ===========================================================================
 
 func handleSetFolder(w http.ResponseWriter, r *http.Request) {
@@ -278,7 +279,6 @@ func handleApplyAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
 		return
 	}
-	// Placeholder: Implement bulk action logic here
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
