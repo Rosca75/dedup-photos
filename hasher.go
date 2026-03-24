@@ -258,187 +258,69 @@ func ComputeDHash(path string) (uint64, error) {
 }
 
 // =============================================================================
-// HashAllImages — Parallel hashing using a worker pool
+// ComputePHash — Average-based perceptual hash (alternative algorithm)
 // =============================================================================
 
-// HashAllImages computes both xxHash and dHash for every image path in the
-// input slice, using multiple goroutines (lightweight threads) for speed.
-//
-// HOW THE WORKER POOL WORKS:
-//
-//	This is a very common Go concurrency pattern called "fan-out/fan-in":
-//
-//	1. PRODUCER: The main goroutine sends file paths into a "jobs" channel.
-//	2. WORKERS:  N goroutines (one per CPU core) read from the jobs channel.
-//	             Each worker hashes one image at a time and sends the result
-//	             to a "results" channel.
-//	3. COLLECTOR: A goroutine reads all results from the results channel
-//	              and puts them into a slice.
-//
-//	Think of it like a restaurant: there's one person taking orders (producer),
-//	multiple cooks working in parallel (workers), and one person collecting
-//	the finished plates (collector).
-//
-//	"channel" in Go is like a thread-safe queue. You send values in with
-//	"channel <- value" and receive them with "value := <-channel".
-//
-// Parameters:
-//   - paths:      Slice of absolute file paths to hash.
-//   - numWorkers: How many goroutines to run in parallel. Typically
-//     runtime.NumCPU() (one per CPU core).
-//
-// Returns:
-//   - []ImageHash: One ImageHash struct per input path, containing both hashes
-//     (or an error if hashing failed).
-func HashAllImages(paths []string, numWorkers int) []ImageHash {
-	// If numWorkers is 0 or negative, default to the number of CPU cores.
-	// runtime.NumCPU() returns the number of logical CPUs (including
-	// hyper-threading). This is usually a good default for I/O + CPU work.
-	if numWorkers <= 0 {
-		numWorkers = runtime.NumCPU()
+// ComputePHash computes a simple average-based perceptual hash. Unlike dHash
+// which compares adjacent pixels, pHash compares each pixel to the overall
+// average brightness. This can be more robust for certain types of edits.
+func ComputePHash(path string) (uint64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open image %s: %w", path, err)
+	}
+	defer file.Close()
+
+	img, _, err := image.Decode(file)
+	if err != nil {
+		return 0, fmt.Errorf("failed to decode image %s: %w", path, err)
 	}
 
-	// Total number of images to process. len() returns the length of a slice.
-	totalImages := len(paths)
+	bounds := img.Bounds()
+	srcWidth := bounds.Max.X - bounds.Min.X
+	srcHeight := bounds.Max.Y - bounds.Min.Y
 
-	// If there are no images, return an empty slice immediately.
-	if totalImages == 0 {
-		return []ImageHash{}
+	const size = 8
+	gray := make([][]uint32, size)
+	for y := 0; y < size; y++ {
+		gray[y] = make([]uint32, size)
 	}
 
-	fmt.Printf("[hasher] Starting %d workers to hash %d images...\n", numWorkers, totalImages)
-
-	// -------------------------------------------------------------------------
-	// Create channels
-	// -------------------------------------------------------------------------
-
-	// "jobs" is a buffered channel of strings (file paths). Workers will read
-	// paths from this channel. The buffer size of totalImages means we can
-	// send all paths without blocking (pre-loading the queue).
-	jobs := make(chan string, totalImages)
-
-	// "results" is a buffered channel of ImageHash structs. Workers send
-	// their results here. We buffer it to totalImages so workers never block
-	// waiting for the collector to read.
-	results := make(chan ImageHash, totalImages)
-
-	// -------------------------------------------------------------------------
-	// Start worker goroutines
-	// -------------------------------------------------------------------------
-
-	// sync.WaitGroup is a counter that lets you wait for a group of
-	// goroutines to finish. You Add(n) before starting goroutines, each
-	// goroutine calls Done() when finished, and Wait() blocks until the
-	// counter reaches zero.
-	var wg sync.WaitGroup
-
-	// Launch numWorkers goroutines. Each one runs the same anonymous function.
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1) // Increment the WaitGroup counter by 1.
-
-		// "go func() { ... }()" launches an anonymous function as a new
-		// goroutine. The goroutine runs concurrently with everything else.
-		go func() {
-			// defer wg.Done() decrements the WaitGroup counter when this
-			// goroutine finishes (when the function returns).
-			defer wg.Done()
-
-			// "range jobs" reads from the jobs channel until it's closed.
-			// Each iteration, "path" receives the next value from the channel.
-			// When the channel is closed AND empty, the loop ends.
-			for path := range jobs {
-				// Create an ImageHash struct to hold results for this file.
-				result := ImageHash{Path: path}
-
-				// Compute the xxHash (exact file fingerprint).
-				xxh, err := ComputeXXHash(path)
-				if err != nil {
-					// If xxHash fails, store the error and send the result.
-					// We don't stop — other files might be fine.
-					result.Error = err
-					results <- result
-					continue
-				}
-				result.XXHash = xxh
-
-				// Compute the dHash (perceptual/visual fingerprint).
-				dh, err := ComputeDHash(path)
-				if err != nil {
-					// dHash can fail if the image format isn't supported
-					// (like HEIC). We still have the xxHash, which is useful
-					// for exact matching, so we keep the result.
-					result.Error = err
-					// Keep the xxHash we already computed.
-					results <- result
-					continue
-				}
-				result.DHash = dh
-
-				// Send the completed result to the results channel.
-				results <- result
-			}
-		}()
-	}
-
-	// -------------------------------------------------------------------------
-	// Send all file paths to the jobs channel (producer)
-	// -------------------------------------------------------------------------
-
-	// We send all paths into the jobs channel. Because the channel is
-	// buffered to totalImages, this won't block.
-	for _, path := range paths {
-		jobs <- path
-	}
-
-	// Close the channel to signal workers that no more jobs are coming.
-	// Workers' "for path := range jobs" loops will exit after processing
-	// all remaining items.
-	close(jobs)
-
-	// -------------------------------------------------------------------------
-	// Wait for all workers to finish, then close results channel
-	// -------------------------------------------------------------------------
-
-	// We launch another goroutine to wait for all workers and then close the
-	// results channel. We can't do this in the main goroutine because we
-	// also need to read from results (which would deadlock).
-	go func() {
-		wg.Wait()      // Block until all workers have called wg.Done().
-		close(results) // Signal the collector that no more results are coming.
-	}()
-
-	// -------------------------------------------------------------------------
-	// Collect all results (collector)
-	// -------------------------------------------------------------------------
-
-	// Preallocate the output slice with the exact capacity we need.
-	// make([]ImageHash, 0, totalImages) creates a slice with length 0 but
-	// capacity totalImages, avoiding reallocations as we append.
-	allResults := make([]ImageHash, 0, totalImages)
-	processed := 0
-
-	// Read from the results channel until it's closed.
-	for result := range results {
-		allResults = append(allResults, result)
-		processed++
-
-		// Print progress every 100 images or on the last one.
-		// The "%" operator is modulo (remainder after division).
-		if processed%100 == 0 || processed == totalImages {
-			fmt.Printf("[hasher] Progress: %d / %d images hashed\n", processed, totalImages)
+	var total uint64
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			srcX := bounds.Min.X + (x * srcWidth / size)
+			srcY := bounds.Min.Y + (y * srcHeight / size)
+			r, g, b, _ := img.At(srcX, srcY).RGBA()
+			luminance := (299*r + 587*g + 114*b) / 1000
+			gray[y][x] = luminance
+			total += uint64(luminance)
 		}
 	}
 
-	fmt.Printf("[hasher] Done! Hashed %d images.\n", len(allResults))
+	avg := total / (size * size)
 
-	return allResults
+	var hash uint64
+	bitPosition := 0
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			if uint64(gray[y][x]) > avg {
+				hash |= 1 << uint(bitPosition)
+			}
+			bitPosition++
+		}
+	}
+
+	return hash, nil
 }
 
 // =============================================================================
-// HashAllImagesWithContext — Like HashAllImages but supports cancellation
+// HashAllImagesWithContext — Parallel hashing with cancellation support
 // =============================================================================
 
-func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int) []ImageHash {
+// HashAllImagesWithContext is like HashAllImages but supports cancellation via
+// a context. It also supports choosing the perceptual hash algorithm.
+func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int, algorithm string) []ImageHash {
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
 	}
@@ -448,7 +330,7 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 		return []ImageHash{}
 	}
 
-	fmt.Printf("[hasher] Starting %d workers to hash %d images (with cancellation support)...\n", numWorkers, totalImages)
+	fmt.Printf("[hasher] Starting %d workers to hash %d images (algorithm: %s)...\n", numWorkers, totalImages, algorithm)
 
 	jobs := make(chan string, totalImages)
 	results := make(chan ImageHash, totalImages)
@@ -460,11 +342,9 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 		go func() {
 			defer wg.Done()
 			for path := range jobs {
-				// Check for cancellation before processing each image.
-				select {
-				case <-ctx.Done():
+				// Check for cancellation.
+				if ctx.Err() != nil {
 					return
-				default:
 				}
 
 				result := ImageHash{Path: path}
@@ -477,27 +357,48 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 				}
 				result.XXHash = xxh
 
-				dh, err := ComputeDHash(path)
-				if err != nil {
-					result.Error = err
-					results <- result
-					continue
+				// Choose perceptual hash algorithm.
+				switch algorithm {
+				case "phash":
+					ph, err := ComputePHash(path)
+					if err != nil {
+						result.Error = err
+						results <- result
+						continue
+					}
+					result.DHash = ph // Store in same field for compatibility.
+				case "both":
+					// Use dHash for grouping. XOR of dHash^pHash would destroy
+					// the metric space property needed by the BK-Tree.
+					dh, err := ComputeDHash(path)
+					if err != nil {
+						result.Error = err
+						results <- result
+						continue
+					}
+					result.DHash = dh
+				default: // "dhash"
+					dh, err := ComputeDHash(path)
+					if err != nil {
+						result.Error = err
+						results <- result
+						continue
+					}
+					result.DHash = dh
 				}
-				result.DHash = dh
 
 				results <- result
 			}
 		}()
 	}
 
-	// Send jobs, but stop early if cancelled.
+	// Send jobs, checking for cancellation.
 	go func() {
 		for _, path := range paths {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				break
-			case jobs <- path:
 			}
+			jobs <- path
 		}
 		close(jobs)
 	}()
@@ -511,8 +412,15 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 	processed := 0
 
 	for result := range results {
+		if ctx.Err() != nil {
+			// Drain remaining results.
+			for range results {
+			}
+			break
+		}
 		allResults = append(allResults, result)
 		processed++
+
 		if processed%100 == 0 || processed == totalImages {
 			fmt.Printf("[hasher] Progress: %d / %d images hashed\n", processed, totalImages)
 		}
@@ -521,10 +429,6 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 	fmt.Printf("[hasher] Done! Hashed %d images.\n", len(allResults))
 	return allResults
 }
-
-// =============================================================================
-// HammingDistance — Count the number of differing bits between two hashes
-// =============================================================================
 
 // HammingDistance computes the Hamming distance between two 64-bit integers.
 // The Hamming distance is the number of bit positions where the two values
