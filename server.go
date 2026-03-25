@@ -442,9 +442,17 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Phase 2: Hash all images using the worker pool (with cancellation).
+		// Phase 2: Hash all images using the multi-pass pipeline.
+		// The progress callback updates scanResult so the UI can show
+		// which phase is active and how many files have been processed.
 		numWorkers := runtime.NumCPU()
-		hashes := HashAllImagesWithContext(ctx, paths, numWorkers, req.Algorithm)
+		hashes := HashAllImagesWithProgress(ctx, paths, numWorkers, req.Algorithm, func(phase string, current int, total int) {
+			scanMutex.Lock()
+			scanResult.Progress.Phase = phase
+			scanResult.Progress.Current = current
+			scanResult.Progress.Total = total
+			scanMutex.Unlock()
+		})
 
 		// Check for cancellation.
 		if ctx.Err() != nil {
