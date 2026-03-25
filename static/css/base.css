@@ -1,21 +1,54 @@
-/* base.css — CSS variables, reset, typography, body styling. */
+/* base.css — Design tokens, reset, typography, body styling.
+   Light professional theme based on the charte graphique. */
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg:         #0f1419;
-  --bg-card:    #1a2332;
-  --bg-hover:   #253345;
-  --border:     #2a3a4e;
-  --text:       #e2e8f0;
-  --muted:      #5a6a7a;
-  --accent:     #2dd4bf;
-  --danger:     #ef4444;
-  --success:    #22c55e;
-  --warning:    #f59e0b;
-  --exact:      #8b5cf6;
-  --perceptual: #06b6d4;
-  --font:       'SF Mono', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+  /* Primary */
+  --primary:          #1A3A5C;   /* Deep blue — buttons, links, interactive */
+  --primary-light:    #4A90E2;   /* Sky blue — accents, active states */
+
+  /* Secondary */
+  --success:          #50C878;   /* Mint green — success, validation */
+
+  /* Neutrals */
+  --text:             #2D2D2D;   /* Dark grey — main text */
+  --text-light:       #6B6B6B;   /* Medium grey — secondary text */
+  --border:           #E0E0E0;   /* Light grey — borders */
+  --bg-subtle:        #F5F5F5;   /* Very light grey — subtle backgrounds */
+  --bg:               #FFFFFF;   /* White — main background */
+  --black:            #121212;   /* Deep black — headers */
+
+  /* Semantic */
+  --danger:           #E74C3C;   /* Red — delete, errors */
+  --warning:          #F5A623;   /* Orange — warnings, perceptual badge */
+  --exact:            #1A3A5C;   /* Deep blue — exact match badge */
+  --perceptual:       #F5A623;   /* Orange — perceptual match badge */
+  --original:         #50C878;   /* Green — "Original" badge */
+  --duplicate:        #E74C3C;   /* Red — "Duplicate" badge */
+
+  /* Typography */
+  --font:             'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-size-h1:     2.5rem;
+  --font-size-h2:     2rem;
+  --font-size-h3:     1.75rem;
+  --font-size-body:   1rem;
+  --font-size-small:  0.875rem;
+  --font-weight-semi: 600;
+  --font-weight-regular: 400;
+
+  /* Spacing (8px grid) */
+  --space-xs:         4px;
+  --space-sm:         8px;
+  --space-md:         16px;
+  --space-lg:         24px;
+  --space-xl:         32px;
+
+  /* Elements */
+  --radius:           8px;
+  --shadow:           0 2px 4px rgba(0,0,0,0.05);
+  --shadow-md:        0 4px 8px rgba(0,0,0,0.08);
+  --transition:       200ms ease;
 }
 
 html { font-size: 14px; }
@@ -24,15 +57,17 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font);
+  font-weight: var(--font-weight-regular);
   line-height: 1.6;
   min-height: 100vh;
   overflow: hidden;
 }
 
-a { color: var(--accent); text-decoration: none; }
+a { color: var(--primary-light); text-decoration: none; }
+a:hover { text-decoration: underline; }
 
-/* Scrollbar styling for dark theme */
+/* Scrollbar styling for light theme */
 ::-webkit-scrollbar { width: 8px; }
-::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-track { background: var(--bg-subtle); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+::-webkit-scrollbar-thumb:hover { background: var(--text-light); }

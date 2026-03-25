@@ -3,19 +3,22 @@
 
 import { initScan } from './scan.js';
 import { initSidebar } from './sidebar.js';
-import { initSettings } from './settings.js';
 import { initBrowse } from './browse.js';
 import { initActions } from './actions.js';
 import { initPreview } from './preview.js';
+import { initHistory } from './history.js';
+import { initFilters } from './filters.js';
 
-/**
- * Initialize all application modules once the DOM is ready.
- */
+/** Initialize all application modules once the DOM is ready. */
 document.addEventListener('DOMContentLoaded', () => {
-  initScan();       // Wire up scan/cancel buttons and polling.
-  initSidebar();    // Prepare sidebar (populated after scan).
-  initSettings();   // Wire up settings pane toggle.
+  initScan();       // Wire up scan/cancel/refresh buttons and polling.
+  initSidebar();    // Prepare sidebar folder tree (populated after scan).
   initBrowse();     // Wire up folder browse dialog.
   initActions();    // Expose delete/mismatch handlers + batch actions.
-  initPreview();    // Initialize image preview panel (Zone 5).
+  initPreview();    // Initialize image preview panel.
+  initHistory();    // Wire up undo/redo buttons.
+  initFilters();    // Wire up dynamic filter controls.
+
+  // Render Feather icons (replaces <i data-feather="..."> with SVGs).
+  if (typeof feather !== 'undefined') feather.replace();
 });

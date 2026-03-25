@@ -4,38 +4,98 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DedupPhotos - Duplicate Photo Finder</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/feather-icons"></script>
   <link rel="stylesheet" href="/static/css/base.css">
   <link rel="stylesheet" href="/static/css/layout.css">
-  <link rel="stylesheet" href="/static/css/cards.css">
+  <link rel="stylesheet" href="/static/css/table.css">
   <link rel="stylesheet" href="/static/css/components.css">
 </head>
 <body>
 
-<!-- 5-zone grid layout: topbar, sidebar (folders+preview), main, settings -->
+<!-- 3-zone grid: topbar, left panel + center table -->
 <div class="app-layout">
 
-  <!-- Zone B — Top Bar -->
+  <!-- Zone B — Top Bar: scan settings + action buttons + stats -->
   <div class="topbar">
+    <!-- Row 1: Scan configuration -->
     <div class="topbar-row">
-      <span class="topbar-title">DedupPhotos</span>
-      <input type="text" id="scan-path" placeholder="/path/to/photos or \\\\NAS\\share" aria-label="Folder path">
-      <button class="btn" style="background:var(--bg);border:1px solid var(--border);color:var(--text)" id="browse-btn">Browse</button>
-      <div class="threshold-group">
-        <label for="scan-threshold">Threshold:</label>
-        <input type="number" id="scan-threshold" value="10" min="0" max="64" aria-label="Similarity threshold">
+      <span class="topbar-logo"><i data-feather="copy"></i> Dedup Photos</span>
+      <div class="topbar-field">
+        <label for="scan-path">Source folder</label>
+        <div class="input-group">
+          <input type="text" id="scan-path" placeholder="/path/to/photos or \\\\NAS\\share">
+          <button class="btn btn-outline btn-sm" id="browse-btn"><i data-feather="folder"></i> Browse...</button>
+        </div>
       </div>
-      <button class="btn btn-primary" id="scan-btn">Scan</button>
-      <button class="btn btn-danger" id="cancel-btn" style="display:none">Cancel</button>
-
-      <!-- Batch action buttons (visible only when groups are selected) -->
-      <div class="batch-actions" id="batch-actions" style="display:none">
-        <span class="batch-label" id="batch-count">0 groups</span>
-        <button class="btn btn-primary btn-sm" id="batch-keep-best">Keep Best</button>
-        <button class="btn btn-danger btn-sm" id="batch-delete-all">Delete All</button>
+      <div class="topbar-field">
+        <label for="scan-threshold">Threshold difference</label>
+        <div class="range-group">
+          <input type="range" id="scan-threshold" min="0" max="100" value="10">
+          <span class="range-value" id="threshold-value">10%</span>
+        </div>
       </div>
-
-      <div class="topbar-spacer"></div>
-      <button class="settings-toggle" id="settings-toggle-btn">Settings &#9654;</button>
+      <div class="topbar-field">
+        <label for="setting-algorithm">Algorithm</label>
+        <select id="setting-algorithm">
+          <option value="dhash">dHash</option>
+          <option value="phash">pHash</option>
+          <option value="both">Both</option>
+        </select>
+      </div>
+      <div class="topbar-field topbar-extensions">
+        <label>Extensions to include</label>
+        <div class="ext-grid">
+          <label><input type="checkbox" value="jpg" checked> JPG</label>
+          <label><input type="checkbox" value="tiff"> TIFF</label>
+          <label><input type="checkbox" value="gif"> GIF</label>
+          <label><input type="checkbox" value="png"> PNG</label>
+          <label><input type="checkbox" value="emf"> EMF</label>
+          <label><input type="checkbox" value="dng"> DNG</label>
+          <label><input type="checkbox" value="bmp"> BMP</label>
+          <label><input type="checkbox" value="psd"> PSD</label>
+          <label><input type="checkbox" value="arw"> ARW</label>
+        </div>
+      </div>
+      <div class="topbar-field">
+        <label for="setting-max-width">Max width (px)</label>
+        <input type="number" id="setting-max-width" value="0" min="0">
+      </div>
+      <div class="topbar-field">
+        <label for="setting-max-height">Max height (px)</label>
+        <input type="number" id="setting-max-height" value="0" min="0">
+      </div>
+      <div class="topbar-field">
+        <label for="setting-normalised-size">Normalised size</label>
+        <select id="setting-normalised-size">
+          <option value="16">16x16</option>
+          <option value="32" selected>32x32</option>
+          <option value="64">64x64</option>
+          <option value="128">128x128</option>
+        </select>
+      </div>
+    </div>
+    <!-- Row 2: Action buttons + Stats -->
+    <div class="topbar-actions">
+      <div class="topbar-buttons">
+        <button class="btn btn-primary" id="scan-btn"><i data-feather="search"></i> Scan</button>
+        <button class="btn btn-danger" id="cancel-btn" style="display:none"><i data-feather="x-circle"></i> Cancel</button>
+        <button class="btn btn-icon" id="undo-btn" title="Undo" disabled><i data-feather="corner-up-left"></i></button>
+        <button class="btn btn-icon" id="redo-btn" title="Redo" disabled><i data-feather="corner-up-right"></i></button>
+        <button class="btn btn-icon" id="refresh-btn" title="Refresh results"><i data-feather="refresh-cw"></i></button>
+        <!-- Batch actions (visible when groups selected) -->
+        <div class="batch-actions" id="batch-actions" style="display:none">
+          <span class="batch-label" id="batch-count">0 groups</span>
+          <button class="btn btn-primary btn-sm" id="batch-keep-best">Keep Best</button>
+          <button class="btn btn-danger btn-sm" id="batch-delete-all">Delete All</button>
+        </div>
+      </div>
+      <div class="topbar-stats" id="stats-bar">
+        <div class="stat"><span class="stat-label">Files scanned</span><span class="stat-value" id="stat-files">--</span></div>
+        <div class="stat"><span class="stat-label">Duplicate groups</span><span class="stat-value" id="stat-groups">--</span></div>
+        <div class="stat"><span class="stat-label">Space savings</span><span class="stat-value" id="stat-savings">--</span></div>
+        <div class="stat"><span class="stat-label">Duration</span><span class="stat-value" id="stat-duration">--</span></div>
+      </div>
     </div>
     <!-- Progress bar (visible during scan) -->
     <div class="progress-section" id="progress-section">
@@ -49,78 +109,56 @@
     </div>
   </div>
 
-  <!-- Zone A — Left Sidebar: split into folder tree (top) and image preview (bottom) -->
-  <div class="sidebar">
-    <!-- Zone 1: Folder tree -->
-    <div class="sidebar-folders">
-      <div class="sidebar-header">Folders</div>
+  <!-- Zone A — Left Panel: preview + folder tree + filters -->
+  <div class="left-panel">
+    <!-- Section 1: Preview -->
+    <div class="panel-section panel-preview">
+      <div class="panel-header">Preview</div>
+      <div id="preview-area">
+        <div class="preview-empty"><i data-feather="image"></i><p>Click a row to preview</p></div>
+      </div>
+    </div>
+    <!-- Section 2: Location with duplicates -->
+    <div class="panel-section panel-folders">
+      <div class="panel-header">Location with duplicates</div>
       <div id="sidebar-tree"></div>
     </div>
-    <!-- Zone 5: Image preview -->
-    <div class="sidebar-preview">
-      <div class="sidebar-header">Preview</div>
-      <div id="preview-area">
-        <div class="preview-empty">Click a row to preview</div>
+    <!-- Section 3: Filters -->
+    <div class="panel-section panel-filters">
+      <div class="panel-header">Filters</div>
+      <div class="filter-group">
+        <label for="filter-filename"><i data-feather="search"></i> Filename</label>
+        <input type="text" id="filter-filename" placeholder="Search by name...">
+      </div>
+      <div class="filter-group">
+        <label for="filter-diff">% diff with original</label>
+        <div class="range-group">
+          <input type="range" id="filter-diff" min="0" max="100" value="100">
+          <span class="range-value" id="filter-diff-value">100%</span>
+        </div>
+      </div>
+      <div class="filter-group">
+        <label>Extension</label>
+        <div class="ext-grid" id="filter-ext-grid">
+          <label><input type="checkbox" value="jpg" checked> JPG</label>
+          <label><input type="checkbox" value="png" checked> PNG</label>
+          <label><input type="checkbox" value="bmp" checked> BMP</label>
+          <label><input type="checkbox" value="tiff" checked> TIFF</label>
+          <label><input type="checkbox" value="gif" checked> GIF</label>
+          <label><input type="checkbox" value="webp" checked> WebP</label>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- Zone D — Central Main Area: interactive results table -->
+  <!-- Zone D — Center: Data table -->
   <div class="main-area">
     <div id="results-area">
       <div class="empty-state" id="empty-state">
-        <div class="icon">&#128247;</div>
-        <p>Enter a folder path above and click Scan to find duplicate photos.</p>
+        <div class="empty-icon"><i data-feather="camera"></i></div>
+        <p>Enter a folder path above and click <strong>Scan</strong> to find duplicate photos.</p>
       </div>
-      <div class="groups" id="groups-container"></div>
-    </div>
-  </div>
-
-  <!-- Zone C — Right Settings Pane -->
-  <div class="settings-pane">
-    <div class="settings-pane-header">
-      <span class="settings-pane-title">Settings</span>
-      <button class="settings-close-btn" id="settings-close-btn">&times;</button>
-    </div>
-    <div class="settings-field">
-      <label for="setting-algorithm">Algorithm</label>
-      <select id="setting-algorithm">
-        <option value="dhash">dHash (default)</option>
-        <option value="phash">pHash</option>
-        <option value="both">Both (dHash fallback)</option>
-      </select>
-    </div>
-    <div class="settings-field">
-      <label for="setting-extensions">Extensions (comma-separated)</label>
-      <input type="text" id="setting-extensions" placeholder="jpg,png,tiff,webp" value="">
-    </div>
-    <div class="settings-field">
-      <label for="setting-min-width">Min width (px, 0=none)</label>
-      <input type="number" id="setting-min-width" value="0" min="0">
-    </div>
-    <div class="settings-field">
-      <label for="setting-max-height">Max height (px, 0=none)</label>
-      <input type="number" id="setting-max-height" value="0" min="0">
-    </div>
-  </div>
-
-  <!-- Status Bar at bottom -->
-  <div class="status-bar" id="stats-bar">
-    <div class="stat-card">
-      <div class="label">Files Scanned</div>
-      <div class="value" id="stat-files">0</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Duplicate Groups</div>
-      <div class="value" id="stat-groups">0</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Space Savings</div>
-      <div class="value" id="stat-savings">0 B</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Duration</div>
-      <div class="value" id="stat-duration">--</div>
+      <div id="groups-container"></div>
     </div>
   </div>
 

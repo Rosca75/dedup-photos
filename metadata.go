@@ -74,6 +74,8 @@ type ImageMetadata struct {
 	Title        string  `json:"title"`         // Image title from EXIF/XMP, if present.
 	Description  string  `json:"description"`   // Image description from EXIF/XMP, if present.
 	QualityScore int     `json:"quality_score"` // Computed quality score, 0-100.
+	Blockiness   float64 `json:"blockiness"`    // JPEG blockiness score (0=smooth, higher=more blocky artifacts).
+	Blurring     float64 `json:"blurring"`      // Blur detection score (0=sharp, higher=more blurry).
 	IsBest       bool    `json:"is_best"`       // True if this is the recommended "keep" image in a group.
 }
 
@@ -251,6 +253,15 @@ func ExtractMetadata(path string) ImageMetadata {
 	// keep. Higher score = more "valuable" image. See ComputeQualityScore
 	// for the scoring algorithm.
 	meta.QualityScore = ComputeQualityScore(&meta)
+
+	// -------------------------------------------------------------------------
+	// Step 6: Compute blockiness and blurring scores
+	// -------------------------------------------------------------------------
+	//
+	// These metrics help identify JPEG compression artifacts (blockiness) and
+	// out-of-focus or motion-blurred images (blurring). They're computed from
+	// the image pixels and displayed in the results table.
+	meta.Blockiness, meta.Blurring = ComputeImageQualityMetrics(path)
 
 	return meta
 }
@@ -436,4 +447,138 @@ func ComputeQualityScore(meta *ImageMetadata) int {
 	finalScore := int(math.Max(0, math.Min(100, score)))
 
 	return finalScore
+}
+
+// =============================================================================
+// ComputeImageQualityMetrics — Blockiness and blurring scores
+// =============================================================================
+
+// ComputeImageQualityMetrics computes two quality metrics for an image:
+//
+// Blockiness: Measures JPEG compression artifacts. JPEG encodes images in 8x8
+// blocks. Over-compressed images show visible block boundaries. We detect
+// these by measuring the average gradient at 8-pixel intervals and comparing
+// it to the overall gradient. Higher values = more visible artifacts.
+//
+// Blurring: Measures image sharpness using the Laplacian operator (second
+// derivative). Sharp images have high variance in the Laplacian, blurry
+// images have low variance. We compute on a downscaled version for speed.
+//
+// Returns (blockiness, blurring). Both return 0.0 if the image can't be decoded.
+func ComputeImageQualityMetrics(path string) (float64, float64) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0
+	}
+	defer file.Close()
+
+	// Use DecodeConfig first to check dimensions, then decode.
+	img, _, err := image.Decode(file)
+	if err != nil {
+		return 0, 0
+	}
+
+	bounds := img.Bounds()
+	w := bounds.Max.X - bounds.Min.X
+	h := bounds.Max.Y - bounds.Min.Y
+	if w < 16 || h < 16 {
+		return 0, 0
+	}
+
+	// Cap at 512px for performance — we don't need full resolution.
+	// Use nearest-neighbor sampling for speed.
+	maxDim := 512
+	scaleW, scaleH := w, h
+	if w > maxDim || h > maxDim {
+		ratio := float64(maxDim) / math.Max(float64(w), float64(h))
+		scaleW = int(float64(w) * ratio)
+		scaleH = int(float64(h) * ratio)
+	}
+
+	// Build grayscale grid.
+	gray := make([][]float64, scaleH)
+	for y := 0; y < scaleH; y++ {
+		gray[y] = make([]float64, scaleW)
+		for x := 0; x < scaleW; x++ {
+			srcX := bounds.Min.X + x*w/scaleW
+			srcY := bounds.Min.Y + y*h/scaleH
+			r, g, b, _ := img.At(srcX, srcY).RGBA()
+			// Luminance in [0, 255] range.
+			gray[y][x] = float64(299*r+587*g+114*b) / 1000.0 / 256.0
+		}
+	}
+
+	blockiness := computeBlockiness(gray, scaleW, scaleH)
+	blurring := computeBlurring(gray, scaleW, scaleH)
+	return blockiness, blurring
+}
+
+// computeBlockiness measures JPEG block boundary artifacts.
+// It compares the average gradient at 8-pixel boundaries to the overall gradient.
+func computeBlockiness(gray [][]float64, w, h int) float64 {
+	var boundarySum, totalSum float64
+	var boundaryCount, totalCount int
+
+	for y := 1; y < h; y++ {
+		for x := 1; x < w; x++ {
+			// Horizontal gradient.
+			dx := math.Abs(gray[y][x] - gray[y][x-1])
+			totalSum += dx
+			totalCount++
+			if x%8 == 0 {
+				boundarySum += dx
+				boundaryCount++
+			}
+		}
+	}
+
+	if totalCount == 0 || boundaryCount == 0 {
+		return 0
+	}
+
+	avgBoundary := boundarySum / float64(boundaryCount)
+	avgTotal := totalSum / float64(totalCount)
+
+	if avgTotal < 0.01 {
+		return 0
+	}
+	// Ratio of boundary gradient to overall gradient.
+	// Values close to 1.0 = no blockiness, higher = more blocky.
+	return math.Max(0, (avgBoundary/avgTotal)-1.0) * 100.0
+}
+
+// computeBlurring estimates image sharpness via Laplacian variance.
+// Lower variance = more blurry. We return the inverse so higher = more blurry.
+func computeBlurring(gray [][]float64, w, h int) float64 {
+	if w < 3 || h < 3 {
+		return 0
+	}
+
+	// Apply 3x3 Laplacian kernel: [0,-1,0; -1,4,-1; 0,-1,0]
+	var sum, sumSq float64
+	count := 0
+	for y := 1; y < h-1; y++ {
+		for x := 1; x < w-1; x++ {
+			laplacian := 4*gray[y][x] - gray[y-1][x] - gray[y+1][x] - gray[y][x-1] - gray[y][x+1]
+			sum += laplacian
+			sumSq += laplacian * laplacian
+			count++
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+
+	mean := sum / float64(count)
+	variance := sumSq/float64(count) - mean*mean
+
+	// Higher variance = sharper. We invert so higher = more blurry.
+	// Scale to a readable range. Typical sharp images have variance 50-500.
+	if variance < 0.01 {
+		return 100.0 // Extremely blurry.
+	}
+	// Map: variance 500+ → ~0 blur, variance ~1 → ~100 blur.
+	blurScore := math.Max(0, math.Min(100, 100.0-variance*0.2))
+	return math.Round(blurScore*100) / 100
 }

@@ -41,7 +41,7 @@ export function showConfirm(message, onYes) {
 
   const noBtn = document.createElement("button");
   noBtn.className = "btn";
-  noBtn.style.cssText = "background:var(--border);color:var(--text)";
+  noBtn.style.cssText = "background:var(--bg-subtle);border:1px solid var(--border);color:var(--text)";
   noBtn.textContent = "Cancel";
 
   row.appendChild(yesBtn);

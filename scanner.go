@@ -53,6 +53,18 @@ var supportedExtensions = map[string]bool{
 	".gif":  true,
 	".heic": true,
 	".heif": true,
+	// RAW formats — decoded via embedded JPEG preview in EXIF.
+	".dng": true, // Adobe Digital Negative.
+	".arw": true, // Sony RAW.
+	".cr2": true, // Canon RAW v2.
+	".cr3": true, // Canon RAW v3.
+	".nef": true, // Nikon RAW.
+	".orf": true, // Olympus RAW.
+	".rw2": true, // Panasonic RAW.
+	".raf": true, // Fujifilm RAW.
+	// Other image formats.
+	".psd": true, // Adobe Photoshop.
+	".emf": true, // Enhanced Metafile.
 }
 
 // ScanDirectory recursively walks the directory tree starting at rootPath and
