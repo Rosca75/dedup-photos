@@ -219,6 +219,144 @@ func ComputeDHashFromEXIFThumbnail(path string) (uint64, error) {
 	return computeDHashFromImage(img), nil
 }
 
+// =============================================================================
+// computeDHashSmart — Buffer-based dHash with EXIF thumbnail fast-path
+// =============================================================================
+
+// computeDHashSmart computes a dHash from file bytes already in memory.
+// It tries the EXIF thumbnail first (fast — ~0.5ms) and falls back to
+// full image decode (slow — ~30-50ms) if no thumbnail is available.
+//
+// This avoids re-opening the file since we already have the bytes from
+// the single os.ReadFile call in ComputeAllHashes.
+func computeDHashSmart(data []byte) (uint64, error) {
+	// Fast path: try to extract and use the EXIF thumbnail.
+	// Most JPEG/HEIC files from cameras embed a small thumbnail (~10-20KB).
+	x, err := exif.Decode(bytes.NewReader(data))
+	if err == nil {
+		thumb, err := x.JpegThumbnail()
+		if err == nil && len(thumb) > 0 {
+			img, _, err := image.Decode(bytes.NewReader(thumb))
+			if err == nil {
+				return computeDHashFromImage(img), nil
+			}
+		}
+	}
+
+	// Slow path: decode the full image (PNG, BMP, edited JPEG without thumbnail).
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return 0, fmt.Errorf("failed to decode image: %w", err)
+	}
+	return computeDHashFromImage(img), nil
+}
+
+// =============================================================================
+// computePHashFromData — Buffer-based pHash (average hash)
+// =============================================================================
+
+// computePHashFromData computes a pHash from file bytes already in memory.
+// Same algorithm as ComputePHash but works on a []byte buffer instead of
+// opening a file, avoiding redundant file I/O.
+func computePHashFromData(data []byte) (uint64, error) {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return 0, fmt.Errorf("failed to decode image: %w", err)
+	}
+
+	bounds := img.Bounds()
+	srcWidth := bounds.Max.X - bounds.Min.X
+	srcHeight := bounds.Max.Y - bounds.Min.Y
+
+	const size = 8
+	gray := make([][]uint32, size)
+	for y := 0; y < size; y++ {
+		gray[y] = make([]uint32, size)
+	}
+
+	var total uint64
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			srcX := bounds.Min.X + (x * srcWidth / size)
+			srcY := bounds.Min.Y + (y * srcHeight / size)
+			r, g, b, _ := img.At(srcX, srcY).RGBA()
+			luminance := (299*r + 587*g + 114*b) / 1000
+			gray[y][x] = luminance
+			total += uint64(luminance)
+		}
+	}
+
+	avg := total / (size * size)
+
+	var hash uint64
+	bitPosition := 0
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			if uint64(gray[y][x]) > avg {
+				hash |= 1 << uint(bitPosition)
+			}
+			bitPosition++
+		}
+	}
+
+	return hash, nil
+}
+
+// =============================================================================
+// ComputeAllHashes — Single-read, cache-aware hash computation
+// =============================================================================
+
+// ComputeAllHashes computes both xxHash and dHash for a single file using
+// a single file read. It checks the cache first and returns cached values
+// if the file hasn't changed (same size + modification time).
+//
+// This is the core optimization: instead of opening the file 2-3 times
+// (once for xxHash, once for EXIF thumbnail, once for full decode), we
+// read the file ONCE into memory and compute everything from the buffer.
+//
+// Parameters:
+//   - path: absolute file path
+//   - info: os.FileInfo from a prior os.Stat call (for cache validation)
+//   - cache: the persistent hash cache (never nil)
+//   - algorithm: "dhash", "phash", or "both"
+//
+// Returns:
+//   - xxHash: full-file xxHash64
+//   - dHash: perceptual hash (dHash or pHash depending on algorithm)
+//   - cacheHit: true if values came from cache (no I/O performed)
+//   - error: non-nil if the file couldn't be read or decoded
+func ComputeAllHashes(path string, info os.FileInfo, cache *HashCache, algorithm string) (xxHash uint64, dHash uint64, cacheHit bool, err error) {
+	// 1. Check cache — if the file hasn't changed, return cached hashes.
+	if xxh, dh, ok := cache.Lookup(path, info); ok {
+		return xxh, dh, true, nil
+	}
+
+	// 2. Cache miss — read the entire file ONCE into memory.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("failed to read file %s: %w", path, err)
+	}
+
+	// 3. Compute xxHash from the in-memory buffer (no file I/O).
+	xxh := xxhash.Sum64(data)
+
+	// 4. Compute perceptual hash from the same buffer.
+	var dh uint64
+	switch algorithm {
+	case "phash":
+		dh, err = computePHashFromData(data)
+	default: // "dhash" or "both"
+		// computeDHashSmart tries EXIF thumbnail first (fast), then full decode.
+		dh, err = computeDHashSmart(data)
+	}
+	if err != nil {
+		// dHash failed but xxHash is still valid.
+		dh = 0
+	}
+
+	return xxh, dh, false, nil
+}
+
 // computeDHashFromImage computes a dHash from an already-decoded image.
 // This is the shared core logic used by both ComputeDHash (full decode)
 // and ComputeDHashFromEXIFThumbnail (thumbnail decode).
@@ -378,27 +516,25 @@ func ComputePHash(path string) (uint64, error) {
 // HashAllImagesWithContext — Parallel hashing with cancellation support
 // =============================================================================
 
-// HashAllImagesWithContext hashes all images using a multi-pass pipeline that
-// avoids unnecessary work. Instead of reading every full file and decoding
-// every image, it uses increasingly expensive passes:
+// HashAllImagesWithContext hashes all images using a cache-aware, single-read
+// pipeline. Each file is read at most once, and unchanged files are served
+// entirely from the persistent disk cache (zero I/O).
 //
-//	Phase A: Get file sizes (os.Stat only — zero file reads)
-//	Phase B: Partial xxHash (64KB read) for ALL files — fast pre-filter
-//	Phase C: Full xxHash ONLY for files sharing same (size + partial hash)
-//	Phase D: Perceptual hash for ALL files (EXIF thumbnail first, full decode fallback)
+// Pipeline:
+//  1. Load persistent hash cache from disk
+//  2. os.Stat all files (for cache validation + progress)
+//  3. Workers call ComputeAllHashes (cache check → single read → xxHash + dHash)
+//  4. Save updated cache to disk
 //
-// The function signature is unchanged from the original single-pass version,
-// so server.go doesn't need modifications.
-//
-// The optional progressFn callback reports phase changes and progress counts
-// to the caller (typically the server, which forwards it to the UI).
+// The function signature is unchanged so server.go/grouper.go don't need changes.
 func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int, algorithm string) []ImageHash {
-	return HashAllImagesWithProgress(ctx, paths, numWorkers, algorithm, nil)
+	return HashAllImagesWithProgress(ctx, paths, numWorkers, algorithm, nil, "")
 }
 
 // HashAllImagesWithProgress is the same as HashAllImagesWithContext but accepts
-// a ProgressCallback for reporting phase/progress updates to the UI.
-func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers int, algorithm string, progressFn ProgressCallback) []ImageHash {
+// a ProgressCallback for reporting phase/progress updates to the UI, and a
+// scanPath used to load/save the persistent hash cache.
+func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers int, algorithm string, progressFn ProgressCallback, scanPath string) []ImageHash {
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
 	}
@@ -415,76 +551,45 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 		}
 	}
 
-	fmt.Printf("[hasher] Starting multi-pass pipeline for %d images (%d workers, algorithm: %s)\n", totalImages, numWorkers, algorithm)
+	fmt.Printf("[hasher] Starting cache-aware pipeline for %d images (%d workers, algorithm: %s)\n", totalImages, numWorkers, algorithm)
 
 	// =======================================================================
-	// Phase A: Get file sizes via os.Stat (no file content reads)
+	// Phase 1: Load persistent hash cache
 	// =======================================================================
 	phaseStart := time.Now()
-	reportProgress("Reading file sizes...", 0, totalImages)
+	reportProgress("Loading hash cache...", 0, totalImages)
 
-	// fileSize maps each path to its file size in bytes.
-	fileSize := make(map[string]int64, totalImages)
-	// sizeGroups maps file size → list of paths with that size.
-	sizeGroups := make(map[int64][]string)
+	var cache *HashCache
+	if scanPath != "" {
+		cache = LoadCache(scanPath)
+	} else {
+		cache = newEmptyCache()
+	}
 
+	fmt.Printf("[hasher] Cache loaded (%d entries) → %.1fs\n", len(cache.Entries), time.Since(phaseStart).Seconds())
+
+	// =======================================================================
+	// Phase 2: os.Stat all files (needed for cache validation)
+	// =======================================================================
+	phaseStart = time.Now()
+	reportProgress("Reading file info...", 0, totalImages)
+
+	// fileInfo stores the os.FileInfo for each path.
+	fileInfo := make(map[string]os.FileInfo, totalImages)
 	var statCount atomic.Int32
-	var mu sync.Mutex
+	var muInfo sync.Mutex
+
 	runParallel(ctx, paths, numWorkers, func(path string) {
 		info, err := os.Stat(path)
 		if err != nil {
-			return // Skip files we can't stat.
-		}
-		sz := info.Size()
-		mu.Lock()
-		fileSize[path] = sz
-		sizeGroups[sz] = append(sizeGroups[sz], path)
-		mu.Unlock()
-		cur := int(statCount.Add(1))
-		if cur%200 == 0 || cur == totalImages {
-			reportProgress("Reading file sizes...", cur, totalImages)
-		}
-	})
-
-	if ctx.Err() != nil {
-		return nil
-	}
-
-	// Count how many files share a size with at least one other file.
-	var sizeCollisionPaths []string
-	for _, group := range sizeGroups {
-		if len(group) > 1 {
-			sizeCollisionPaths = append(sizeCollisionPaths, group...)
-		}
-	}
-
-	fmt.Printf("[hasher] Phase A (file sizes): %d files, %d share sizes → %.1fs\n",
-		totalImages, len(sizeCollisionPaths), time.Since(phaseStart).Seconds())
-
-	// =======================================================================
-	// Phase B: Partial xxHash (64KB) for ALL files — fast pre-filter
-	// =======================================================================
-	phaseStart = time.Now()
-	reportProgress("Computing quick fingerprints...", 0, totalImages)
-
-	const partialSize = 65536 // 64KB — enough to distinguish most files.
-
-	// partialHash maps each path to its partial xxHash.
-	partialHash := make(map[string]uint64, totalImages)
-	var partialCount atomic.Int32
-	var muPartial sync.Mutex
-
-	runParallel(ctx, paths, numWorkers, func(path string) {
-		ph, err := ComputePartialXXHash(path, partialSize)
-		if err != nil {
 			return
 		}
-		muPartial.Lock()
-		partialHash[path] = ph
-		muPartial.Unlock()
-		cur := int(partialCount.Add(1))
-		if cur%200 == 0 || cur == totalImages {
-			reportProgress("Computing quick fingerprints...", cur, totalImages)
+		muInfo.Lock()
+		fileInfo[path] = info
+		muInfo.Unlock()
+		cur := int(statCount.Add(1))
+		if cur%500 == 0 || cur == totalImages {
+			reportProgress("Reading file info...", cur, totalImages)
 		}
 	})
 
@@ -492,168 +597,118 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 		return nil
 	}
 
-	fmt.Printf("[hasher] Phase B (partial xxHash): %d files × 64KB → %.1fs\n",
-		totalImages, time.Since(phaseStart).Seconds())
+	fmt.Printf("[hasher] Phase 2 (stat): %d files → %.1fs\n", len(fileInfo), time.Since(phaseStart).Seconds())
 
 	// =======================================================================
-	// Phase C: Full xxHash ONLY for files that share (size + partial hash)
+	// Phase 3: Compute hashes (cache-aware, single-read per file)
 	// =======================================================================
 	phaseStart = time.Now()
 
-	// Build groups keyed by (size, partial hash). Only groups with 2+ files
-	// need full xxHash — those are the exact-duplicate candidates.
-	type sizePartialKey struct {
-		size    int64
-		partial uint64
-	}
-	spGroups := make(map[sizePartialKey][]string)
+	// Count cache hits vs misses for progress display.
+	var cacheHits, cacheMisses atomic.Int32
+
+	// Pre-scan to count how many will be cache hits (for progress message).
 	for _, path := range paths {
-		sz, ok1 := fileSize[path]
-		ph, ok2 := partialHash[path]
-		if !ok1 || !ok2 {
+		info, ok := fileInfo[path]
+		if !ok {
 			continue
 		}
-		key := sizePartialKey{size: sz, partial: ph}
-		spGroups[key] = append(spGroups[key], path)
-	}
-
-	// Collect only the paths that need full xxHash (collision candidates).
-	var fullHashPaths []string
-	for _, group := range spGroups {
-		if len(group) > 1 {
-			fullHashPaths = append(fullHashPaths, group...)
-		}
-	}
-
-	reportProgress("Verifying exact matches...", 0, len(fullHashPaths))
-
-	// fullXXHash maps each path to its full-file xxHash.
-	fullXXHash := make(map[string]uint64, len(fullHashPaths))
-	var fullCount atomic.Int32
-	var muFull sync.Mutex
-
-	runParallel(ctx, fullHashPaths, numWorkers, func(path string) {
-		xxh, err := ComputeXXHash(path)
-		if err != nil {
-			return
-		}
-		muFull.Lock()
-		fullXXHash[path] = xxh
-		muFull.Unlock()
-		cur := int(fullCount.Add(1))
-		total := len(fullHashPaths)
-		if cur%50 == 0 || cur == total {
-			reportProgress("Verifying exact matches...", cur, total)
-		}
-	})
-
-	if ctx.Err() != nil {
-		return nil
-	}
-
-	fmt.Printf("[hasher] Phase C (full xxHash): %d candidates out of %d → %.1fs\n",
-		len(fullHashPaths), totalImages, time.Since(phaseStart).Seconds())
-
-	// =======================================================================
-	// Phase D: Perceptual hash for ALL files
-	// =======================================================================
-	// Try EXIF thumbnail dHash first (fast), fall back to full decode (slow).
-	phaseStart = time.Now()
-	reportProgress("Computing visual fingerprints...", 0, totalImages)
-
-	perceptualHash := make(map[string]uint64, totalImages)
-	perceptualErr := make(map[string]error, 0)
-	var perceptualCount atomic.Int32
-	var thumbCount, fullDecodeCount atomic.Int32
-	var muPerceptual sync.Mutex
-
-	// Choose the perceptual hash function based on algorithm setting.
-	perceptualHashFn := func(path string) (uint64, error) {
-		switch algorithm {
-		case "phash":
-			return ComputePHash(path)
-		default: // "dhash" or "both" — use dHash for grouping
-			return ComputeDHash(path)
-		}
-	}
-
-	runParallel(ctx, paths, numWorkers, func(path string) {
-		var dh uint64
-		var err error
-
-		// Fast path: try EXIF thumbnail (only for dHash, not pHash).
-		if algorithm != "phash" {
-			dh, err = ComputeDHashFromEXIFThumbnail(path)
-			if err == nil {
-				thumbCount.Add(1)
-				muPerceptual.Lock()
-				perceptualHash[path] = dh
-				muPerceptual.Unlock()
-				cur := int(perceptualCount.Add(1))
-				if cur%200 == 0 || cur == totalImages {
-					reportProgress("Computing visual fingerprints...", cur, totalImages)
-				}
-				return
-			}
-		}
-
-		// Slow path: full image decode.
-		fullDecodeCount.Add(1)
-		dh, err = perceptualHashFn(path)
-		muPerceptual.Lock()
-		if err != nil {
-			perceptualErr[path] = err
+		if _, _, hit := cache.Lookup(path, info); hit {
+			cacheHits.Add(1)
 		} else {
-			perceptualHash[path] = dh
+			cacheMisses.Add(1)
 		}
-		muPerceptual.Unlock()
-		cur := int(perceptualCount.Add(1))
-		if cur%200 == 0 || cur == totalImages {
-			reportProgress("Computing visual fingerprints...", cur, totalImages)
-		}
-	})
+	}
+	hits := int(cacheHits.Load())
+	misses := int(cacheMisses.Load())
 
-	if ctx.Err() != nil {
-		return nil
+	phaseMsg := fmt.Sprintf("Computing fingerprints... (%d cached, %d to compute)", hits, misses)
+	reportProgress(phaseMsg, 0, totalImages)
+	fmt.Printf("[hasher] Cache: %d hits, %d misses\n", hits, misses)
+
+	// Reset counters for actual processing progress.
+	cacheHits.Store(0)
+	cacheMisses.Store(0)
+
+	// Build a path→index map for O(1) lookup (avoids linear scan per file).
+	pathIndex := make(map[string]int, totalImages)
+	for i, p := range paths {
+		pathIndex[p] = i
 	}
 
-	fmt.Printf("[hasher] Phase D (perceptual): %d via EXIF thumbnail, %d via full decode → %.1fs\n",
-		int(thumbCount.Load()), int(fullDecodeCount.Load()), time.Since(phaseStart).Seconds())
+	// Results are written into this slice (one per path, in order).
+	// Each index is written by exactly one goroutine, so no lock needed
+	// for the slice itself.
+	allResults := make([]ImageHash, totalImages)
+	var processedCount atomic.Int32
+	var muCache sync.Mutex
 
-	// =======================================================================
-	// Assemble final results
-	// =======================================================================
-	// Combine all phases into ImageHash results. Each file gets:
-	//   - XXHash: full xxHash if it was a collision candidate, else partial xxHash
-	//   - DHash: perceptual hash (from thumbnail or full decode)
-	//   - Error: set if perceptual hashing failed
-	allResults := make([]ImageHash, 0, totalImages)
-	for _, path := range paths {
+	// Process each file: cache check → single read → compute hashes.
+	runParallel(ctx, paths, numWorkers, func(path string) {
+		idx := pathIndex[path]
 		result := ImageHash{Path: path}
 
-		// Use full xxHash if available (collision candidate), else partial hash.
-		// Partial hash is sufficient for non-collision files: they won't match
-		// anything anyway since no other file shares their (size, partial) key.
-		if xxh, ok := fullXXHash[path]; ok {
+		info, ok := fileInfo[path]
+		if !ok {
+			result.Error = fmt.Errorf("could not stat file: %s", path)
+			allResults[idx] = result
+			return
+		}
+
+		// Check cache under lock (fast — just a map lookup).
+		muCache.Lock()
+		xxh, dh, wasHit := cache.Lookup(path, info)
+		muCache.Unlock()
+
+		if wasHit {
+			// Cache hit — no I/O needed at all!
 			result.XXHash = xxh
-		} else if ph, ok := partialHash[path]; ok {
-			result.XXHash = ph
-		}
-
-		// Set perceptual hash.
-		if dh, ok := perceptualHash[path]; ok {
 			result.DHash = dh
+			cacheHits.Add(1)
+		} else {
+			// Cache miss — read file and compute hashes (no lock needed
+			// for file I/O, which is the slow part we want parallelized).
+			var err error
+			xxh, dh, _, err = ComputeAllHashes(path, info, cache, algorithm)
+			if err != nil {
+				result.Error = err
+			} else {
+				result.XXHash = xxh
+				result.DHash = dh
+			}
+			// Store result in cache under lock.
+			muCache.Lock()
+			cache.Store(path, info, xxh, dh)
+			muCache.Unlock()
+			cacheMisses.Add(1)
 		}
 
-		// Set error if perceptual hashing failed.
-		if err, ok := perceptualErr[path]; ok {
-			result.Error = err
-		}
+		allResults[idx] = result
 
-		allResults = append(allResults, result)
+		cur := int(processedCount.Add(1))
+		if cur%100 == 0 || cur == totalImages {
+			reportProgress(phaseMsg, cur, totalImages)
+		}
+	})
+
+	if ctx.Err() != nil {
+		return nil
 	}
 
-	fmt.Printf("[hasher] Done! %d images hashed via multi-pass pipeline.\n", len(allResults))
+	fmt.Printf("[hasher] Phase 3 (hash): %d cache hits, %d computed → %.1fs\n",
+		int(cacheHits.Load()), int(cacheMisses.Load()), time.Since(phaseStart).Seconds())
+
+	// =======================================================================
+	// Phase 4: Save cache to disk
+	// =======================================================================
+	if scanPath != "" {
+		reportProgress("Saving cache...", totalImages, totalImages)
+		if err := SaveCache(cache, scanPath); err != nil {
+			fmt.Printf("[hasher] Warning: failed to save cache: %v\n", err)
+		}
+	}
+
+	fmt.Printf("[hasher] Done! %d images hashed.\n", len(allResults))
 	return allResults
 }
 
