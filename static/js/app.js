@@ -6,6 +6,7 @@ import { initSidebar } from './sidebar.js';
 import { initSettings } from './settings.js';
 import { initBrowse } from './browse.js';
 import { initActions } from './actions.js';
+import { initPreview } from './preview.js';
 
 /**
  * Initialize all application modules once the DOM is ready.
@@ -15,5 +16,6 @@ document.addEventListener('DOMContentLoaded', () => {
   initSidebar();    // Prepare sidebar (populated after scan).
   initSettings();   // Wire up settings pane toggle.
   initBrowse();     // Wire up folder browse dialog.
-  initActions();    // Expose delete/mismatch handlers.
+  initActions();    // Expose delete/mismatch handlers + batch actions.
+  initPreview();    // Initialize image preview panel (Zone 5).
 });

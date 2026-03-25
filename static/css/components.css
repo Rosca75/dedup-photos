@@ -11,6 +11,10 @@
   cursor: pointer;
   transition: all 0.2s;
 }
+.btn-sm {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.72rem;
+}
 .btn-primary { background: var(--accent); color: var(--bg); }
 .btn-primary:hover { filter: brightness(1.15); }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -91,7 +95,7 @@
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 1.5rem;
-  max-width: 420px;
+  max-width: 480px;
   width: 90%;
   box-shadow: 0 8px 32px rgba(0,0,0,0.5);
   text-align: center;
@@ -114,7 +118,7 @@
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 1.25rem;
-  max-width: 520px;
+  max-width: 560px;
   width: 90%;
   max-height: 70vh;
   display: flex;
@@ -122,6 +126,27 @@
   box-shadow: 0 8px 32px rgba(0,0,0,0.5);
 }
 .browse-box h3 { font-size: 0.95rem; margin-bottom: 0.75rem; }
+
+/* Manual path input row in browse dialog (for NAS/network paths) */
+.browse-path-row {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+}
+.browse-path-input {
+  flex: 1;
+  padding: 0.45rem 0.6rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 0.8rem;
+  outline: none;
+}
+.browse-path-input:focus { border-color: var(--accent); }
+.browse-path-input::placeholder { color: var(--muted); }
+
 .browse-current { font-size: 0.72rem; color: var(--muted); margin-bottom: 0.5rem; word-break: break-all; }
 .browse-list {
   flex: 1;

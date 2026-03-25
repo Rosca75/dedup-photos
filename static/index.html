@@ -11,14 +11,14 @@
 </head>
 <body>
 
-<!-- 4-zone grid layout: topbar, sidebar, main, settings -->
+<!-- 5-zone grid layout: topbar, sidebar (folders+preview), main, settings -->
 <div class="app-layout">
 
   <!-- Zone B — Top Bar -->
   <div class="topbar">
     <div class="topbar-row">
       <span class="topbar-title">DedupPhotos</span>
-      <input type="text" id="scan-path" placeholder="/path/to/photos" aria-label="Folder path">
+      <input type="text" id="scan-path" placeholder="/path/to/photos or \\\\NAS\\share" aria-label="Folder path">
       <button class="btn" style="background:var(--bg);border:1px solid var(--border);color:var(--text)" id="browse-btn">Browse</button>
       <div class="threshold-group">
         <label for="scan-threshold">Threshold:</label>
@@ -26,6 +26,14 @@
       </div>
       <button class="btn btn-primary" id="scan-btn">Scan</button>
       <button class="btn btn-danger" id="cancel-btn" style="display:none">Cancel</button>
+
+      <!-- Batch action buttons (visible only when groups are selected) -->
+      <div class="batch-actions" id="batch-actions" style="display:none">
+        <span class="batch-label" id="batch-count">0 groups</span>
+        <button class="btn btn-primary btn-sm" id="batch-keep-best">Keep Best</button>
+        <button class="btn btn-danger btn-sm" id="batch-delete-all">Delete All</button>
+      </div>
+
       <div class="topbar-spacer"></div>
       <button class="settings-toggle" id="settings-toggle-btn">Settings &#9654;</button>
     </div>
@@ -41,13 +49,23 @@
     </div>
   </div>
 
-  <!-- Zone A — Left Sidebar: folder tree navigation -->
+  <!-- Zone A — Left Sidebar: split into folder tree (top) and image preview (bottom) -->
   <div class="sidebar">
-    <div class="sidebar-header">Folders</div>
-    <div id="sidebar-tree"></div>
+    <!-- Zone 1: Folder tree -->
+    <div class="sidebar-folders">
+      <div class="sidebar-header">Folders</div>
+      <div id="sidebar-tree"></div>
+    </div>
+    <!-- Zone 5: Image preview -->
+    <div class="sidebar-preview">
+      <div class="sidebar-header">Preview</div>
+      <div id="preview-area">
+        <div class="preview-empty">Click a row to preview</div>
+      </div>
+    </div>
   </div>
 
-  <!-- Zone D — Central Main Area: duplicate groups -->
+  <!-- Zone D — Central Main Area: interactive results table -->
   <div class="main-area">
     <div id="results-area">
       <div class="empty-state" id="empty-state">

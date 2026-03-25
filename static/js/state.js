@@ -16,5 +16,11 @@ export const state = {
   settingsOpen: false,
 
   /** Set of group IDs that are currently expanded in the main area. */
-  expandedGroups: new Set()
+  expandedGroups: new Set(),
+
+  /** Set of group IDs selected for batch actions (checkboxes). */
+  selectedGroups: new Set(),
+
+  /** Image object currently shown in preview panel (Zone 5), or null. */
+  previewImage: null
 };
