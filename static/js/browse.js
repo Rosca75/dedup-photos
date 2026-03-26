@@ -110,6 +110,22 @@ function showBrowseDialog(data) {
 
   box.appendChild(list);
 
+  // Include subfolders checkbox.
+  const subRow = document.createElement('div');
+  subRow.className = 'browse-subfolder-row';
+  const subLabel = document.createElement('label');
+  subLabel.className = 'browse-subfolder-label';
+  const subCb = document.createElement('input');
+  subCb.type = 'checkbox';
+  subCb.checked = window._includeSubfolders !== false; // Default true.
+  subCb.addEventListener('change', () => {
+    window._includeSubfolders = subCb.checked;
+  });
+  subLabel.appendChild(subCb);
+  subLabel.appendChild(document.createTextNode(' Include subfolders'));
+  subRow.appendChild(subLabel);
+  box.appendChild(subRow);
+
   // Action buttons: Select and Cancel.
   const actions = document.createElement('div');
   actions.className = 'browse-actions';
@@ -119,6 +135,7 @@ function showBrowseDialog(data) {
   selectBtn.textContent = 'Select This Folder';
   selectBtn.addEventListener('click', () => {
     document.getElementById('scan-path').value = data.current;
+    window._includeSubfolders = subCb.checked;
     document.body.removeChild(overlay);
   });
 

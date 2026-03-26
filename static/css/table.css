@@ -91,6 +91,18 @@ th.sort-desc .sort-arrow { opacity: 1; color: var(--primary); }
   max-width: 250px;
 }
 
+/* Pending deletion row — strikethrough with red tint */
+.image-row.pending-delete {
+  background: rgba(231, 76, 60, 0.06);
+  opacity: 0.6;
+}
+.image-row.pending-delete td { text-decoration: line-through; }
+.image-row.pending-delete .btn-del-icon,
+.image-row.pending-delete .btn-undo-icon { text-decoration: none; }
+
+/* Collapsed group row indicator */
+.group-row.collapsed { opacity: 0.85; }
+
 /* Cell styles */
 .cell-name { font-weight: var(--font-weight-semi); color: var(--black); }
 .cell-path { color: var(--text-light); font-size: 0.78rem; }
@@ -120,6 +132,7 @@ th.sort-desc .sort-arrow { opacity: 1; color: var(--primary); }
 .badge-perceptual { background: var(--perceptual); }
 .badge-keep       { background: var(--original); color: #fff; }
 .badge-delete     { background: var(--duplicate); }
+.badge-series     { background: #3B82F6; }  /* Blue badge for burst/series groups */
 
 /* ===== Quality bar ===== */
 .quality-section {

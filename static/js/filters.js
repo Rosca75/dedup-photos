@@ -1,5 +1,5 @@
 // filters.js — Dynamic filtering of scan results (no re-scan needed).
-// Filters: filename search, % diff slider, extension checkboxes.
+// Filters: filename search, % diff slider, extension checkboxes, file size.
 
 import { state } from './state.js';
 import { renderResults } from './table.js';
@@ -29,7 +29,6 @@ export function initFilters() {
   // Extension checkboxes.
   const extGrid = document.getElementById('filter-ext-grid');
   if (extGrid) {
-    // Initialize: add all checked extensions.
     extGrid.querySelectorAll('input[type="checkbox"]').forEach(cb => {
       if (cb.checked) state.filters.extensions.add(cb.value.toLowerCase());
       cb.addEventListener('change', () => {
@@ -37,6 +36,24 @@ export function initFilters() {
         else state.filters.extensions.delete(cb.value.toLowerCase());
         refilter();
       });
+    });
+  }
+
+  // Min file size filter (KB).
+  const minSizeInput = document.getElementById('filter-min-filesize');
+  if (minSizeInput) {
+    minSizeInput.addEventListener('input', () => {
+      state.filters.minFileSize = (parseInt(minSizeInput.value, 10) || 0) * 1024;
+      refilter();
+    });
+  }
+
+  // Max file size filter (MB).
+  const maxSizeInput = document.getElementById('filter-max-filesize');
+  if (maxSizeInput) {
+    maxSizeInput.addEventListener('input', () => {
+      state.filters.maxFileSize = (parseInt(maxSizeInput.value, 10) || 0) * 1024 * 1024;
+      refilter();
     });
   }
 }
@@ -49,7 +66,7 @@ function refilter() {
 /**
  * Apply all active filters to a list of groups.
  * Returns a new array with only matching groups (and within each group,
- * only images that match the filename + extension filters).
+ * only images that match the filename + extension + file size filters).
  */
 export function applyFilters(groups) {
   if (!groups) return [];
@@ -72,6 +89,13 @@ export function applyFilters(groups) {
           const ext = extractExt(img.filename).toLowerCase();
           return state.filters.extensions.has(ext);
         });
+      }
+      // File size filters.
+      if (state.filters.minFileSize > 0) {
+        images = images.filter(img => (img.size || 0) >= state.filters.minFileSize);
+      }
+      if (state.filters.maxFileSize > 0) {
+        images = images.filter(img => (img.size || 0) <= state.filters.maxFileSize);
       }
 
       // Need at least 2 images for a valid duplicate group.

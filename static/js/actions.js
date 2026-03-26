@@ -1,18 +1,19 @@
-// actions.js — File actions: delete, mismatch report, batch operations.
+// actions.js — File actions: mark for deletion, confirm, batch operations, mismatch.
 
 import { state } from './state.js';
 import { apiDelete, apiMismatchReport } from './api.js';
-import { showToast, showConfirm } from './components.js';
+import { showToast } from './components.js';
 import { renderResults } from './table.js';
 import { clearPreview } from './preview.js';
-import { pushAction } from './history.js';
 
-/** Wire up global action handlers and batch action buttons. */
+/** Wire up global action handlers, batch buttons, and confirm-deletions button. */
 export function initActions() {
-  window.deleteFile = deleteFile;
+  window.deleteFile = markForDeletion;
+  window.unmarkFile = unmarkForDeletion;
   window.reportMismatch = reportMismatch;
   document.getElementById('batch-keep-best').addEventListener('click', batchKeepBest);
   document.getElementById('batch-delete-all').addEventListener('click', batchDeleteAll);
+  document.getElementById('confirm-deletions-btn').addEventListener('click', confirmDeletions);
 }
 
 /** Show or hide batch action buttons based on group selection. */
@@ -25,24 +26,54 @@ export function updateBatchButtons() {
   if (label) label.textContent = count + ' group' + (count !== 1 ? 's' : '');
 }
 
-/** Prompt the user, then delete a file by path. */
-function deleteFile(path) {
-  showConfirm('Delete ' + path + '?', () => {
-    apiDelete(path)
-      .then(data => {
-        if (data.success) {
-          showToast('Deleted: ' + path, 'success');
-          // Push to undo stack for undo/redo support.
-          pushAction({ type: 'delete', path, trashPath: data.trash_path || '', timestamp: Date.now() });
-          removeImageFromState(path);
-          if (state.scanResult) renderResults(state.scanResult);
-          clearPreview();
-        } else {
-          showToast('Delete failed: ' + (data.error || 'Unknown error'), 'error');
-        }
-      })
-      .catch(err => showToast('Delete failed: ' + err.message, 'error'));
-  });
+/** Update the confirm-deletions button visibility and count. */
+export function updateConfirmButton() {
+  const btn = document.getElementById('confirm-deletions-btn');
+  if (!btn) return;
+  const count = state.pendingDeletions.size;
+  if (count > 0) {
+    btn.style.display = 'inline-flex';
+    btn.textContent = 'Confirm ' + count + ' deletion' + (count !== 1 ? 's' : '');
+  } else {
+    btn.style.display = 'none';
+  }
+}
+
+/** Mark a file for deletion (visual only, no API call yet). */
+function markForDeletion(path) {
+  state.pendingDeletions.add(path);
+  updateConfirmButton();
+  if (state.scanResult) renderResults(state.scanResult);
+}
+
+/** Unmark a file from pending deletion. */
+function unmarkForDeletion(path) {
+  state.pendingDeletions.delete(path);
+  updateConfirmButton();
+  if (state.scanResult) renderResults(state.scanResult);
+}
+
+/** Confirm and permanently delete all pending files. */
+async function confirmDeletions() {
+  const paths = Array.from(state.pendingDeletions);
+  if (paths.length === 0) return;
+
+  let ok = 0, fail = 0;
+  for (const path of paths) {
+    try {
+      const data = await apiDelete(path);
+      if (data.success) {
+        ok++;
+        removeImageFromState(path);
+        state.pendingDeletions.delete(path);
+      } else { fail++; }
+    } catch (e) { fail++; }
+  }
+
+  clearPreview();
+  updateConfirmButton();
+  if (state.scanResult) renderResults(state.scanResult);
+  showToast(ok + ' file(s) permanently deleted' + (fail > 0 ? ', ' + fail + ' failed' : ''), fail > 0 ? 'error' : 'success');
 }
 
 /** Remove an image from state and clean up empty groups. */
@@ -58,20 +89,24 @@ function removeImageFromState(path) {
 function batchKeepBest() {
   const paths = collectPathsForBatch(true);
   if (paths.length === 0) { showToast('No files to delete.', 'error'); return; }
-  const groupCount = state.selectedGroups.size;
-  showConfirm('Delete ' + paths.length + ' file(s) from ' + groupCount + ' group(s), keeping only the best?', () => {
-    executeBatchDelete(paths);
-  });
+  paths.forEach(p => state.pendingDeletions.add(p));
+  state.selectedGroups.clear();
+  updateConfirmButton();
+  updateBatchButtons();
+  if (state.scanResult) renderResults(state.scanResult);
+  showToast(paths.length + ' file(s) marked for deletion. Click "Confirm" to delete permanently.', 'success');
 }
 
 /** Batch action: delete ALL images in each selected group. */
 function batchDeleteAll() {
   const paths = collectPathsForBatch(false);
   if (paths.length === 0) { showToast('No files to delete.', 'error'); return; }
-  const groupCount = state.selectedGroups.size;
-  showConfirm('Delete ALL ' + paths.length + ' file(s) from ' + groupCount + ' group(s)?', () => {
-    executeBatchDelete(paths);
-  });
+  paths.forEach(p => state.pendingDeletions.add(p));
+  state.selectedGroups.clear();
+  updateConfirmButton();
+  updateBatchButtons();
+  if (state.scanResult) renderResults(state.scanResult);
+  showToast(paths.length + ' file(s) marked for deletion. Click "Confirm" to delete permanently.', 'success');
 }
 
 /** Collect file paths for batch operation. keepBest=true skips best images. */
@@ -86,25 +121,6 @@ function collectPathsForBatch(keepBest) {
     }
   }
   return paths;
-}
-
-/** Execute sequential deletes for a list of paths. */
-async function executeBatchDelete(paths) {
-  let ok = 0, fail = 0;
-  for (const path of paths) {
-    try {
-      const data = await apiDelete(path);
-      if (data.success) {
-        ok++;
-        pushAction({ type: 'delete', path, trashPath: data.trash_path || '', timestamp: Date.now() });
-        removeImageFromState(path);
-      } else { fail++; }
-    } catch (e) { fail++; }
-  }
-  state.selectedGroups.clear();
-  clearPreview();
-  if (state.scanResult) renderResults(state.scanResult);
-  showToast('Batch: ' + ok + ' deleted, ' + fail + ' failed.', fail > 0 ? 'error' : 'success');
 }
 
 /** Download a mismatch diagnostic report. */

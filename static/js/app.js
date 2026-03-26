@@ -6,7 +6,6 @@ import { initSidebar } from './sidebar.js';
 import { initBrowse } from './browse.js';
 import { initActions } from './actions.js';
 import { initPreview } from './preview.js';
-import { initHistory } from './history.js';
 import { initFilters } from './filters.js';
 
 /** Initialize all application modules once the DOM is ready. */
@@ -16,8 +15,10 @@ document.addEventListener('DOMContentLoaded', () => {
   initBrowse();     // Wire up folder browse dialog.
   initActions();    // Expose delete/mismatch handlers + batch actions.
   initPreview();    // Initialize image preview panel.
-  initHistory();    // Wire up undo/redo buttons.
   initFilters();    // Wire up dynamic filter controls.
+
+  // Default: include subfolders when scanning.
+  window._includeSubfolders = true;
 
   // Render Feather icons (replaces <i data-feather="..."> with SVGs).
   if (typeof feather !== 'undefined') feather.replace();

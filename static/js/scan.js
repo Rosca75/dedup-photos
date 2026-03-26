@@ -34,6 +34,11 @@ function startScan() {
   const normalisedSize = parseInt(document.getElementById('setting-normalised-size').value, 10) || 32;
   const maxWidth = parseInt(document.getElementById('setting-max-width').value, 10) || 0;
   const maxHeight = parseInt(document.getElementById('setting-max-height').value, 10) || 0;
+  const minFileSize = (parseInt(document.getElementById('setting-min-filesize').value, 10) || 0) * 1024; // KB → bytes
+  const maxFileSize = (parseInt(document.getElementById('setting-max-filesize').value, 10) || 0) * 1024 * 1024; // MB → bytes
+
+  // Read the include-subfolders setting (stored in state by browse.js).
+  const includeSubfolders = window._includeSubfolders !== false; // Default true.
 
   // Collect checked extension checkboxes from the top bar.
   const extensions = [];
@@ -49,7 +54,10 @@ function startScan() {
   apiScan({
     path, threshold, algorithm, extensions,
     min_width: maxWidth, max_height: maxHeight,
-    normalised_size: normalisedSize
+    normalised_size: normalisedSize,
+    include_subfolders: includeSubfolders,
+    min_file_size: minFileSize,
+    max_file_size: maxFileSize
   })
     .then(data => {
       if (data.status === 'complete') { stopPolling(); renderResults(data); }
