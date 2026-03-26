@@ -400,8 +400,9 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 	scanMutex.Unlock()
 
-	// Clear the thumbnail cache for the new scan.
-	thumbnailCache = sync.Map{}
+	// NOTE: We intentionally do NOT clear the thumbnail cache between scans.
+	// Thumbnails are keyed by absolute file path and remain valid as long as
+	// the file hasn't changed. Re-generating them is expensive and unnecessary.
 
 	// Create a cancellable context for this scan.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -495,7 +496,15 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		// Phase 2: Hash all images using the cache-aware pipeline.
 		// The progress callback updates scanResult so the UI can show
 		// which phase is active and how many files have been processed.
-		// We pass req.Path so the cache is scoped to this scan directory.
+		// We pass all scan paths (primary + extras) so the hasher can load
+		// and merge caches from all directories for maximum cache hits.
+		allScanPaths := []string{req.Path}
+		for _, ep := range req.ExtraPaths {
+			ep = strings.TrimSpace(ep)
+			if ep != "" {
+				allScanPaths = append(allScanPaths, ep)
+			}
+		}
 		numWorkers := runtime.NumCPU()
 		hashes := HashAllImagesWithProgress(ctx, paths, numWorkers, req.Algorithm, func(phase string, current int, total int) {
 			scanMutex.Lock()
@@ -503,7 +512,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 			scanResult.Progress.Current = current
 			scanResult.Progress.Total = total
 			scanMutex.Unlock()
-		}, req.Path)
+		}, allScanPaths)
 
 		// Check for cancellation.
 		if ctx.Err() != nil {
