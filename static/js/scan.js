@@ -21,12 +21,17 @@ export function initScan() {
 
 /** Gather settings from the top bar and start a scan. */
 function startScan() {
-  const path = document.getElementById('scan-path').value.trim();
-  if (!path) {
+  const rawPath = document.getElementById('scan-path').value.trim();
+  if (!rawPath) {
     showToast('Please enter a folder path.', 'error');
     document.getElementById('scan-path').focus();
     return;
   }
+
+  // Support multiple paths separated by semicolons.
+  const paths = rawPath.split(';').map(p => p.trim()).filter(Boolean);
+  const path = paths[0]; // Primary path for backward compatibility.
+  const extraPaths = paths.slice(1); // Additional paths to merge.
 
   // Read settings from inline top bar controls.
   const threshold = parseInt(document.getElementById('scan-threshold').value, 10) || 10;
@@ -34,16 +39,18 @@ function startScan() {
   const normalisedSize = parseInt(document.getElementById('setting-normalised-size').value, 10) || 32;
   const maxWidth = parseInt(document.getElementById('setting-max-width').value, 10) || 0;
   const maxHeight = parseInt(document.getElementById('setting-max-height').value, 10) || 0;
-  const minFileSize = (parseInt(document.getElementById('setting-min-filesize').value, 10) || 0) * 1024; // KB → bytes
-  const maxFileSize = (parseInt(document.getElementById('setting-max-filesize').value, 10) || 0) * 1024 * 1024; // MB → bytes
+  const minFileSize = (parseInt(document.getElementById('setting-min-filesize').value, 10) || 0) * 1024;
+  const maxFileSize = (parseInt(document.getElementById('setting-max-filesize').value, 10) || 0) * 1024 * 1024;
 
-  // Read the include-subfolders setting (stored in state by browse.js).
-  const includeSubfolders = window._includeSubfolders !== false; // Default true.
+  const includeSubfolders = window._includeSubfolders !== false;
 
-  // Collect checked extension checkboxes from the top bar.
   const extensions = [];
   document.querySelectorAll('.topbar-extensions .ext-grid input[type="checkbox"]:checked')
     .forEach(cb => extensions.push(cb.value));
+
+  // Clear promoted images for a fresh scan.
+  state.pendingDeletions.clear();
+  state.promotedImages.clear();
 
   setScanningUI(true);
   document.getElementById('groups-container').innerHTML = '';
@@ -53,6 +60,7 @@ function startScan() {
 
   apiScan({
     path, threshold, algorithm, extensions,
+    extra_paths: extraPaths,
     min_width: maxWidth, max_height: maxHeight,
     normalised_size: normalisedSize,
     include_subfolders: includeSubfolders,

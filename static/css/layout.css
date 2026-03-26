@@ -1,12 +1,12 @@
 /* layout.css — Grid layout: topbar, left panel, center table. */
 
-/* Main grid — 2 columns (left panel + main area) */
+/* Main grid — 3 columns (left panel + resize handle + main area) */
 .app-layout {
   display: grid;
   grid-template-areas:
-    "topbar  topbar"
-    "left    main";
-  grid-template-columns: 240px 1fr;
+    "topbar       topbar       topbar"
+    "left         left-resize  main";
+  grid-template-columns: 240px 5px 1fr;
   grid-template-rows: auto 1fr;
   height: 100vh;
 }
@@ -289,6 +289,33 @@
   text-align: right;
 }
 
+/* ===== Resize handles between panel sections (vertical) ===== */
+.panel-resize-handle {
+  height: 5px;
+  cursor: row-resize;
+  background: var(--border);
+  flex-shrink: 0;
+  position: relative;
+  transition: background var(--transition);
+}
+.panel-resize-handle:hover,
+.panel-resize-handle.dragging {
+  background: var(--primary-light);
+}
+
+/* Horizontal resize handle (left panel ↔ main area) */
+.panel-resize-handle-h {
+  grid-area: left-resize;
+  width: 5px;
+  cursor: col-resize;
+  background: var(--border);
+  transition: background var(--transition);
+}
+.panel-resize-handle-h:hover,
+.panel-resize-handle-h.dragging {
+  background: var(--primary-light);
+}
+
 /* Section 2: Folder tree */
 .panel-folders {
   flex: 1;
@@ -378,4 +405,5 @@
     grid-template-rows: auto 1fr;
   }
   .left-panel { display: none; }
+  .panel-resize-handle-h { display: none; }
 }

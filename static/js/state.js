@@ -21,6 +21,9 @@ export const state = {
   /** Set of file paths marked for deletion (pending confirmation). */
   pendingDeletions: new Set(),
 
+  /** Set of file paths promoted to "Original" by user (one-click promotion). */
+  promotedImages: new Set(),
+
   /** Current sort column and direction for the results table. */
   sortColumn: null,
   sortDirection: 'asc',

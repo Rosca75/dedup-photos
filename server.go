@@ -139,6 +139,7 @@ type ScanRequest struct {
 	IncludeSubfolders bool     `json:"include_subfolders"`  // Whether to scan subfolders recursively (default: true).
 	MinFileSize       int64    `json:"min_file_size"`       // Minimum file size in bytes (0 = no limit).
 	MaxFileSize       int64    `json:"max_file_size"`       // Maximum file size in bytes (0 = no limit).
+	ExtraPaths        []string `json:"extra_paths"`         // Additional directories to scan (merged with Path).
 }
 
 // BrowseRequest is the JSON body for directory browsing.
@@ -438,6 +439,28 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 			scanResult.Progress.Phase = fmt.Sprintf("Error: %v", err)
 			scanMutex.Unlock()
 			return
+		}
+
+		// Scan extra paths (for multi-folder duplicate detection).
+		// Each extra path is scanned with the same filters and merged into
+		// the main paths slice so duplicates across folders are detected.
+		for _, extraPath := range req.ExtraPaths {
+			ep := strings.TrimSpace(extraPath)
+			if ep == "" {
+				continue
+			}
+			epInfo, epErr := os.Stat(ep)
+			if epErr != nil || !epInfo.IsDir() {
+				log.Printf("[scan] Skipping extra path (not a directory): %s", ep)
+				continue
+			}
+			extraFiles, epErr := ScanDirectoryFiltered(ep, allowedExts, req.MinWidth, req.MaxHeight, req.IncludeSubfolders, req.MinFileSize, req.MaxFileSize)
+			if epErr != nil {
+				log.Printf("[scan] Error scanning extra path %s: %v", ep, epErr)
+				continue
+			}
+			paths = append(paths, extraFiles...)
+			log.Printf("[scan] Extra path %s: found %d images", ep, len(extraFiles))
 		}
 
 		// Check for cancellation.
@@ -856,8 +879,22 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	// image.Decode automatically detects the format and decodes the image.
+	// For HEIC/HEIF files (not natively supported by Go), we fall back to
+	// extracting the embedded JPEG thumbnail from the file's EXIF data.
 	img, _, err := image.Decode(file)
 	if err != nil {
+		// Fallback: try to extract embedded JPEG from HEIC/HEIF/ARW/DNG files.
+		// Many camera RAW and HEIC files contain an embedded JPEG preview that
+		// we can find by scanning for the JPEG SOI (0xFFD8) marker.
+		embeddedJPEG := extractEmbeddedJPEG(path)
+		if embeddedJPEG != nil {
+			// Cache and serve the embedded JPEG directly as the thumbnail.
+			thumbnailCache.Store(path, embeddedJPEG)
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			w.Write(embeddedJPEG)
+			return
+		}
 		http.Error(w, fmt.Sprintf("cannot decode image: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -945,6 +982,82 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	w.Write(thumbnailBytes)
+}
+
+// extractEmbeddedJPEG tries to find and extract an embedded JPEG from a file.
+// Many camera formats (HEIC, HEIF, ARW, DNG, CR2) contain a full-size JPEG
+// preview embedded within the file. We scan for the JPEG SOI marker (0xFFD8)
+// and find the matching EOI marker (0xFFD9) to extract the largest one.
+// Returns the JPEG bytes, or nil if no embedded JPEG was found.
+func extractEmbeddedJPEG(filePath string) []byte {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil
+	}
+
+	// Limit search to first 50MB to avoid scanning huge files forever.
+	maxScan := len(data)
+	if maxScan > 50*1024*1024 {
+		maxScan = 50 * 1024 * 1024
+	}
+
+	var bestJPEG []byte
+
+	// Scan for JPEG SOI markers (0xFF 0xD8) and find the largest embedded JPEG.
+	// Skip the very first bytes — if the file starts with FFD8, it's already
+	// a plain JPEG and would have been decoded by image.Decode.
+	for i := 2; i < maxScan-1; i++ {
+		if data[i] != 0xFF || data[i+1] != 0xD8 {
+			continue
+		}
+
+		// Found a potential JPEG start. Now find the end (EOI: 0xFF 0xD9).
+		// Search from the SOI marker to the end of the file.
+		endSearch := maxScan
+		if endSearch > len(data) {
+			endSearch = len(data)
+		}
+		eoiIdx := -1
+		for j := i + 2; j < endSearch-1; j++ {
+			if data[j] == 0xFF && data[j+1] == 0xD9 {
+				eoiIdx = j + 2 // Include the EOI marker bytes.
+				// Don't break — keep searching for a later EOI in case
+				// the JPEG contains restart markers that look like EOI.
+				// Actually, we want the first complete JPEG, not the last EOI.
+				break
+			}
+		}
+
+		if eoiIdx <= 0 {
+			continue
+		}
+
+		jpegData := data[i:eoiIdx]
+
+		// Only accept JPEGs that are at least 10KB (skip tiny EXIF thumbnails,
+		// prefer the larger preview image if available).
+		if len(jpegData) < 10*1024 {
+			// Still keep it as a fallback if we haven't found anything better.
+			if bestJPEG == nil {
+				bestJPEG = jpegData
+			}
+			continue
+		}
+
+		// Verify it's a valid JPEG by trying to decode it.
+		_, decErr := jpeg.Decode(bytes.NewReader(jpegData))
+		if decErr == nil {
+			// Keep the largest valid JPEG we find.
+			if len(jpegData) > len(bestJPEG) {
+				bestJPEG = jpegData
+			}
+		}
+
+		// Skip ahead past this JPEG to look for more.
+		i = eoiIdx - 1
+	}
+
+	return bestJPEG
 }
 
 // =============================================================================
