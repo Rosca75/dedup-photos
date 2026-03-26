@@ -47,14 +47,14 @@
         <label>Extensions to include</label>
         <div class="ext-grid">
           <label><input type="checkbox" value="jpg" checked> JPG</label>
-          <label><input type="checkbox" value="tiff"> TIFF</label>
-          <label><input type="checkbox" value="gif"> GIF</label>
-          <label><input type="checkbox" value="png"> PNG</label>
-          <label><input type="checkbox" value="emf"> EMF</label>
-          <label><input type="checkbox" value="dng"> DNG</label>
-          <label><input type="checkbox" value="bmp"> BMP</label>
-          <label><input type="checkbox" value="psd"> PSD</label>
-          <label><input type="checkbox" value="arw"> ARW</label>
+          <label><input type="checkbox" value="png" checked> PNG</label>
+          <label><input type="checkbox" value="bmp" checked> BMP</label>
+          <label><input type="checkbox" value="tiff" checked> TIFF</label>
+          <label><input type="checkbox" value="webp" checked> WEBP</label>
+          <label><input type="checkbox" value="gif" checked> GIF</label>
+          <label><input type="checkbox" value="dng" checked> DNG</label>
+          <label><input type="checkbox" value="arw" checked> ARW</label>
+          <label><input type="checkbox" value="heic" checked> HEIC</label>
         </div>
       </div>
       <div class="topbar-field">
@@ -64,6 +64,14 @@
       <div class="topbar-field">
         <label for="setting-max-height">Max height (px)</label>
         <input type="number" id="setting-max-height" value="0" min="0">
+      </div>
+      <div class="topbar-field">
+        <label for="setting-min-filesize">Min file size (KB)</label>
+        <input type="number" id="setting-min-filesize" value="0" min="0">
+      </div>
+      <div class="topbar-field">
+        <label for="setting-max-filesize">Max file size (MB)</label>
+        <input type="number" id="setting-max-filesize" value="0" min="0">
       </div>
       <div class="topbar-field">
         <label for="setting-normalised-size">Normalised size</label>
@@ -80,8 +88,7 @@
       <div class="topbar-buttons">
         <button class="btn btn-primary" id="scan-btn"><i data-feather="search"></i> Scan</button>
         <button class="btn btn-danger" id="cancel-btn" style="display:none"><i data-feather="x-circle"></i> Cancel</button>
-        <button class="btn btn-icon" id="undo-btn" title="Undo" disabled><i data-feather="corner-up-left"></i></button>
-        <button class="btn btn-icon" id="redo-btn" title="Redo" disabled><i data-feather="corner-up-right"></i></button>
+        <button class="btn btn-danger" id="confirm-deletions-btn" style="display:none"><i data-feather="check-circle"></i> Confirm Deletions</button>
         <button class="btn btn-icon" id="refresh-btn" title="Refresh results"><i data-feather="refresh-cw"></i></button>
         <!-- Batch actions (visible when groups selected) -->
         <div class="batch-actions" id="batch-actions" style="display:none">
@@ -144,9 +151,20 @@
           <label><input type="checkbox" value="png" checked> PNG</label>
           <label><input type="checkbox" value="bmp" checked> BMP</label>
           <label><input type="checkbox" value="tiff" checked> TIFF</label>
+          <label><input type="checkbox" value="webp" checked> WEBP</label>
           <label><input type="checkbox" value="gif" checked> GIF</label>
-          <label><input type="checkbox" value="webp" checked> WebP</label>
+          <label><input type="checkbox" value="dng" checked> DNG</label>
+          <label><input type="checkbox" value="arw" checked> ARW</label>
+          <label><input type="checkbox" value="heic" checked> HEIC</label>
         </div>
+      </div>
+      <div class="filter-group">
+        <label for="filter-min-filesize">Min file size (KB)</label>
+        <input type="number" id="filter-min-filesize" value="0" min="0" placeholder="0">
+      </div>
+      <div class="filter-group">
+        <label for="filter-max-filesize">Max file size (MB)</label>
+        <input type="number" id="filter-max-filesize" value="0" min="0" placeholder="0">
       </div>
     </div>
   </div>

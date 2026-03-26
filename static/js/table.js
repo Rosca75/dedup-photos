@@ -1,12 +1,12 @@
 // table.js — Central zone: render scan results as a flat data table.
-// Replaces the old render.js with sortable columns and group headers.
+// Supports sortable columns, collapsible groups, series badges, hover preview.
 
 import { state } from './state.js';
 import { formatBytes, formatDuration } from './helpers.js';
 import { resetScanUI } from './scan.js';
 import { buildSidebarTree } from './sidebar.js';
 import { showPreview, clearPreview } from './preview.js';
-import { updateBatchButtons } from './actions.js';
+import { updateBatchButtons, updateConfirmButton } from './actions.js';
 import { applyFilters } from './filters.js';
 
 /**
@@ -26,7 +26,7 @@ export function renderResults(data) {
     );
   }
 
-  // Apply dynamic filters (filename, % diff, extension).
+  // Apply dynamic filters (filename, % diff, extension, file size).
   groups = applyFilters(groups);
 
   const container = document.getElementById('groups-container');
@@ -37,9 +37,18 @@ export function renderResults(data) {
     return;
   }
   document.getElementById('empty-state').style.display = 'none';
+
+  // Sort groups if a sort column is active.
+  if (state.sortColumn) {
+    groups = sortGroups(groups, state.sortColumn, state.sortDirection);
+  }
+
   container.appendChild(buildResultsTable(groups));
   buildSidebarTree();
   updateBatchButtons();
+  updateConfirmButton();
+  // Replace feather icon placeholders in dynamically created elements.
+  if (typeof feather !== 'undefined') feather.replace();
 }
 
 /** Update the stats display in the top bar. */
@@ -73,41 +82,95 @@ function buildResultsTable(groups) {
   return table;
 }
 
+/** Column definitions for the table header. */
+const COLUMNS = [
+  { cls: 'col-check', sortable: false },
+  { cls: 'col-diff',  key: 'diff',  text: '% Diff' },
+  { cls: 'col-type',  key: 'type',  text: 'Type' },
+  { cls: 'col-name',  key: 'name',  text: 'Filename' },
+  { cls: 'col-path',  key: 'path',  text: 'File Path' },
+  { cls: 'col-dim',   key: 'dim',   text: 'Dimensions' },
+  { cls: 'col-ext',   key: 'ext',   text: 'Ext' },
+  { cls: 'col-size',  key: 'size',  text: 'File Size' },
+  { cls: 'col-block', key: 'block', text: 'Blockiness' },
+  { cls: 'col-blur',  key: 'blur',  text: 'Blurring' },
+  { cls: 'col-actions', sortable: false, text: '' }
+];
+
 /** Build the table header with sortable columns. */
 function buildTableHead() {
   const thead = document.createElement('thead');
   const tr = document.createElement('tr');
-  const cols = [
-    { cls: 'col-check', sortable: false, content: createSelectAllCheckbox() },
-    { cls: 'col-diff',  key: 'diff',  text: '% Diff' },
-    { cls: 'col-type',  key: 'type',  text: 'Type' },
-    { cls: 'col-name',  key: 'name',  text: 'Filename' },
-    { cls: 'col-path',  key: 'path',  text: 'File Path' },
-    { cls: 'col-dim',   key: 'dim',   text: 'Dimensions' },
-    { cls: 'col-ext',   key: 'ext',   text: 'Ext' },
-    { cls: 'col-size',  key: 'size',  text: 'File Size' },
-    { cls: 'col-block', key: 'block', text: 'Blockiness' },
-    { cls: 'col-blur',  key: 'blur',  text: 'Blurring' },
-    { cls: 'col-actions', sortable: false, text: '' }
-  ];
-  for (const c of cols) {
+  for (const c of COLUMNS) {
     const th = document.createElement('th');
     th.className = c.cls;
-    if (c.content) {
-      th.appendChild(c.content);
+    if (c.cls === 'col-check') {
+      th.appendChild(createSelectAllCheckbox());
     } else {
       th.textContent = c.text || '';
-      if (c.sortable !== false) {
+      if (c.sortable !== false && c.key) {
+        // Add sort arrow and click handler.
         const arrow = document.createElement('span');
         arrow.className = 'sort-arrow';
-        arrow.textContent = '\u21C5';
+        // Show direction indicator if this column is active.
+        if (state.sortColumn === c.key) {
+          arrow.textContent = state.sortDirection === 'asc' ? '\u25B2' : '\u25BC';
+          th.classList.add('sort-' + state.sortDirection);
+        } else {
+          arrow.textContent = '\u21C5';
+        }
         th.appendChild(arrow);
+        th.addEventListener('click', () => handleSort(c.key));
       }
     }
     tr.appendChild(th);
   }
   thead.appendChild(tr);
   return thead;
+}
+
+/** Handle clicking a sortable column header. */
+function handleSort(key) {
+  if (state.sortColumn === key) {
+    // Toggle direction.
+    state.sortDirection = state.sortDirection === 'asc' ? 'desc' : 'asc';
+  } else {
+    state.sortColumn = key;
+    state.sortDirection = 'asc';
+  }
+  if (state.scanResult) renderResults(state.scanResult);
+}
+
+/** Sort groups' images by the given column key and direction. */
+function sortGroups(groups, key, dir) {
+  // We sort images within each group by the specified column.
+  const sorted = groups.map(g => {
+    const images = [...(g.images || [])];
+    images.sort((a, b) => {
+      let va = getSortValue(a, key);
+      let vb = getSortValue(b, key);
+      if (typeof va === 'string') { va = va.toLowerCase(); vb = (vb || '').toLowerCase(); }
+      if (va < vb) return dir === 'asc' ? -1 : 1;
+      if (va > vb) return dir === 'asc' ? 1 : -1;
+      return 0;
+    });
+    return { ...g, images };
+  });
+  return sorted;
+}
+
+/** Extract a sortable value from an image for the given column key. */
+function getSortValue(img, key) {
+  switch (key) {
+    case 'name':  return img.filename || '';
+    case 'path':  return img.path || '';
+    case 'dim':   return (img.width || 0) * (img.height || 0);
+    case 'ext':   return extractExt(img.filename);
+    case 'size':  return img.size || 0;
+    case 'block': return img.blockiness != null ? img.blockiness : 0;
+    case 'blur':  return img.blurring != null ? img.blurring : 0;
+    default:      return '';
+  }
 }
 
 /** Create the "select all" checkbox for the header. */
@@ -128,16 +191,17 @@ function createSelectAllCheckbox() {
 /** Append group header row + image rows to tbody. */
 function appendGroupRows(tbody, group) {
   const images = group.images || [];
-  const isExact = group.match_type === 'exact';
+  const matchType = group.match_type || 'perceptual';
   const diff = group.confidence != null ? (100 - Number(group.confidence)).toFixed(1) : '--';
   const wasted = images.slice(1).reduce((s, img) => s + (img.size || 0), 0);
+  const isCollapsed = state.collapsedGroups.has(group.id);
 
   // Group header row.
   const gRow = document.createElement('tr');
-  gRow.className = 'group-row';
+  gRow.className = 'group-row' + (isCollapsed ? ' collapsed' : '');
   gRow.setAttribute('data-group-id', group.id || '');
 
-  // Checkbox.
+  // Checkbox cell.
   const cbTd = document.createElement('td');
   const cb = document.createElement('input');
   cb.type = 'checkbox';
@@ -152,16 +216,16 @@ function appendGroupRows(tbody, group) {
   cbTd.appendChild(cb);
   gRow.appendChild(cbTd);
 
-  // % diff.
+  // % diff cell.
   const diffTd = document.createElement('td');
   diffTd.textContent = diff + '%';
   gRow.appendChild(diffTd);
 
-  // Type badge.
+  // Type badge cell.
   const typeTd = document.createElement('td');
   const badge = document.createElement('span');
-  badge.className = 'badge ' + (isExact ? 'badge-exact' : 'badge-perceptual');
-  badge.textContent = isExact ? 'Exact' : 'Perceptual';
+  badge.className = 'badge badge-' + matchType;
+  badge.textContent = matchType === 'exact' ? 'Exact' : matchType === 'series' ? 'Series' : 'Perceptual';
   typeTd.appendChild(badge);
   gRow.appendChild(typeTd);
 
@@ -169,12 +233,13 @@ function appendGroupRows(tbody, group) {
   const sumTd = document.createElement('td');
   sumTd.colSpan = 7;
   sumTd.className = 'group-summary-cell';
-  sumTd.textContent = images.length + ' images \u00B7 ' + formatBytes(wasted) + ' wasted';
+  const arrow = isCollapsed ? '\u25B6' : '\u25BC';
+  sumTd.textContent = arrow + ' ' + images.length + ' images \u00B7 ' + formatBytes(wasted) + ' wasted';
   gRow.appendChild(sumTd);
 
   // Actions cell.
   const actTd = document.createElement('td');
-  if (!isExact && group.id) {
+  if (matchType === 'perceptual' && group.id) {
     const mBtn = document.createElement('button');
     mBtn.className = 'btn-mismatch';
     mBtn.textContent = 'Mismatch';
@@ -185,19 +250,36 @@ function appendGroupRows(tbody, group) {
     actTd.appendChild(mBtn);
   }
   gRow.appendChild(actTd);
+
+  // Click on group row to toggle collapse/expand.
+  gRow.addEventListener('click', (e) => {
+    // Don't toggle if clicking the checkbox.
+    if (e.target.type === 'checkbox') return;
+    if (state.collapsedGroups.has(group.id)) {
+      state.collapsedGroups.delete(group.id);
+    } else {
+      state.collapsedGroups.add(group.id);
+    }
+    if (state.scanResult) renderResults(state.scanResult);
+  });
+
   tbody.appendChild(gRow);
 
-  // Image rows.
-  for (const img of images) tbody.appendChild(buildImageRow(img));
+  // Image rows (hidden when collapsed).
+  if (!isCollapsed) {
+    for (const img of images) tbody.appendChild(buildImageRow(img));
+  }
 }
 
 /** Build a table row for a single image. */
 function buildImageRow(img) {
   const tr = document.createElement('tr');
-  tr.className = 'image-row';
+  const isPending = state.pendingDeletions.has(img.path);
+  tr.className = 'image-row' + (isPending ? ' pending-delete' : '');
   tr.setAttribute('data-path', img.path || '');
   if (state.selectedRowPath === img.path) tr.classList.add('active');
 
+  // Click to select and show preview in the left panel.
   tr.addEventListener('click', () => {
     document.querySelectorAll('.image-row.active').forEach(r => r.classList.remove('active'));
     tr.classList.add('active');
@@ -205,12 +287,16 @@ function buildImageRow(img) {
     showPreview(img);
   });
 
+  // Mouseover to show a quick hover preview tooltip.
+  tr.addEventListener('mouseenter', () => showHoverPreview(tr, img));
+  tr.addEventListener('mouseleave', hideHoverPreview);
+
   // Empty checkbox cell.
   tr.appendChild(document.createElement('td'));
   // Empty diff cell.
   tr.appendChild(document.createElement('td'));
 
-  // Original/Duplicate badge.
+  // Original/Duplicate/Series badge.
   const statusTd = document.createElement('td');
   const sBadge = document.createElement('span');
   sBadge.className = 'badge badge-sm ' + (img.is_best ? 'badge-keep' : 'badge-delete');
@@ -233,20 +319,69 @@ function buildImageRow(img) {
   // Blurring.
   addCell(tr, img.blurring != null ? Number(img.blurring).toFixed(2) : '--');
 
-  // Delete button.
+  // Delete / Undo button cell.
   const delTd = document.createElement('td');
-  const delBtn = document.createElement('button');
-  delBtn.className = 'btn-del-icon';
-  delBtn.innerHTML = '<i data-feather="trash-2"></i>';
-  delBtn.title = 'Delete this file';
-  delBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    window.deleteFile(img.path);
-  });
-  delTd.appendChild(delBtn);
+  if (isPending) {
+    // Show undo icon for pending deletions.
+    const undoBtn = document.createElement('button');
+    undoBtn.className = 'btn-del-icon btn-undo-icon';
+    undoBtn.innerHTML = '<i data-feather="rotate-ccw"></i>';
+    undoBtn.title = 'Undo: remove from deletion list';
+    undoBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      window.unmarkFile(img.path);
+    });
+    delTd.appendChild(undoBtn);
+  } else {
+    // Show trash icon for normal rows.
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn-del-icon';
+    delBtn.innerHTML = '<i data-feather="trash-2"></i>';
+    delBtn.title = 'Mark for deletion';
+    delBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      window.deleteFile(img.path);
+    });
+    delTd.appendChild(delBtn);
+  }
   tr.appendChild(delTd);
 
   return tr;
+}
+
+/** Show a hover preview tooltip near the row. */
+function showHoverPreview(row, img) {
+  hideHoverPreview();
+  const tip = document.createElement('div');
+  tip.className = 'hover-preview';
+  tip.id = 'hover-preview-tip';
+  const thumb = document.createElement('img');
+  thumb.src = '/api/thumbnail?path=' + encodeURIComponent(img.path || '');
+  thumb.alt = img.filename || '';
+  thumb.onerror = function () { tip.style.display = 'none'; };
+  tip.appendChild(thumb);
+
+  const info = document.createElement('div');
+  info.className = 'hover-preview-info';
+  info.textContent = (img.filename || '') + ' \u2022 ' + formatBytes(img.size);
+  tip.appendChild(info);
+
+  document.body.appendChild(tip);
+
+  // Position near the row.
+  const rect = row.getBoundingClientRect();
+  tip.style.top = Math.max(0, rect.top - 10) + 'px';
+  tip.style.left = (rect.right + 10) + 'px';
+  // If off-screen right, show on the left side.
+  if (rect.right + 270 > window.innerWidth) {
+    tip.style.left = Math.max(0, rect.left - 270) + 'px';
+  }
+}
+
+/** Hide the hover preview tooltip. */
+function hideHoverPreview() {
+  const existing = document.getElementById('hover-preview-tip');
+  if (existing) existing.remove();
 }
 
 /** Helper: add a text cell to a row. */

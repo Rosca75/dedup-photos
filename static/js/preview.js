@@ -71,15 +71,6 @@ export function showPreview(img) {
   badge.style.display = 'inline-block';
   info.appendChild(badge);
 
-  // Delete button.
-  const delBtn = document.createElement('button');
-  delBtn.className = 'btn btn-danger btn-sm';
-  delBtn.textContent = 'Delete this file';
-  delBtn.style.marginTop = '8px';
-  delBtn.style.width = '100%';
-  delBtn.onclick = () => window.deleteFile(img.path);
-  info.appendChild(delBtn);
-
   container.appendChild(info);
 }
 

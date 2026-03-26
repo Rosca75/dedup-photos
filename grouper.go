@@ -39,8 +39,12 @@
 package main
 
 import (
-	"fmt"  // Formatted I/O.
-	"sort" // Sorting algorithms.
+	"fmt"           // Formatted I/O.
+	"path/filepath" // For extracting filenames from paths.
+	"regexp"        // For extracting numeric suffixes from filenames.
+	"sort"          // Sorting algorithms.
+	"strconv"       // For converting strings to numbers.
+	"strings"       // For string manipulation.
 
 	// uuid generates random UUIDs (Universally Unique Identifiers).
 	// A UUID looks like "550e8400-e29b-41d4-a716-446655440000".
@@ -571,6 +575,36 @@ func GroupDuplicates(hashes []ImageHash, threshold int) []DuplicateGroup {
 	fmt.Printf("[grouper] Pass 2 complete: found %d perceptual duplicate groups.\n", perceptualCount)
 
 	// =========================================================================
+	// PASS 3: Detect "series" (burst/rafale) groups among perceptual matches
+	// =========================================================================
+	//
+	// A "series" is a set of photos taken in rapid succession (burst mode).
+	// They look very similar (high confidence) but have sequential filenames
+	// like IMG_2413.JPG, IMG_2414.JPG, IMG_2415.JPG. These are NOT true
+	// duplicates — the user intentionally took multiple shots.
+	//
+	// Detection criteria:
+	//   1. The group is perceptual (not exact — exact means byte-identical).
+	//   2. Confidence >= 95% (images are very similar visually).
+	//   3. Filenames share a common prefix with sequential numeric suffixes.
+	//      e.g., IMG_2413, IMG_2414, IMG_2415 → prefix "IMG_", numbers 2413-2415.
+	//
+	// If all criteria are met, we relabel the group as "series" instead of
+	// "perceptual". The frontend can then display a blue "SERIES" badge.
+
+	fmt.Println("[grouper] Pass 3: Detecting burst/series groups...")
+	seriesCount := 0
+	for i := range groups {
+		if groups[i].MatchType == "perceptual" && groups[i].Confidence >= 95.0 {
+			if isSeriesGroup(groups[i].Images) {
+				groups[i].MatchType = "series"
+				seriesCount++
+			}
+		}
+	}
+	fmt.Printf("[grouper] Pass 3 complete: found %d series (burst) groups.\n", seriesCount)
+
+	// =========================================================================
 	// Final sorting: largest groups first (most duplicates = most wasted space)
 	// =========================================================================
 	sort.Slice(groups, func(i, j int) bool {
@@ -580,4 +614,81 @@ func GroupDuplicates(hashes []ImageHash, threshold int) []DuplicateGroup {
 	fmt.Printf("[grouper] Total: %d duplicate groups found.\n", len(groups))
 
 	return groups
+}
+
+// =============================================================================
+// isSeriesGroup — Check if images form a sequential burst/series
+// =============================================================================
+
+// numericSuffixRegex matches a trailing number at the end of a filename stem.
+// For example, "IMG_2413" matches with suffix "2413" and prefix "IMG_".
+var numericSuffixRegex = regexp.MustCompile(`^(.*?)(\d+)$`)
+
+// isSeriesGroup checks whether a set of images have sequential filenames,
+// indicating they were taken in burst/rafale mode (e.g., IMG_2413, IMG_2414).
+//
+// The algorithm:
+//  1. Extract the filename stem (without extension) for each image.
+//  2. Split each stem into a text prefix and a numeric suffix.
+//  3. Check that all images share the same prefix.
+//  4. Check that the numeric suffixes form a consecutive sequence
+//     (e.g., 2413, 2414, 2415 — no gaps larger than 1).
+//
+// Returns true if the images form a series, false otherwise.
+func isSeriesGroup(images []ImageMetadata) bool {
+	if len(images) < 2 {
+		return false
+	}
+
+	// Extract prefix and numeric suffix for each image.
+	type parsed struct {
+		prefix string
+		number int
+	}
+	var items []parsed
+
+	for _, img := range images {
+		// Get just the filename without the directory path.
+		base := filepath.Base(img.Path)
+		// Remove the file extension (e.g., ".JPG") to get the stem.
+		ext := filepath.Ext(base)
+		stem := strings.TrimSuffix(base, ext)
+
+		// Try to match a trailing number in the stem.
+		matches := numericSuffixRegex.FindStringSubmatch(stem)
+		if matches == nil {
+			// No trailing number — can't be a series.
+			return false
+		}
+
+		prefix := matches[1]
+		num, err := strconv.Atoi(matches[2])
+		if err != nil {
+			return false
+		}
+		items = append(items, parsed{prefix: strings.ToLower(prefix), number: num})
+	}
+
+	// Check that all images share the same prefix.
+	for i := 1; i < len(items); i++ {
+		if items[i].prefix != items[0].prefix {
+			return false
+		}
+	}
+
+	// Sort by numeric suffix and check for consecutive numbers.
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].number < items[j].number
+	})
+
+	for i := 1; i < len(items); i++ {
+		gap := items[i].number - items[i-1].number
+		// Allow a gap of at most 1 (consecutive). A gap of 0 means same number
+		// (different extensions?), gap of 1 means sequential.
+		if gap < 0 || gap > 1 {
+			return false
+		}
+	}
+
+	return true
 }

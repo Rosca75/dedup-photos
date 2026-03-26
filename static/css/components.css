@@ -199,6 +199,62 @@
 .browse-item:last-child { border-bottom: none; }
 .browse-actions { display: flex; gap: var(--space-sm); margin-top: var(--space-sm); justify-content: flex-end; }
 
+/* ===== Hover preview tooltip ===== */
+.hover-preview {
+  position: fixed;
+  z-index: 8000;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-xs);
+  max-width: 260px;
+  pointer-events: none;
+}
+.hover-preview img {
+  display: block;
+  max-width: 250px;
+  max-height: 200px;
+  object-fit: contain;
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+}
+.hover-preview-info {
+  font-size: 0.7rem;
+  color: var(--text-light);
+  margin-top: var(--space-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ===== Browse subfolder checkbox ===== */
+.browse-subfolder-row {
+  margin-top: var(--space-xs);
+  margin-bottom: var(--space-sm);
+}
+.browse-subfolder-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  font-size: var(--font-size-small);
+  color: var(--text);
+  cursor: pointer;
+}
+.browse-subfolder-label input[type="checkbox"] {
+  accent-color: var(--primary-light);
+  width: 15px;
+  height: 15px;
+}
+
+/* ===== Undo icon in table rows ===== */
+.btn-undo-icon {
+  color: var(--warning);
+}
+.btn-undo-icon:hover {
+  color: var(--success);
+}
+
 /* Responsive */
 @media (max-width: 1024px) {
   .left-panel { display: none; }

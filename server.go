@@ -129,13 +129,16 @@ const maxUndoActions = 20
 
 // ScanRequest is the JSON body sent by the frontend when starting a scan.
 type ScanRequest struct {
-	Path       string   `json:"path"`       // Directory path to scan for duplicates.
-	Threshold  int      `json:"threshold"`  // Hamming distance threshold for perceptual matching.
-	Algorithm  string   `json:"algorithm"`  // Algorithm: "dhash", "phash", or "both" (default: "dhash").
-	MinWidth   int      `json:"min_width"`  // Minimum image width to include (0 = no limit).
-	MaxHeight  int      `json:"max_height"` // Maximum image height to include (0 = no limit).
-	Extensions     []string `json:"extensions"`      // List of extensions to include (empty = all supported).
-	NormalisedSize int      `json:"normalised_size"` // Reduced image size for comparison (16, 32, 64, 128).
+	Path              string   `json:"path"`               // Directory path to scan for duplicates.
+	Threshold         int      `json:"threshold"`           // Hamming distance threshold for perceptual matching.
+	Algorithm         string   `json:"algorithm"`           // Algorithm: "dhash", "phash", or "both" (default: "dhash").
+	MinWidth          int      `json:"min_width"`           // Minimum image width to include (0 = no limit).
+	MaxHeight         int      `json:"max_height"`          // Maximum image height to include (0 = no limit).
+	Extensions        []string `json:"extensions"`          // List of extensions to include (empty = all supported).
+	NormalisedSize    int      `json:"normalised_size"`     // Reduced image size for comparison (16, 32, 64, 128).
+	IncludeSubfolders bool     `json:"include_subfolders"`  // Whether to scan subfolders recursively (default: true).
+	MinFileSize       int64    `json:"min_file_size"`       // Minimum file size in bytes (0 = no limit).
+	MaxFileSize       int64    `json:"max_file_size"`       // Maximum file size in bytes (0 = no limit).
 }
 
 // BrowseRequest is the JSON body for directory browsing.
@@ -427,7 +430,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		paths, err := ScanDirectoryFiltered(req.Path, allowedExts, req.MinWidth, req.MaxHeight)
+		paths, err := ScanDirectoryFiltered(req.Path, allowedExts, req.MinWidth, req.MaxHeight, req.IncludeSubfolders, req.MinFileSize, req.MaxFileSize)
 		if err != nil {
 			log.Printf("[scan] Error scanning directory: %v", err)
 			scanMutex.Lock()
@@ -641,13 +644,14 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// -------------------------------------------------------------------------
-	// Soft-delete the file (rename to .deleted for undo support)
+	// Permanently delete the file from disk
 	// -------------------------------------------------------------------------
 	//
-	// Instead of permanently deleting, we rename the file by appending
-	// ".deleted" to its name. This allows undo (rename back to original).
-	trashPath := req.Path + ".deleted"
-	err = os.Rename(req.Path, trashPath)
+	// This is irreversible — the file cannot be recovered after deletion
+	// (unless the user has backups). The frontend uses a two-step flow:
+	// 1. User marks files for deletion (visual only, no API call).
+	// 2. User clicks "Confirm Deletions" which calls this endpoint for each file.
+	err = os.Remove(req.Path)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -658,31 +662,15 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Remove the thumbnail from cache since the file is "gone".
+	// Remove the thumbnail from cache since the file is gone.
 	thumbnailCache.Delete(req.Path)
 
-	// Push to undo stack.
-	actionMutex.Lock()
-	undoStack = append(undoStack, Action{
-		Type:      "delete",
-		Path:      req.Path,
-		TrashPath: trashPath,
-		Timestamp: time.Now().UnixMilli(),
-	})
-	if len(undoStack) > maxUndoActions {
-		undoStack = undoStack[len(undoStack)-maxUndoActions:]
-	}
-	// Clear redo stack on new action.
-	redoStack = nil
-	actionMutex.Unlock()
-
-	log.Printf("POST /api/delete — soft-deleted %s → %s", req.Path, trashPath)
+	log.Printf("POST /api/delete — permanently deleted %s", req.Path)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":    true,
-		"trash_path": trashPath,
-		"message":    fmt.Sprintf("File deleted: %s", req.Path),
+		"success": true,
+		"message": fmt.Sprintf("File permanently deleted: %s", req.Path),
 	})
 }
 
@@ -1189,22 +1177,31 @@ func handleReportMismatch(w http.ResponseWriter, r *http.Request) {
 // ScanDirectoryFiltered — Scan with extension and dimension filters
 // =============================================================================
 
-func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidth, maxHeight int) ([]string, error) {
-	// If no custom extensions, use default scan.
-	if len(allowedExts) == 0 && minWidth == 0 && maxHeight == 0 {
-		return ScanDirectory(rootPath)
-	}
-
+// ScanDirectoryFiltered scans rootPath for image files with optional filters.
+// Parameters:
+//   - rootPath:          Directory to scan.
+//   - allowedExts:       Map of allowed extensions (empty = all supported).
+//   - minWidth:          Minimum image width in pixels (0 = no limit).
+//   - maxHeight:         Maximum image height in pixels (0 = no limit).
+//   - includeSubfolders: If true, recurse into subfolders. If false, only scan rootPath.
+//   - minFileSize:       Minimum file size in bytes (0 = no limit).
+//   - maxFileSize:       Maximum file size in bytes (0 = no limit).
+func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidth, maxHeight int, includeSubfolders bool, minFileSize, maxFileSize int64) ([]string, error) {
 	var imagePaths []string
 
 	err := filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
+		// Skip hidden directories.
 		if d.IsDir() && strings.HasPrefix(d.Name(), ".") {
 			return filepath.SkipDir
 		}
+		// If not including subfolders, skip any subdirectory (but not rootPath itself).
 		if d.IsDir() {
+			if !includeSubfolders && path != rootPath {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
@@ -1224,6 +1221,19 @@ func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidt
 		absPath, absErr := filepath.Abs(path)
 		if absErr != nil {
 			absPath = path
+		}
+
+		// Check file size filters.
+		if minFileSize > 0 || maxFileSize > 0 {
+			info, infoErr := d.Info()
+			if infoErr == nil {
+				if minFileSize > 0 && info.Size() < minFileSize {
+					return nil
+				}
+				if maxFileSize > 0 && info.Size() > maxFileSize {
+					return nil
+				}
+			}
 		}
 
 		// Check dimension filters if specified.

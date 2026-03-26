@@ -18,11 +18,8 @@ export const state = {
   /** Image object currently shown in preview panel, or null. */
   previewImage: null,
 
-  /** Undo stack — array of {type, path, trashPath, timestamp} objects. */
-  undoStack: [],
-
-  /** Redo stack — array of {type, path, trashPath, timestamp} objects. */
-  redoStack: [],
+  /** Set of file paths marked for deletion (pending confirmation). */
+  pendingDeletions: new Set(),
 
   /** Current sort column and direction for the results table. */
   sortColumn: null,
@@ -31,10 +28,15 @@ export const state = {
   /** Currently selected row path (for highlight in table). */
   selectedRowPath: null,
 
+  /** Set of group IDs that are currently collapsed in the table. */
+  collapsedGroups: new Set(),
+
   /** Filter state for dynamic filtering (no re-scan). */
   filters: {
     filename: '',
     maxDiff: 100,
-    extensions: new Set()
+    extensions: new Set(),
+    minFileSize: 0,
+    maxFileSize: 0
   }
 };

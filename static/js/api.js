@@ -33,24 +33,6 @@ export async function apiDelete(path) {
   return resp.json();
 }
 
-/** Undo the last delete action (restore from .deleted). */
-export async function apiUndo() {
-  const resp = await fetch("/api/undo", { method: "POST" });
-  return resp.json();
-}
-
-/** Redo the last undone action (delete again). */
-export async function apiRedo() {
-  const resp = await fetch("/api/redo", { method: "POST" });
-  return resp.json();
-}
-
-/** Get undo/redo stack state from the server. */
-export async function apiHistory() {
-  const resp = await fetch("/api/history");
-  return resp.json();
-}
-
 /** Browse directories starting from the given path. */
 export async function apiBrowse(path) {
   const resp = await fetch("/api/browse", {
