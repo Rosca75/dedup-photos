@@ -103,6 +103,26 @@ var thumbnailCache sync.Map
 // Calling it will signal the scan goroutine to stop.
 var scanCancel context.CancelFunc
 
+// actionMutex protects the undo/redo stacks from concurrent access.
+var actionMutex sync.Mutex
+
+// undoStack holds the last N delete actions for undo support. Max 20.
+var undoStack []Action
+
+// redoStack holds undone actions for redo support.
+var redoStack []Action
+
+// Action represents a reversible delete operation (soft-delete via rename).
+type Action struct {
+	Type      string `json:"type"`       // "delete"
+	Path      string `json:"path"`       // Original file path.
+	TrashPath string `json:"trash_path"` // Renamed (.deleted) path.
+	Timestamp int64  `json:"timestamp"`  // Unix milliseconds.
+}
+
+// maxUndoActions is the maximum number of actions kept in the undo stack.
+const maxUndoActions = 20
+
 // =============================================================================
 // Types — JSON request/response structures
 // =============================================================================
@@ -114,7 +134,8 @@ type ScanRequest struct {
 	Algorithm  string   `json:"algorithm"`  // Algorithm: "dhash", "phash", or "both" (default: "dhash").
 	MinWidth   int      `json:"min_width"`  // Minimum image width to include (0 = no limit).
 	MaxHeight  int      `json:"max_height"` // Maximum image height to include (0 = no limit).
-	Extensions []string `json:"extensions"` // List of extensions to include (empty = all supported).
+	Extensions     []string `json:"extensions"`      // List of extensions to include (empty = all supported).
+	NormalisedSize int      `json:"normalised_size"` // Reduced image size for comparison (16, 32, 64, 128).
 }
 
 // BrowseRequest is the JSON body for directory browsing.
@@ -222,6 +243,9 @@ func StartServer(port int) {
 
 	// POST /api/report-mismatch → Generate a diagnostic report for a mismatched group.
 	http.HandleFunc("/api/report-mismatch", handleReportMismatch)
+	http.HandleFunc("/api/undo", handleUndo)
+	http.HandleFunc("/api/redo", handleRedo)
+	http.HandleFunc("/api/history", handleHistory)
 
 	// -------------------------------------------------------------------------
 	// Start the HTTP server
@@ -617,11 +641,13 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// -------------------------------------------------------------------------
-	// Permanently delete the file from disk
+	// Soft-delete the file (rename to .deleted for undo support)
 	// -------------------------------------------------------------------------
 	//
-	// os.Remove deletes the file. This is irreversible.
-	err = os.Remove(req.Path)
+	// Instead of permanently deleting, we rename the file by appending
+	// ".deleted" to its name. This allows undo (rename back to original).
+	trashPath := req.Path + ".deleted"
+	err = os.Rename(req.Path, trashPath)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -632,15 +658,167 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Remove the thumbnail from cache since the file is gone.
+	// Remove the thumbnail from cache since the file is "gone".
 	thumbnailCache.Delete(req.Path)
 
-	log.Printf("POST /api/delete — permanently deleted %s", req.Path)
+	// Push to undo stack.
+	actionMutex.Lock()
+	undoStack = append(undoStack, Action{
+		Type:      "delete",
+		Path:      req.Path,
+		TrashPath: trashPath,
+		Timestamp: time.Now().UnixMilli(),
+	})
+	if len(undoStack) > maxUndoActions {
+		undoStack = undoStack[len(undoStack)-maxUndoActions:]
+	}
+	// Clear redo stack on new action.
+	redoStack = nil
+	actionMutex.Unlock()
+
+	log.Printf("POST /api/delete — soft-deleted %s → %s", req.Path, trashPath)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"trash_path": trashPath,
+		"message":    fmt.Sprintf("File deleted: %s", req.Path),
+	})
+}
+
+// =============================================================================
+// handleUndo — Reverse the most recent delete action
+// =============================================================================
+
+// handleUndo handles POST requests to /api/undo.
+// It pops the most recent action from the undo stack, renames the .deleted file
+// back to its original path, and pushes the action onto the redo stack.
+func handleUndo(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	actionMutex.Lock()
+	defer actionMutex.Unlock()
+
+	// Check if there's anything to undo.
+	if len(undoStack) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Nothing to undo",
+		})
+		return
+	}
+
+	// Pop the most recent action from the undo stack.
+	action := undoStack[len(undoStack)-1]
+	undoStack = undoStack[:len(undoStack)-1]
+
+	// Rename the .deleted file back to its original path.
+	if err := os.Rename(action.TrashPath, action.Path); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("Failed to restore file: %v", err),
+		})
+		return
+	}
+
+	// Push onto the redo stack so the user can redo if they change their mind.
+	redoStack = append(redoStack, action)
+
+	log.Printf("Undo: restored %s", action.Path)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"message": fmt.Sprintf("File permanently deleted: %s", req.Path),
+		"path":    action.Path,
+		"message": fmt.Sprintf("Restored: %s", action.Path),
+	})
+}
+
+// =============================================================================
+// handleRedo — Re-apply the most recently undone delete action
+// =============================================================================
+
+// handleRedo handles POST requests to /api/redo.
+// It pops the most recent action from the redo stack, renames the original file
+// back to .deleted, and pushes the action onto the undo stack.
+func handleRedo(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	actionMutex.Lock()
+	defer actionMutex.Unlock()
+
+	// Check if there's anything to redo.
+	if len(redoStack) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Nothing to redo",
+		})
+		return
+	}
+
+	// Pop the most recent action from the redo stack.
+	action := redoStack[len(redoStack)-1]
+	redoStack = redoStack[:len(redoStack)-1]
+
+	// Rename the original file back to .deleted.
+	if err := os.Rename(action.Path, action.TrashPath); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("Failed to re-delete file: %v", err),
+		})
+		return
+	}
+
+	// Push back onto the undo stack.
+	undoStack = append(undoStack, action)
+
+	log.Printf("Redo: re-deleted %s", action.Path)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"path":    action.Path,
+		"message": fmt.Sprintf("Re-deleted: %s", action.Path),
+	})
+}
+
+// =============================================================================
+// handleHistory — Return the current undo/redo stack state
+// =============================================================================
+
+// handleHistory handles GET requests to /api/history.
+// It returns the current undo and redo stacks as JSON so the frontend can
+// enable/disable undo/redo buttons and show action history.
+func handleHistory(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	actionMutex.Lock()
+	defer actionMutex.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"undo_count": len(undoStack),
+		"redo_count": len(redoStack),
+		"undo":       undoStack,
+		"redo":       redoStack,
 	})
 }
 

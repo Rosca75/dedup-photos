@@ -1,7 +1,7 @@
 // sidebar.js — Left sidebar: folder tree navigation for filtering scan results.
 
 import { state } from './state.js';
-import { renderResults } from './render.js';
+import { renderResults } from './table.js';
 
 /**
  * Initialize the sidebar (no-op until scan results arrive).

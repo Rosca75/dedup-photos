@@ -12,15 +12,29 @@ export const state = {
   /** Currently selected folder path for sidebar filtering (null = show all). */
   selectedFolder: null,
 
-  /** Whether the settings pane is currently visible. */
-  settingsOpen: false,
-
-  /** Set of group IDs that are currently expanded in the main area. */
-  expandedGroups: new Set(),
-
   /** Set of group IDs selected for batch actions (checkboxes). */
   selectedGroups: new Set(),
 
-  /** Image object currently shown in preview panel (Zone 5), or null. */
-  previewImage: null
+  /** Image object currently shown in preview panel, or null. */
+  previewImage: null,
+
+  /** Undo stack — array of {type, path, trashPath, timestamp} objects. */
+  undoStack: [],
+
+  /** Redo stack — array of {type, path, trashPath, timestamp} objects. */
+  redoStack: [],
+
+  /** Current sort column and direction for the results table. */
+  sortColumn: null,
+  sortDirection: 'asc',
+
+  /** Currently selected row path (for highlight in table). */
+  selectedRowPath: null,
+
+  /** Filter state for dynamic filtering (no re-scan). */
+  filters: {
+    filename: '',
+    maxDiff: 100,
+    extensions: new Set()
+  }
 };

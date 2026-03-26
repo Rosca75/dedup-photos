@@ -1,0 +1,144 @@
+/* table.css — Data table styles for duplicate results. */
+
+/* Results table container */
+.groups { padding-bottom: 2rem; }
+
+/* The data table */
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-small);
+}
+
+/* Sticky header */
+.results-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-subtle);
+  padding: var(--space-sm);
+  text-align: left;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-light);
+  font-weight: var(--font-weight-semi);
+  border-bottom: 2px solid var(--border);
+  white-space: nowrap;
+  z-index: 2;
+  cursor: pointer;
+  user-select: none;
+  transition: color var(--transition);
+}
+.results-table thead th:hover { color: var(--primary); }
+
+/* Sort indicator */
+.sort-arrow { font-size: 0.65rem; margin-left: 3px; opacity: 0.4; }
+th.sort-asc .sort-arrow,
+th.sort-desc .sort-arrow { opacity: 1; color: var(--primary); }
+
+/* Column widths */
+.col-check    { width: 36px; text-align: center !important; cursor: default !important; }
+.col-diff     { width: 70px; }
+.col-type     { width: 90px; }
+.col-name     { min-width: 130px; }
+.col-path     { min-width: 150px; }
+.col-dim      { width: 95px; }
+.col-ext      { width: 55px; }
+.col-size     { width: 80px; }
+.col-block    { width: 75px; }
+.col-blur     { width: 75px; }
+.col-actions  { width: 50px; text-align: center !important; cursor: default !important; }
+
+/* ===== Group header row ===== */
+.group-row {
+  background: var(--bg-subtle);
+  border-top: 2px solid var(--border);
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.group-row:hover { background: #ECECEC; }
+.group-row td {
+  padding: var(--space-sm);
+  font-weight: var(--font-weight-semi);
+  vertical-align: middle;
+}
+.group-row td:first-child { text-align: center; }
+
+/* Group summary text */
+.group-summary-cell {
+  font-weight: var(--font-weight-regular) !important;
+  color: var(--text-light);
+  font-size: 0.8rem;
+}
+
+/* ===== Image row ===== */
+.image-row {
+  cursor: pointer;
+  transition: background var(--transition);
+  border-bottom: 1px solid var(--border);
+}
+.image-row:hover { background: var(--bg-subtle); }
+.image-row.active {
+  background: rgba(74, 144, 226, 0.08);
+  border-left: 3px solid var(--primary-light);
+}
+.image-row td {
+  padding: 6px var(--space-sm);
+  vertical-align: middle;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 250px;
+}
+
+/* Cell styles */
+.cell-name { font-weight: var(--font-weight-semi); color: var(--black); }
+.cell-path { color: var(--text-light); font-size: 0.78rem; }
+
+/* Checkbox styling */
+.group-checkbox,
+.results-table thead th input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: var(--primary-light);
+}
+
+/* ===== Badges ===== */
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 99px;
+  font-size: 0.68rem;
+  font-weight: var(--font-weight-semi);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #fff;
+}
+.badge-sm { padding: 1px 7px; font-size: 0.62rem; }
+.badge-exact      { background: var(--exact); }
+.badge-perceptual { background: var(--perceptual); }
+.badge-keep       { background: var(--original); color: #fff; }
+.badge-delete     { background: var(--duplicate); }
+
+/* ===== Quality bar ===== */
+.quality-section {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: 0.78rem;
+}
+.quality-section .qlabel { color: var(--text-light); white-space: nowrap; }
+.quality-track {
+  flex: 1;
+  height: 5px;
+  background: var(--bg-subtle);
+  border-radius: 99px;
+  overflow: hidden;
+}
+.quality-fill { height: 100%; border-radius: 99px; transition: width 0.4s; }
+.quality-section .qval {
+  font-weight: var(--font-weight-semi);
+  min-width: 2.5em;
+  text-align: right;
+}

@@ -1,10 +1,7 @@
 // api.js — All fetch() calls to the backend API.
 // This is the ONLY file that calls fetch(). Other modules use these functions.
 
-/**
- * Start a scan with the given settings object.
- * Returns the JSON response (may be immediate "complete" or "scanning").
- */
+/** Start a scan with the given settings object. */
 export async function apiScan(settings) {
   const resp = await fetch("/api/scan", {
     method: "POST",
@@ -14,27 +11,19 @@ export async function apiScan(settings) {
   return resp.json();
 }
 
-/**
- * Poll for current scan results / progress.
- * Returns the full results JSON including status, progress, stats, groups.
- */
+/** Poll for current scan results / progress. */
 export async function apiResults() {
   const resp = await fetch("/api/results");
   return resp.json();
 }
 
-/**
- * Cancel the currently running scan.
- */
+/** Cancel the currently running scan. */
 export async function apiCancel() {
   const resp = await fetch("/api/cancel", { method: "POST" });
   return resp.json();
 }
 
-/**
- * Soft-delete a file by path (renames to .deleted).
- * Returns { success: true } or { success: false, error: "..." }.
- */
+/** Delete a file by path (soft-delete: renames to .deleted). */
 export async function apiDelete(path) {
   const resp = await fetch("/api/delete", {
     method: "POST",
@@ -44,10 +33,25 @@ export async function apiDelete(path) {
   return resp.json();
 }
 
-/**
- * Browse directories starting from the given path.
- * Returns { current, parent, entries: [{name, path}] }.
- */
+/** Undo the last delete action (restore from .deleted). */
+export async function apiUndo() {
+  const resp = await fetch("/api/undo", { method: "POST" });
+  return resp.json();
+}
+
+/** Redo the last undone action (delete again). */
+export async function apiRedo() {
+  const resp = await fetch("/api/redo", { method: "POST" });
+  return resp.json();
+}
+
+/** Get undo/redo stack state from the server. */
+export async function apiHistory() {
+  const resp = await fetch("/api/history");
+  return resp.json();
+}
+
+/** Browse directories starting from the given path. */
 export async function apiBrowse(path) {
   const resp = await fetch("/api/browse", {
     method: "POST",
@@ -57,10 +61,7 @@ export async function apiBrowse(path) {
   return resp.json();
 }
 
-/**
- * Download a mismatch diagnostic report for a group.
- * Returns a Blob (JSON file) for the user to download.
- */
+/** Download a mismatch diagnostic report for a group (returns Blob). */
 export async function apiMismatchReport(groupId) {
   const resp = await fetch("/api/report-mismatch", {
     method: "POST",

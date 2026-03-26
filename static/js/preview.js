@@ -1,26 +1,21 @@
-// preview.js — Zone 5: image preview panel in the bottom of the left sidebar.
+// preview.js — Left panel: image preview + metadata display.
 
 import { state } from './state.js';
 import { formatBytes, formatDate, formatGPS, qualityColor } from './helpers.js';
 
-/**
- * Initialize the preview panel with a placeholder message.
- */
+/** Initialize the preview panel with a placeholder. */
 export function initPreview() {
   clearPreview();
 }
 
-/**
- * Show a full preview of the given image object in Zone 5.
- * Displays thumbnail, metadata, quality bar, KEEP/DELETE badge, and delete button.
- */
+/** Show a full preview of the given image object. */
 export function showPreview(img) {
   state.previewImage = img;
   const container = document.getElementById('preview-area');
   if (!container) return;
   container.innerHTML = '';
 
-  // Thumbnail image.
+  // Thumbnail.
   const thumbImg = document.createElement('img');
   thumbImg.src = '/api/thumbnail?path=' + encodeURIComponent(img.path || '');
   thumbImg.alt = img.filename || 'thumbnail';
@@ -28,7 +23,7 @@ export function showPreview(img) {
   thumbImg.onerror = function () { this.style.display = 'none'; };
   container.appendChild(thumbImg);
 
-  // Info section with metadata.
+  // Info section.
   const info = document.createElement('div');
   info.className = 'preview-info';
 
@@ -41,11 +36,13 @@ export function showPreview(img) {
   // Metadata fields.
   const fields = [
     ['Size', formatBytes(img.size)],
-    ['Resolution', (img.width && img.height) ? (img.width + 'x' + img.height) : '--'],
+    ['Resolution', (img.width && img.height) ? img.width + 'x' + img.height : '--'],
     ['Date', formatDate(img.date_taken)],
     ['Camera', img.camera || '--'],
     ['GPS', formatGPS(img.gps_lat, img.gps_lon)],
-    ['Quality', img.quality_score != null ? (img.quality_score + '/100') : '--']
+    ['Quality', img.quality_score != null ? img.quality_score + '/100' : '--'],
+    ['Blockiness', img.blockiness != null ? Number(img.blockiness).toFixed(2) : '--'],
+    ['Blurring', img.blurring != null ? Number(img.blurring).toFixed(2) : '--']
   ];
   for (const [label, value] of fields) {
     const item = document.createElement('div');
@@ -61,17 +58,16 @@ export function showPreview(img) {
     info.appendChild(item);
   }
 
-  // Quality bar (if available).
+  // Quality bar.
   if (img.quality_score != null) {
-    const qbar = buildQualityBar(img.quality_score);
-    info.appendChild(qbar);
+    info.appendChild(buildQualityBar(img.quality_score));
   }
 
-  // KEEP or DELETE badge.
+  // Original/Duplicate badge.
   const badge = document.createElement('span');
   badge.className = 'badge ' + (img.is_best ? 'badge-keep' : 'badge-delete');
-  badge.textContent = img.is_best ? 'KEEP' : 'DELETE';
-  badge.style.marginTop = '0.5rem';
+  badge.textContent = img.is_best ? 'Original' : 'Duplicate';
+  badge.style.marginTop = '8px';
   badge.style.display = 'inline-block';
   info.appendChild(badge);
 
@@ -79,7 +75,7 @@ export function showPreview(img) {
   const delBtn = document.createElement('button');
   delBtn.className = 'btn btn-danger btn-sm';
   delBtn.textContent = 'Delete this file';
-  delBtn.style.marginTop = '0.5rem';
+  delBtn.style.marginTop = '8px';
   delBtn.style.width = '100%';
   delBtn.onclick = () => window.deleteFile(img.path);
   info.appendChild(delBtn);
@@ -87,12 +83,12 @@ export function showPreview(img) {
   container.appendChild(info);
 }
 
-/** Build a small quality bar widget. */
+/** Build a quality bar widget. */
 function buildQualityBar(score) {
   const qs = Number(score);
   const section = document.createElement('div');
   section.className = 'quality-section';
-  section.style.marginTop = '0.4rem';
+  section.style.marginTop = '6px';
   const track = document.createElement('div');
   track.className = 'quality-track';
   const fill = document.createElement('div');
@@ -104,13 +100,12 @@ function buildQualityBar(score) {
   return section;
 }
 
-/**
- * Clear the preview panel and show a placeholder message.
- */
+/** Clear the preview panel and show a placeholder. */
 export function clearPreview() {
   state.previewImage = null;
   const container = document.getElementById('preview-area');
   if (container) {
-    container.innerHTML = '<div class="preview-empty">Click a row to preview</div>';
+    container.innerHTML = '<div class="preview-empty"><i data-feather="image"></i><p>Click a row to preview</p></div>';
+    if (typeof feather !== 'undefined') feather.replace();
   }
 }
