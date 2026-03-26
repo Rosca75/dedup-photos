@@ -7,6 +7,7 @@ import { initBrowse } from './browse.js';
 import { initActions } from './actions.js';
 import { initPreview } from './preview.js';
 import { initFilters } from './filters.js';
+import { initResize } from './resize.js';
 
 /** Initialize all application modules once the DOM is ready. */
 document.addEventListener('DOMContentLoaded', () => {
@@ -16,6 +17,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initActions();    // Expose delete/mismatch handlers + batch actions.
   initPreview();    // Initialize image preview panel.
   initFilters();    // Wire up dynamic filter controls.
+  initResize();     // Enable drag-to-resize for panel sections.
 
   // Default: include subfolders when scanning.
   window._includeSubfolders = true;

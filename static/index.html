@@ -125,11 +125,15 @@
         <div class="preview-empty"><i data-feather="image"></i><p>Click a row to preview</p></div>
       </div>
     </div>
+    <!-- Drag handle between preview and folders -->
+    <div class="panel-resize-handle" data-resize="preview-folders"></div>
     <!-- Section 2: Location with duplicates -->
     <div class="panel-section panel-folders">
       <div class="panel-header">Location with duplicates</div>
       <div id="sidebar-tree"></div>
     </div>
+    <!-- Drag handle between folders and filters -->
+    <div class="panel-resize-handle" data-resize="folders-filters"></div>
     <!-- Section 3: Filters -->
     <div class="panel-section panel-filters">
       <div class="panel-header">Filters</div>
@@ -168,6 +172,9 @@
       </div>
     </div>
   </div>
+
+  <!-- Horizontal resize handle for left panel width -->
+  <div class="panel-resize-handle-h" id="left-panel-resize"></div>
 
   <!-- Zone D — Center: Data table -->
   <div class="main-area">

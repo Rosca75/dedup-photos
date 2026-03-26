@@ -1,4 +1,5 @@
-// actions.js — File actions: mark for deletion, confirm, batch operations, mismatch.
+// actions.js — File actions: mark for deletion, confirm, batch operations,
+// promote-to-original, mismatch report.
 
 import { state } from './state.js';
 import { apiDelete, apiMismatchReport } from './api.js';
@@ -10,6 +11,7 @@ import { clearPreview } from './preview.js';
 export function initActions() {
   window.deleteFile = markForDeletion;
   window.unmarkFile = unmarkForDeletion;
+  window.promoteImage = promoteToOriginal;
   window.reportMismatch = reportMismatch;
   document.getElementById('batch-keep-best').addEventListener('click', batchKeepBest);
   document.getElementById('batch-delete-all').addEventListener('click', batchDeleteAll);
@@ -53,6 +55,13 @@ function unmarkForDeletion(path) {
   if (state.scanResult) renderResults(state.scanResult);
 }
 
+/** Promote a duplicate image to "Original" status (one-click, no unpromote). */
+function promoteToOriginal(path) {
+  state.promotedImages.add(path);
+  if (state.scanResult) renderResults(state.scanResult);
+  showToast('Promoted to Original.', 'success');
+}
+
 /** Confirm and permanently delete all pending files. */
 async function confirmDeletions() {
   const paths = Array.from(state.pendingDeletions);
@@ -85,19 +94,52 @@ function removeImageFromState(path) {
   state.scanResult.groups = state.scanResult.groups.filter(g => (g.images || []).length >= 2);
 }
 
-/** Batch action: keep only the best image in each selected group. */
-function batchKeepBest() {
-  const paths = collectPathsForBatch(true);
+/**
+ * Batch "Keep Best": permanently delete all non-original, non-promoted images
+ * in selected groups. Keeps images marked as is_best OR promoted by user.
+ */
+async function batchKeepBest() {
+  const paths = collectPathsForKeepBest();
   if (paths.length === 0) { showToast('No files to delete.', 'error'); return; }
-  paths.forEach(p => state.pendingDeletions.add(p));
+
+  // Directly delete permanently (no pending step for batch Keep Best).
+  let ok = 0, fail = 0;
+  for (const path of paths) {
+    try {
+      const data = await apiDelete(path);
+      if (data.success) {
+        ok++;
+        removeImageFromState(path);
+        state.pendingDeletions.delete(path);
+      } else { fail++; }
+    } catch (e) { fail++; }
+  }
+
   state.selectedGroups.clear();
+  clearPreview();
   updateConfirmButton();
   updateBatchButtons();
   if (state.scanResult) renderResults(state.scanResult);
-  showToast(paths.length + ' file(s) marked for deletion. Click "Confirm" to delete permanently.', 'success');
+  showToast(ok + ' file(s) permanently deleted' + (fail > 0 ? ', ' + fail + ' failed' : ''), fail > 0 ? 'error' : 'success');
 }
 
-/** Batch action: delete ALL images in each selected group. */
+/** Collect paths for Keep Best: skip is_best images AND promoted images. */
+function collectPathsForKeepBest() {
+  if (!state.scanResult || !state.scanResult.groups) return [];
+  const paths = [];
+  for (const group of state.scanResult.groups) {
+    if (!state.selectedGroups.has(group.id)) continue;
+    for (const img of (group.images || [])) {
+      // Keep the image if it's the best or if user promoted it.
+      if (img.is_best) continue;
+      if (state.promotedImages.has(img.path)) continue;
+      if (img.path) paths.push(img.path);
+    }
+  }
+  return paths;
+}
+
+/** Batch action: mark ALL images in each selected group for deletion. */
 function batchDeleteAll() {
   const paths = collectPathsForBatch(false);
   if (paths.length === 0) { showToast('No files to delete.', 'error'); return; }

@@ -1,5 +1,6 @@
 // table.js — Central zone: render scan results as a flat data table.
-// Supports sortable columns, collapsible groups, series badges, hover preview.
+// Supports sortable columns, collapsible groups, series badges, hover preview,
+// keyboard navigation, and promote-to-original.
 
 import { state } from './state.js';
 import { formatBytes, formatDuration } from './helpers.js';
@@ -18,7 +19,7 @@ export function renderResults(data) {
   state.scanResult = data;
   updateStatsBar(data.stats || {});
 
-  // Apply folder filter.
+  // Apply folder filter (supports multiple folders).
   let groups = data.groups || [];
   if (state.selectedFolder) {
     groups = groups.filter(g =>
@@ -49,6 +50,12 @@ export function renderResults(data) {
   updateConfirmButton();
   // Replace feather icon placeholders in dynamically created elements.
   if (typeof feather !== 'undefined') feather.replace();
+
+  // Restore active row highlight after re-render.
+  if (state.selectedRowPath) {
+    const row = container.querySelector('[data-path="' + CSS.escape(state.selectedRowPath) + '"]');
+    if (row) row.classList.add('active');
+  }
 }
 
 /** Update the stats display in the top bar. */
@@ -74,12 +81,40 @@ function showEmptyState(status) {
 function buildResultsTable(groups) {
   const table = document.createElement('table');
   table.className = 'results-table';
+  // Make table focusable for keyboard navigation.
+  table.tabIndex = 0;
   table.appendChild(buildTableHead());
 
   const tbody = document.createElement('tbody');
   for (const group of groups) appendGroupRows(tbody, group);
   table.appendChild(tbody);
+
+  // Keyboard arrow navigation within the table.
+  table.addEventListener('keydown', handleTableKeydown);
   return table;
+}
+
+/** Handle keyboard events on the table for arrow navigation. */
+function handleTableKeydown(e) {
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  e.preventDefault();
+
+  const rows = Array.from(document.querySelectorAll('.image-row'));
+  if (rows.length === 0) return;
+
+  // Find the currently active row index.
+  const currentIdx = rows.findIndex(r => r.classList.contains('active'));
+  let nextIdx;
+  if (e.key === 'ArrowDown') {
+    nextIdx = currentIdx < 0 ? 0 : Math.min(currentIdx + 1, rows.length - 1);
+  } else {
+    nextIdx = currentIdx < 0 ? 0 : Math.max(currentIdx - 1, 0);
+  }
+
+  // Simulate click on the target row to select it and show preview.
+  rows[nextIdx].click();
+  // Scroll the row into view if needed.
+  rows[nextIdx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
 /** Column definitions for the table header. */
@@ -109,10 +144,8 @@ function buildTableHead() {
     } else {
       th.textContent = c.text || '';
       if (c.sortable !== false && c.key) {
-        // Add sort arrow and click handler.
         const arrow = document.createElement('span');
         arrow.className = 'sort-arrow';
-        // Show direction indicator if this column is active.
         if (state.sortColumn === c.key) {
           arrow.textContent = state.sortDirection === 'asc' ? '\u25B2' : '\u25BC';
           th.classList.add('sort-' + state.sortDirection);
@@ -132,7 +165,6 @@ function buildTableHead() {
 /** Handle clicking a sortable column header. */
 function handleSort(key) {
   if (state.sortColumn === key) {
-    // Toggle direction.
     state.sortDirection = state.sortDirection === 'asc' ? 'desc' : 'asc';
   } else {
     state.sortColumn = key;
@@ -143,8 +175,7 @@ function handleSort(key) {
 
 /** Sort groups' images by the given column key and direction. */
 function sortGroups(groups, key, dir) {
-  // We sort images within each group by the specified column.
-  const sorted = groups.map(g => {
+  return groups.map(g => {
     const images = [...(g.images || [])];
     images.sort((a, b) => {
       let va = getSortValue(a, key);
@@ -156,7 +187,6 @@ function sortGroups(groups, key, dir) {
     });
     return { ...g, images };
   });
-  return sorted;
 }
 
 /** Extract a sortable value from an image for the given column key. */
@@ -253,7 +283,6 @@ function appendGroupRows(tbody, group) {
 
   // Click on group row to toggle collapse/expand.
   gRow.addEventListener('click', (e) => {
-    // Don't toggle if clicking the checkbox.
     if (e.target.type === 'checkbox') return;
     if (state.collapsedGroups.has(group.id)) {
       state.collapsedGroups.delete(group.id);
@@ -267,14 +296,17 @@ function appendGroupRows(tbody, group) {
 
   // Image rows (hidden when collapsed).
   if (!isCollapsed) {
-    for (const img of images) tbody.appendChild(buildImageRow(img));
+    for (const img of images) tbody.appendChild(buildImageRow(img, group.id));
   }
 }
 
 /** Build a table row for a single image. */
-function buildImageRow(img) {
+function buildImageRow(img, groupId) {
   const tr = document.createElement('tr');
   const isPending = state.pendingDeletions.has(img.path);
+  // Check if promoted by user.
+  const isPromoted = state.promotedImages.has(img.path);
+  const isOriginal = img.is_best || isPromoted;
   tr.className = 'image-row' + (isPending ? ' pending-delete' : '');
   tr.setAttribute('data-path', img.path || '');
   if (state.selectedRowPath === img.path) tr.classList.add('active');
@@ -287,8 +319,9 @@ function buildImageRow(img) {
     showPreview(img);
   });
 
-  // Mouseover to show a quick hover preview tooltip.
-  tr.addEventListener('mouseenter', () => showHoverPreview(tr, img));
+  // Mouseover to show a quick hover preview tooltip near the mouse.
+  tr.addEventListener('mouseenter', (e) => showHoverPreview(e, img));
+  tr.addEventListener('mousemove', moveHoverPreview);
   tr.addEventListener('mouseleave', hideHoverPreview);
 
   // Empty checkbox cell.
@@ -296,12 +329,26 @@ function buildImageRow(img) {
   // Empty diff cell.
   tr.appendChild(document.createElement('td'));
 
-  // Original/Duplicate/Series badge.
+  // Original/Duplicate badge cell — with promote button for non-originals.
   const statusTd = document.createElement('td');
+  statusTd.className = 'cell-status';
   const sBadge = document.createElement('span');
-  sBadge.className = 'badge badge-sm ' + (img.is_best ? 'badge-keep' : 'badge-delete');
-  sBadge.textContent = img.is_best ? 'Original' : 'Duplicate';
+  sBadge.className = 'badge badge-sm ' + (isOriginal ? 'badge-keep' : 'badge-delete');
+  sBadge.textContent = isOriginal ? 'Original' : 'Duplicate';
   statusTd.appendChild(sBadge);
+
+  // Promote button — only show for non-original images.
+  if (!isOriginal) {
+    const promBtn = document.createElement('button');
+    promBtn.className = 'btn-promote';
+    promBtn.innerHTML = '<i data-feather="arrow-up-circle"></i>';
+    promBtn.title = 'Promote to Original';
+    promBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      window.promoteImage(img.path);
+    });
+    statusTd.appendChild(promBtn);
+  }
   tr.appendChild(statusTd);
 
   // Filename.
@@ -322,7 +369,6 @@ function buildImageRow(img) {
   // Delete / Undo button cell.
   const delTd = document.createElement('td');
   if (isPending) {
-    // Show undo icon for pending deletions.
     const undoBtn = document.createElement('button');
     undoBtn.className = 'btn-del-icon btn-undo-icon';
     undoBtn.innerHTML = '<i data-feather="rotate-ccw"></i>';
@@ -333,7 +379,6 @@ function buildImageRow(img) {
     });
     delTd.appendChild(undoBtn);
   } else {
-    // Show trash icon for normal rows.
     const delBtn = document.createElement('button');
     delBtn.className = 'btn-del-icon';
     delBtn.innerHTML = '<i data-feather="trash-2"></i>';
@@ -349,8 +394,8 @@ function buildImageRow(img) {
   return tr;
 }
 
-/** Show a hover preview tooltip near the row. */
-function showHoverPreview(row, img) {
+/** Show hover preview tooltip near the mouse pointer (to the right). */
+function showHoverPreview(e, img) {
   hideHoverPreview();
   const tip = document.createElement('div');
   tip.className = 'hover-preview';
@@ -367,15 +412,34 @@ function showHoverPreview(row, img) {
   tip.appendChild(info);
 
   document.body.appendChild(tip);
+  positionHoverPreview(tip, e.clientX, e.clientY);
+}
 
-  // Position near the row.
-  const rect = row.getBoundingClientRect();
-  tip.style.top = Math.max(0, rect.top - 10) + 'px';
-  tip.style.left = (rect.right + 10) + 'px';
-  // If off-screen right, show on the left side.
-  if (rect.right + 270 > window.innerWidth) {
-    tip.style.left = Math.max(0, rect.left - 270) + 'px';
+/** Reposition hover preview as mouse moves. */
+function moveHoverPreview(e) {
+  const tip = document.getElementById('hover-preview-tip');
+  if (tip) positionHoverPreview(tip, e.clientX, e.clientY);
+}
+
+/** Position the hover preview to the right of the mouse cursor. */
+function positionHoverPreview(tip, mouseX, mouseY) {
+  const tipW = 270;
+  const offset = 15;
+  let left = mouseX + offset;
+  let top = mouseY - 20;
+
+  // If off-screen right, show on the left of mouse.
+  if (left + tipW > window.innerWidth) {
+    left = mouseX - tipW - offset;
   }
+  // Keep within vertical bounds.
+  if (top < 0) top = 0;
+  if (top + 250 > window.innerHeight) {
+    top = Math.max(0, window.innerHeight - 260);
+  }
+
+  tip.style.top = top + 'px';
+  tip.style.left = left + 'px';
 }
 
 /** Hide the hover preview tooltip. */
