@@ -528,13 +528,16 @@ func ComputePHash(path string) (uint64, error) {
 //
 // The function signature is unchanged so server.go/grouper.go don't need changes.
 func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int, algorithm string) []ImageHash {
-	return HashAllImagesWithProgress(ctx, paths, numWorkers, algorithm, nil, "")
+	return HashAllImagesWithProgress(ctx, paths, numWorkers, algorithm, nil, nil)
 }
 
 // HashAllImagesWithProgress is the same as HashAllImagesWithContext but accepts
 // a ProgressCallback for reporting phase/progress updates to the UI, and a
-// scanPath used to load/save the persistent hash cache.
-func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers int, algorithm string, progressFn ProgressCallback, scanPath string) []ImageHash {
+// list of scanPaths used to load/save the persistent hash cache.
+// The first scanPath is the "primary" — its cache file is where results are
+// saved. Additional scanPaths are loaded and merged in so that files from
+// previously-scanned directories get cache hits even in multi-folder scans.
+func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers int, algorithm string, progressFn ProgressCallback, scanPaths []string) []ImageHash {
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
 	}
@@ -554,19 +557,37 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 	fmt.Printf("[hasher] Starting cache-aware pipeline for %d images (%d workers, algorithm: %s)\n", totalImages, numWorkers, algorithm)
 
 	// =======================================================================
-	// Phase 1: Load persistent hash cache
+	// Phase 1: Load persistent hash cache (merge from all scan paths)
 	// =======================================================================
 	phaseStart := time.Now()
 	reportProgress("Loading hash cache...", 0, totalImages)
 
+	// Load the primary cache (first scanPath), then merge entries from any
+	// additional scan paths. This ensures that files previously scanned in
+	// a different folder still get cache hits in multi-folder scans.
 	var cache *HashCache
-	if scanPath != "" {
-		cache = LoadCache(scanPath)
+	if len(scanPaths) > 0 && scanPaths[0] != "" {
+		cache = LoadCache(scanPaths[0])
+		// Merge entries from additional scan path caches (extra folders).
+		for _, sp := range scanPaths[1:] {
+			if sp == "" {
+				continue
+			}
+			extra := LoadCache(sp)
+			for k, v := range extra.Entries {
+				// Only add entries not already in the primary cache
+				// (primary cache takes precedence if both have the same path).
+				if _, exists := cache.Entries[k]; !exists {
+					cache.Entries[k] = v
+				}
+			}
+			fmt.Printf("[hasher] Merged %d entries from extra cache (%s)\n", len(extra.Entries), sp)
+		}
 	} else {
 		cache = newEmptyCache()
 	}
 
-	fmt.Printf("[hasher] Cache loaded (%d entries) → %.1fs\n", len(cache.Entries), time.Since(phaseStart).Seconds())
+	fmt.Printf("[hasher] Cache loaded (%d total entries) → %.1fs\n", len(cache.Entries), time.Since(phaseStart).Seconds())
 
 	// =======================================================================
 	// Phase 2: os.Stat all files (needed for cache validation)
@@ -701,9 +722,12 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 	// =======================================================================
 	// Phase 4: Save cache to disk
 	// =======================================================================
-	if scanPath != "" {
+	// Save the merged cache to the primary scan path's cache file.
+	// This means the primary cache now contains entries from all extra paths too,
+	// speeding up future re-scans with the same primary folder.
+	if len(scanPaths) > 0 && scanPaths[0] != "" {
 		reportProgress("Saving cache...", totalImages, totalImages)
-		if err := SaveCache(cache, scanPath); err != nil {
+		if err := SaveCache(cache, scanPaths[0]); err != nil {
 			fmt.Printf("[hasher] Warning: failed to save cache: %v\n", err)
 		}
 	}
