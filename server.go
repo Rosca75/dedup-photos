@@ -1,62 +1,35 @@
 // =============================================================================
-// server.go — HTTP API server for the DedupPhotos web interface
+// server.go — Shared types, global state, and utility functions.
 // =============================================================================
 //
-// This file sets up the HTTP server that powers the web UI. When you open
-// http://localhost:8080 in your browser, this code handles all the requests:
-// serving the HTML page, starting scans, returning results, serving thumbnails,
-// and deleting files.
+// This file contains:
+//   - Type definitions shared between the Go backend and JS frontend
+//     (serialised via JSON struct tags).
+//   - Global state variables protected by mutexes (scan result, thumbnail
+//     cache, cancel function, undo/redo stacks).
+//   - ScanDirectoryFiltered: walks a directory tree with optional filters.
+//   - extractEmbeddedJPEG: extracts embedded JPEG previews from camera files.
 //
-// HOW WEB SERVERS WORK IN GO:
-//   Go's standard library includes a production-quality HTTP server. You don't
-//   need a framework like Express (Node.js) or Flask (Python). You just:
-//   1. Register "handler" functions for URL patterns (routes).
-//   2. Call http.ListenAndServe to start listening for connections.
-//   Each incoming request runs in its own goroutine automatically, so the
-//   server can handle many requests concurrently.
-//
-// ARCHITECTURE:
-//   The frontend (index.html) communicates with this server via JSON APIs:
-//   - POST /api/scan     → Start scanning a directory for duplicates.
-//   - GET  /api/results  → Poll for scan progress and results.
-//   - POST /api/delete   → Permanently delete a duplicate file.
-//   - GET  /api/thumbnail→ Get a resized thumbnail of an image.
-//
-// THREAD SAFETY:
-//   Because requests run concurrently, we protect shared state (scan results,
-//   thumbnail cache) with sync.Mutex and sync.Map. Without these, two
-//   goroutines could read/write the same data simultaneously, causing bugs.
-//
-// Key Go concepts:
-//   - go:embed:    Embeds files into the binary at compile time.
-//   - http.Handler: Interface for handling HTTP requests.
-//   - sync.Mutex:  Mutual exclusion lock for protecting shared data.
-//   - sync.Map:    Concurrent-safe map (no mutex needed).
-//   - goroutine:   Lightweight thread (used for background scanning).
+// All HTTP handler code has been removed — the app now uses Wails v2 bindings
+// (see app.go). Types remain here because scanner.go, hasher.go, grouper.go,
+// and metadata.go all reference them.
 // =============================================================================
 
 package main
 
 import (
-	"bytes"         // For working with byte buffers (thumbnail encoding).
-	"context"       // For scan cancellation support.
-	"embed"         // For embedding static files into the binary.
-	"encoding/json" // For encoding/decoding JSON (API communication).
-	"fmt"           // Formatted I/O.
-	"image"         // Standard image interface.
-	"image/jpeg"    // JPEG encoder (for thumbnails).
-	"io/fs"         // For sub-filesystem of embedded files.
-	"log"           // Logging with timestamps.
-	"net/http"      // HTTP server and client.
-	"os"            // File operations.
-	"path/filepath" // For directory browsing.
-	"runtime"       // Runtime info (number of CPUs).
-	"sort"          // For sorting directory entries.
-	"strings"       // For string operations.
-	"sync"          // Synchronization primitives (Mutex, Map).
-	"time"          // Time measurement.
+	"bytes"         // bytes.NewReader for JPEG validation in extractEmbeddedJPEG.
+	"context"       // context.CancelFunc type for scan cancellation.
+	"image"         // image.DecodeConfig for dimension filtering.
+	"image/jpeg"    // jpeg.Decode for validating extracted JPEG segments.
+	"os"            // File operations (Open, ReadFile, Stat, WalkDir).
+	"path/filepath" // filepath.WalkDir, filepath.Abs, filepath.Ext.
+	"sort"          // sort.Strings for deterministic path ordering.
+	"strings"       // String helpers (HasPrefix, ToLower, TrimSpace).
+	"sync"          // sync.Mutex for scanMutex; sync.Map for thumbnailCache.
 
-	// Image format decoders (registered via blank imports).
+	// Image format decoders — blank imports register decoders via init().
+	// These must be imported somewhere in the binary to enable decoding.
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
@@ -65,1247 +38,131 @@ import (
 )
 
 // =============================================================================
-// Embedded static files
+// Global state — protected by mutexes
 // =============================================================================
 
-// go:embed embeds the entire static directory into the binary at compile time.
-// This means the compiled binary contains all frontend files (HTML, CSS, JS)
-// and you don't need to ship them separately.
-//
-//go:embed static
-var staticFiles embed.FS
-
-// =============================================================================
-// Global state — protected by a mutex
-// =============================================================================
-
-// scanMutex protects the scanResult variable from concurrent access.
-// When the background scan goroutine updates scanResult, and the API handler
-// reads it simultaneously, the mutex prevents data races.
-//
-// HOW A MUTEX WORKS:
-//   - Lock():   "I'm about to read/write shared data. Wait if someone else
-//     has the lock."
-//   - Unlock(): "I'm done. Someone else can have the lock now."
-//     You MUST always Unlock after Locking, ideally with defer.
+// scanMutex protects scanResult and scanCancel from concurrent access.
+// The background scan goroutine writes these; GetResults() reads them.
 var scanMutex sync.Mutex
 
-// scanResult holds the current state of the scanning process. It's read by
-// the /api/results endpoint and written by the background scan goroutine.
+// scanResult holds the latest scan state (idle / scanning / complete).
+// Written by the scan goroutine; read by GetResults().
 var scanResult ScanResult
 
-// thumbnailCache stores generated thumbnails to avoid re-computing them.
-// sync.Map is a concurrent-safe map that doesn't need a mutex.
-// Keys are file paths (string), values are JPEG byte slices ([]byte).
+// thumbnailCache stores computed JPEG thumbnails keyed by file path.
+// sync.Map is safe for concurrent reads and writes without a mutex.
 var thumbnailCache sync.Map
 
-// scanCancel holds the cancel function for the currently running scan.
-// Calling it will signal the scan goroutine to stop.
+// scanCancel is the cancel function for the currently running scan.
+// Calling it stops the background scan goroutine via context cancellation.
 var scanCancel context.CancelFunc
 
-// actionMutex protects the undo/redo stacks from concurrent access.
+// actionMutex protects the undo/redo stacks below.
 var actionMutex sync.Mutex
 
-// undoStack holds the last N delete actions for undo support. Max 20.
+// undoStack records reversible delete operations (max 20 entries).
 var undoStack []Action
 
-// redoStack holds undone actions for redo support.
+// redoStack records undone actions so they can be re-applied.
 var redoStack []Action
-
-// Action represents a reversible delete operation (soft-delete via rename).
-type Action struct {
-	Type      string `json:"type"`       // "delete"
-	Path      string `json:"path"`       // Original file path.
-	TrashPath string `json:"trash_path"` // Renamed (.deleted) path.
-	Timestamp int64  `json:"timestamp"`  // Unix milliseconds.
-}
 
 // maxUndoActions is the maximum number of actions kept in the undo stack.
 const maxUndoActions = 20
 
 // =============================================================================
-// Types — JSON request/response structures
+// Types — JSON request/response structures (shared with JS via Wails)
 // =============================================================================
 
-// ScanRequest is the JSON body sent by the frontend when starting a scan.
+// Action represents a reversible delete (soft-delete via rename to .deleted).
+type Action struct {
+	Type      string `json:"type"`       // "delete"
+	Path      string `json:"path"`       // Original file path.
+	TrashPath string `json:"trash_path"` // Renamed path (.deleted suffix).
+	Timestamp int64  `json:"timestamp"`  // Unix milliseconds.
+}
+
+// ScanRequest is passed by the JS frontend when starting a scan.
+// Wails automatically deserialises the JS object into this struct.
 type ScanRequest struct {
-	Path              string   `json:"path"`               // Directory path to scan for duplicates.
-	Threshold         int      `json:"threshold"`           // Hamming distance threshold for perceptual matching.
-	Algorithm         string   `json:"algorithm"`           // Algorithm: "dhash", "phash", or "both" (default: "dhash").
-	MinWidth          int      `json:"min_width"`           // Minimum image width to include (0 = no limit).
-	MaxHeight         int      `json:"max_height"`          // Maximum image height to include (0 = no limit).
-	Extensions        []string `json:"extensions"`          // List of extensions to include (empty = all supported).
-	NormalisedSize    int      `json:"normalised_size"`     // Reduced image size for comparison (16, 32, 64, 128).
-	IncludeSubfolders bool     `json:"include_subfolders"`  // Whether to scan subfolders recursively (default: true).
-	MinFileSize       int64    `json:"min_file_size"`       // Minimum file size in bytes (0 = no limit).
-	MaxFileSize       int64    `json:"max_file_size"`       // Maximum file size in bytes (0 = no limit).
-	ExtraPaths        []string `json:"extra_paths"`         // Additional directories to scan (merged with Path).
+	Path              string   `json:"path"`               // Primary directory to scan.
+	Threshold         int      `json:"threshold"`           // Hamming distance threshold (0–100).
+	Algorithm         string   `json:"algorithm"`           // "dhash", "phash", or "both".
+	MinWidth          int      `json:"min_width"`           // Minimum image width in px (0=no limit).
+	MaxHeight         int      `json:"max_height"`          // Maximum image height in px (0=no limit).
+	Extensions        []string `json:"extensions"`          // e.g. ["jpg","png"] (empty=all).
+	NormalisedSize    int      `json:"normalised_size"`     // Hash grid size: 16, 32, 64, or 128.
+	IncludeSubfolders bool     `json:"include_subfolders"`  // Recurse into subdirectories.
+	MinFileSize       int64    `json:"min_file_size"`       // Minimum file size in bytes.
+	MaxFileSize       int64    `json:"max_file_size"`       // Maximum file size in bytes.
+	ExtraPaths        []string `json:"extra_paths"`         // Additional directories to scan.
 }
 
-// BrowseRequest is the JSON body for directory browsing.
+// BrowseRequest is the argument to the Browse method.
 type BrowseRequest struct {
-	Path string `json:"path"` // Directory to list (empty = home directory / roots).
+	Path string `json:"path"` // Directory to list (empty = home directory).
 }
 
-// BrowseEntry represents one directory entry in the browse response.
+// BrowseEntry represents one subdirectory in a browse result.
 type BrowseEntry struct {
-	Name  string `json:"name"`   // Directory name.
+	Name  string `json:"name"`   // Directory name (last segment only).
 	Path  string `json:"path"`   // Full absolute path.
 	IsDir bool   `json:"is_dir"` // Always true (we only return directories).
 }
 
-// BrowseResponse is the response from /api/browse.
+// BrowseResponse is returned by Browse().
 type BrowseResponse struct {
-	Current string        `json:"current"` // The current directory being listed.
+	Current string        `json:"current"` // Absolute path currently being listed.
 	Parent  string        `json:"parent"`  // Parent directory (empty if at root).
-	Entries []BrowseEntry `json:"entries"` // Child directories.
+	Entries []BrowseEntry `json:"entries"` // Subdirectory entries.
 }
 
-// ReportMismatchRequest is the JSON body for mismatch reporting.
+// ReportMismatchRequest is the argument to ReportMismatch().
 type ReportMismatchRequest struct {
-	GroupID string `json:"group_id"` // The group ID to report.
+	GroupID string `json:"group_id"` // UUID of the duplicate group.
 }
 
-// DeleteRequest is the JSON body sent when the user wants to delete a file.
+// DeleteRequest is the argument to DeleteFile().
 type DeleteRequest struct {
-	Path string `json:"path"` // Path to the file to delete (rename).
+	Path string `json:"path"` // Absolute path of the file to delete.
 }
 
-// ScanProgress reports how far along the current scan is. The frontend uses
-// this to update a progress bar.
+// ScanProgress reports how far along the current scan is.
 type ScanProgress struct {
-	Current int    `json:"current"` // Number of items processed so far.
-	Total   int    `json:"total"`   // Total number of items to process.
-	Phase   string `json:"phase"`   // Human-readable description of the current phase.
+	Current int    `json:"current"` // Items processed so far.
+	Total   int    `json:"total"`   // Total items to process.
+	Phase   string `json:"phase"`   // Human-readable current activity.
 }
 
-// ScanStats contains summary statistics about a completed scan.
+// ScanStats contains summary statistics for a completed scan.
 type ScanStats struct {
-	TotalFiles      int   `json:"total_files"`      // Total image files found.
-	DuplicateGroups int   `json:"duplicate_groups"` // Number of duplicate groups detected.
-	WastedBytes     int64 `json:"wasted_bytes"`     // Total bytes that could be freed.
-	DurationMs      int64 `json:"duration_ms"`      // How long the scan took in milliseconds.
+	TotalFiles      int   `json:"total_files"`      // Image files found.
+	DuplicateGroups int   `json:"duplicate_groups"` // Duplicate groups detected.
+	WastedBytes     int64 `json:"wasted_bytes"`     // Bytes that could be freed.
+	DurationMs      int64 `json:"duration_ms"`      // Scan duration in milliseconds.
 }
 
-// ScanResult is the complete response from /api/results. It combines status,
-// progress, statistics, and the actual duplicate groups.
+// ScanResult is the full response returned by GetResults().
+// Status is "idle", "scanning", "complete", or "cancelled".
 type ScanResult struct {
-	Status   string           `json:"status"`   // "idle", "scanning", or "complete".
-	Progress ScanProgress     `json:"progress"` // Current progress (only meaningful during scanning).
-	Stats    ScanStats        `json:"stats"`    // Summary statistics (only meaningful when complete).
-	Groups   []DuplicateGroup `json:"groups"`   // The duplicate groups found.
+	Status   string           `json:"status"`
+	Progress ScanProgress     `json:"progress"`
+	Stats    ScanStats        `json:"stats"`
+	Groups   []DuplicateGroup `json:"groups"`
 }
 
 // =============================================================================
-// StartServer — Initialize and start the HTTP server
+// ScanDirectoryFiltered — Walk a directory tree with optional filters
 // =============================================================================
 
-// StartServer registers all HTTP routes and starts listening for connections.
-// This function blocks forever (until the process is killed), because the
-// HTTP server runs in an infinite loop accepting connections.
+// ScanDirectoryFiltered walks rootPath and returns image file paths that match
+// all active filters. Used by both the primary path and extra paths in StartScan.
 //
 // Parameters:
-//   - port: The port number to listen on (e.g., 8080).
-func StartServer(port int) {
-	// -------------------------------------------------------------------------
-	// Register HTTP routes (URL patterns → handler functions)
-	// -------------------------------------------------------------------------
-	//
-	// http.HandleFunc maps a URL pattern to a handler function. When a
-	// request matches the pattern, Go calls the handler function with:
-	//   - w: http.ResponseWriter — used to send the response.
-	//   - r: *http.Request — contains the request details (method, URL, body).
-
-	// Serve static files (CSS, JS) from the embedded filesystem.
-	// fs.Sub strips the "static" prefix so /static/style.css maps to static/style.css.
-	staticSub, err := fs.Sub(staticFiles, "static")
-	if err != nil {
-		log.Fatalf("Failed to create static sub-filesystem: %v", err)
-	}
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticSub))))
-
-	// GET / → Serve the embedded HTML page.
-	http.HandleFunc("/", handleIndex)
-
-	// POST /api/scan → Start scanning a directory for duplicates.
-	http.HandleFunc("/api/scan", handleScan)
-
-	// GET /api/results → Get the current scan status, progress, and results.
-	http.HandleFunc("/api/results", handleResults)
-
-	// POST /api/delete → Delete (rename) a file.
-	http.HandleFunc("/api/delete", handleDelete)
-
-	// GET /api/thumbnail?path=<filepath> → Get a resized thumbnail of an image.
-	http.HandleFunc("/api/thumbnail", handleThumbnail)
-
-	// POST /api/cancel → Cancel a running scan.
-	http.HandleFunc("/api/cancel", handleCancel)
-
-	// POST /api/browse → Browse directories on the server filesystem.
-	http.HandleFunc("/api/browse", handleBrowse)
-
-	// POST /api/report-mismatch → Generate a diagnostic report for a mismatched group.
-	http.HandleFunc("/api/report-mismatch", handleReportMismatch)
-	http.HandleFunc("/api/undo", handleUndo)
-	http.HandleFunc("/api/redo", handleRedo)
-	http.HandleFunc("/api/history", handleHistory)
-
-	// -------------------------------------------------------------------------
-	// Start the HTTP server
-	// -------------------------------------------------------------------------
-
-	// Build the address string. fmt.Sprintf formats a string (like printf).
-	// ":%d" means "listen on all interfaces, port <d>".
-	addr := fmt.Sprintf(":%d", port)
-
-	// Log the startup message. log.Printf adds a timestamp automatically.
-	log.Printf("HTTP server listening on %s", addr)
-
-	// http.ListenAndServe starts the server. It blocks forever, processing
-	// incoming requests. If it returns, something went wrong (e.g., the
-	// port is already in use).
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		// log.Fatalf prints an error message and exits the program.
-		log.Fatalf("Server failed to start: %v", err)
-	}
-}
-
-// =============================================================================
-// setCORSHeaders — Add CORS headers to every response
-// =============================================================================
-
-// setCORSHeaders adds Cross-Origin Resource Sharing (CORS) headers to the
-// response. CORS is a browser security feature that blocks requests from
-// one origin (e.g., localhost:3000) to another (e.g., localhost:8080).
-//
-// By setting "Access-Control-Allow-Origin: *", we allow requests from any
-// origin. This is fine for a local development tool but would be a security
-// risk for a production web app.
-//
-// Parameters:
-//   - w: The response writer to add headers to.
-func setCORSHeaders(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-}
-
-// =============================================================================
-// handleIndex — Serve the main HTML page
-// =============================================================================
-
-// handleIndex serves the embedded index.html file. This is what you see when
-// you open http://localhost:8080/ in your browser.
-func handleIndex(w http.ResponseWriter, r *http.Request) {
-	// Add CORS headers.
-	setCORSHeaders(w)
-
-	// Only serve the index page for the exact "/" path. Other paths (like
-	// "/favicon.ico") should get a 404.
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-
-	// Read index.html from the embedded filesystem.
-	indexHTML, err := staticFiles.ReadFile("static/index.html")
-	if err != nil {
-		http.Error(w, "index.html not found", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(indexHTML)
-}
-
-// =============================================================================
-// handleScan — Start a duplicate-detection scan
-// =============================================================================
-
-// handleScan handles POST requests to /api/scan. It reads the scan parameters
-// from the JSON body, validates them, and launches the scan in a background
-// goroutine so the request can return immediately.
-//
-// The frontend then polls /api/results to track progress and get the final
-// results.
-func handleScan(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-
-	// Handle CORS preflight requests. Browsers send an OPTIONS request
-	// before POST requests to check if CORS is allowed.
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Only accept POST requests.
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	log.Printf("POST /api/scan — received scan request")
-
-	// -------------------------------------------------------------------------
-	// Parse the JSON request body
-	// -------------------------------------------------------------------------
-
-	// json.NewDecoder creates a JSON decoder that reads from r.Body (the
-	// request body). Decode() parses the JSON into our ScanRequest struct.
-	var req ScanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
-		return
-	}
-
-	// Validate the path. It must be a non-empty string pointing to a directory.
-	if req.Path == "" {
-		http.Error(w, `{"error":"path is required"}`, http.StatusBadRequest)
-		return
-	}
-
-	// Check that the path exists and is a directory.
-	info, err := os.Stat(req.Path)
-	if err != nil {
-		msg := fmt.Sprintf(`{"error":"path does not exist: %s"}`, req.Path)
-		http.Error(w, msg, http.StatusBadRequest)
-		return
-	}
-	if !info.IsDir() {
-		http.Error(w, `{"error":"path is not a directory"}`, http.StatusBadRequest)
-		return
-	}
-
-	// Default the threshold to 10 if not provided (or 0).
-	if req.Threshold <= 0 {
-		req.Threshold = 10
-	}
-
-	// Default algorithm to "dhash" if not specified.
-	if req.Algorithm == "" {
-		req.Algorithm = "dhash"
-	}
-
-	// Cancel any running scan before starting a new one.
-	scanMutex.Lock()
-	if scanCancel != nil {
-		scanCancel()
-	}
-	scanResult = ScanResult{
-		Status: "scanning",
-		Progress: ScanProgress{
-			Phase: "Starting scan...",
-		},
-	}
-	scanMutex.Unlock()
-
-	// NOTE: We intentionally do NOT clear the thumbnail cache between scans.
-	// Thumbnails are keyed by absolute file path and remain valid as long as
-	// the file hasn't changed. Re-generating them is expensive and unnecessary.
-
-	// Create a cancellable context for this scan.
-	ctx, cancel := context.WithCancel(context.Background())
-	scanMutex.Lock()
-	scanCancel = cancel
-	scanMutex.Unlock()
-
-	go func() {
-		startTime := time.Now()
-
-		log.Printf("[scan] Starting scan of: %s (threshold: %d, algorithm: %s)", req.Path, req.Threshold, req.Algorithm)
-
-		// Phase 1: Scan the directory for image files
-		scanMutex.Lock()
-		scanResult.Progress.Phase = "Scanning directory for images..."
-		scanMutex.Unlock()
-
-		// Build the set of allowed extensions from the request.
-		allowedExts := make(map[string]bool)
-		if len(req.Extensions) > 0 {
-			for _, ext := range req.Extensions {
-				e := strings.ToLower(strings.TrimSpace(ext))
-				if !strings.HasPrefix(e, ".") {
-					e = "." + e
-				}
-				allowedExts[e] = true
-			}
-		}
-
-		paths, err := ScanDirectoryFiltered(req.Path, allowedExts, req.MinWidth, req.MaxHeight, req.IncludeSubfolders, req.MinFileSize, req.MaxFileSize)
-		if err != nil {
-			log.Printf("[scan] Error scanning directory: %v", err)
-			scanMutex.Lock()
-			scanResult.Status = "complete"
-			scanResult.Progress.Phase = fmt.Sprintf("Error: %v", err)
-			scanMutex.Unlock()
-			return
-		}
-
-		// Scan extra paths (for multi-folder duplicate detection).
-		// Each extra path is scanned with the same filters and merged into
-		// the main paths slice so duplicates across folders are detected.
-		for _, extraPath := range req.ExtraPaths {
-			ep := strings.TrimSpace(extraPath)
-			if ep == "" {
-				continue
-			}
-			epInfo, epErr := os.Stat(ep)
-			if epErr != nil || !epInfo.IsDir() {
-				log.Printf("[scan] Skipping extra path (not a directory): %s", ep)
-				continue
-			}
-			extraFiles, epErr := ScanDirectoryFiltered(ep, allowedExts, req.MinWidth, req.MaxHeight, req.IncludeSubfolders, req.MinFileSize, req.MaxFileSize)
-			if epErr != nil {
-				log.Printf("[scan] Error scanning extra path %s: %v", ep, epErr)
-				continue
-			}
-			paths = append(paths, extraFiles...)
-			log.Printf("[scan] Extra path %s: found %d images", ep, len(extraFiles))
-		}
-
-		// Check for cancellation.
-		if ctx.Err() != nil {
-			scanMutex.Lock()
-			scanResult.Status = "cancelled"
-			scanResult.Progress.Phase = "Scan cancelled"
-			scanMutex.Unlock()
-			return
-		}
-
-		totalFiles := len(paths)
-		log.Printf("[scan] Found %d image files", totalFiles)
-
-		scanMutex.Lock()
-		scanResult.Progress.Total = totalFiles
-		scanResult.Progress.Phase = "Hashing images..."
-		scanMutex.Unlock()
-
-		if totalFiles == 0 {
-			scanMutex.Lock()
-			scanResult.Status = "complete"
-			scanResult.Progress.Phase = "No images found"
-			scanResult.Stats = ScanStats{
-				TotalFiles: 0,
-				DurationMs: time.Since(startTime).Milliseconds(),
-			}
-			scanMutex.Unlock()
-			return
-		}
-
-		// Phase 2: Hash all images using the cache-aware pipeline.
-		// The progress callback updates scanResult so the UI can show
-		// which phase is active and how many files have been processed.
-		// We pass all scan paths (primary + extras) so the hasher can load
-		// and merge caches from all directories for maximum cache hits.
-		allScanPaths := []string{req.Path}
-		for _, ep := range req.ExtraPaths {
-			ep = strings.TrimSpace(ep)
-			if ep != "" {
-				allScanPaths = append(allScanPaths, ep)
-			}
-		}
-		numWorkers := runtime.NumCPU()
-		hashes := HashAllImagesWithProgress(ctx, paths, numWorkers, req.Algorithm, func(phase string, current int, total int) {
-			scanMutex.Lock()
-			scanResult.Progress.Phase = phase
-			scanResult.Progress.Current = current
-			scanResult.Progress.Total = total
-			scanMutex.Unlock()
-		}, allScanPaths)
-
-		// Check for cancellation.
-		if ctx.Err() != nil {
-			scanMutex.Lock()
-			scanResult.Status = "cancelled"
-			scanResult.Progress.Phase = "Scan cancelled"
-			scanMutex.Unlock()
-			return
-		}
-
-		scanMutex.Lock()
-		scanResult.Progress.Current = totalFiles
-		scanResult.Progress.Phase = "Grouping duplicates..."
-		scanMutex.Unlock()
-
-		// Phase 3: Group duplicates
-		groups := GroupDuplicates(hashes, req.Threshold)
-
-		// Check for cancellation.
-		if ctx.Err() != nil {
-			scanMutex.Lock()
-			scanResult.Status = "cancelled"
-			scanResult.Progress.Phase = "Scan cancelled"
-			scanMutex.Unlock()
-			return
-		}
-
-		// Phase 4: Compute statistics
-		var wastedBytes int64
-		for _, group := range groups {
-			for i, img := range group.Images {
-				if i > 0 {
-					wastedBytes += img.Size
-				}
-			}
-		}
-
-		duration := time.Since(startTime)
-
-		scanMutex.Lock()
-		scanResult = ScanResult{
-			Status: "complete",
-			Progress: ScanProgress{
-				Current: totalFiles,
-				Total:   totalFiles,
-				Phase:   "Complete",
-			},
-			Stats: ScanStats{
-				TotalFiles:      totalFiles,
-				DuplicateGroups: len(groups),
-				WastedBytes:     wastedBytes,
-				DurationMs:      duration.Milliseconds(),
-			},
-			Groups: groups,
-		}
-		scanMutex.Unlock()
-
-		log.Printf("[scan] Scan complete! %d files, %d groups, %d wasted bytes, took %v",
-			totalFiles, len(groups), wastedBytes, duration)
-	}()
-
-	// -------------------------------------------------------------------------
-	// Return immediate response (scan is running in background)
-	// -------------------------------------------------------------------------
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "scanning",
-		"message": "Scan started",
-	})
-}
-
-// =============================================================================
-// handleResults — Return current scan status and results
-// =============================================================================
-
-// handleResults handles GET requests to /api/results. It returns the current
-// scan state as JSON, including progress (if scanning) or final results
-// (if complete).
-func handleResults(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-
-	// Handle CORS preflight.
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Lock the mutex while reading shared state. Even reads need locking
-	// because another goroutine (the scan) might be writing simultaneously.
-	scanMutex.Lock()
-	// Make a copy of the result so we can release the lock quickly.
-	// This is important for performance — we don't want to hold the lock
-	// while encoding JSON (which involves I/O).
-	result := scanResult
-	scanMutex.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
-}
-
-// =============================================================================
-// handleDelete — Delete (rename) a file
-// =============================================================================
-
-// handleDelete handles POST requests to /api/delete. It permanently removes
-// the file from disk. This is irreversible — the file cannot be recovered
-// after deletion (unless the user has backups).
-func handleDelete(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-
-	// Handle CORS preflight.
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Parse the JSON request body.
-	var req DeleteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
-		return
-	}
-
-	if req.Path == "" {
-		http.Error(w, `{"error":"path is required"}`, http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("POST /api/delete — path: %s", req.Path)
-
-	// -------------------------------------------------------------------------
-	// Safety check: Make sure the path exists and is a regular file
-	// -------------------------------------------------------------------------
-	info, err := os.Stat(req.Path)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("file not found: %s", req.Path),
-		})
-		return
-	}
-
-	// IsDir() returns true if the path is a directory. We only delete files,
-	// not directories, for safety.
-	if info.IsDir() {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "cannot delete a directory",
-		})
-		return
-	}
-
-	// -------------------------------------------------------------------------
-	// Permanently delete the file from disk
-	// -------------------------------------------------------------------------
-	//
-	// This is irreversible — the file cannot be recovered after deletion
-	// (unless the user has backups). The frontend uses a two-step flow:
-	// 1. User marks files for deletion (visual only, no API call).
-	// 2. User clicks "Confirm Deletions" which calls this endpoint for each file.
-	err = os.Remove(req.Path)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("failed to delete file: %v", err),
-		})
-		return
-	}
-
-	// Remove the thumbnail from cache since the file is gone.
-	thumbnailCache.Delete(req.Path)
-
-	log.Printf("POST /api/delete — permanently deleted %s", req.Path)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("File permanently deleted: %s", req.Path),
-	})
-}
-
-// =============================================================================
-// handleUndo — Reverse the most recent delete action
-// =============================================================================
-
-// handleUndo handles POST requests to /api/undo.
-// It pops the most recent action from the undo stack, renames the .deleted file
-// back to its original path, and pushes the action onto the redo stack.
-func handleUndo(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	actionMutex.Lock()
-	defer actionMutex.Unlock()
-
-	// Check if there's anything to undo.
-	if len(undoStack) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Nothing to undo",
-		})
-		return
-	}
-
-	// Pop the most recent action from the undo stack.
-	action := undoStack[len(undoStack)-1]
-	undoStack = undoStack[:len(undoStack)-1]
-
-	// Rename the .deleted file back to its original path.
-	if err := os.Rename(action.TrashPath, action.Path); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Failed to restore file: %v", err),
-		})
-		return
-	}
-
-	// Push onto the redo stack so the user can redo if they change their mind.
-	redoStack = append(redoStack, action)
-
-	log.Printf("Undo: restored %s", action.Path)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"path":    action.Path,
-		"message": fmt.Sprintf("Restored: %s", action.Path),
-	})
-}
-
-// =============================================================================
-// handleRedo — Re-apply the most recently undone delete action
-// =============================================================================
-
-// handleRedo handles POST requests to /api/redo.
-// It pops the most recent action from the redo stack, renames the original file
-// back to .deleted, and pushes the action onto the undo stack.
-func handleRedo(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	actionMutex.Lock()
-	defer actionMutex.Unlock()
-
-	// Check if there's anything to redo.
-	if len(redoStack) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Nothing to redo",
-		})
-		return
-	}
-
-	// Pop the most recent action from the redo stack.
-	action := redoStack[len(redoStack)-1]
-	redoStack = redoStack[:len(redoStack)-1]
-
-	// Rename the original file back to .deleted.
-	if err := os.Rename(action.Path, action.TrashPath); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Failed to re-delete file: %v", err),
-		})
-		return
-	}
-
-	// Push back onto the undo stack.
-	undoStack = append(undoStack, action)
-
-	log.Printf("Redo: re-deleted %s", action.Path)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"path":    action.Path,
-		"message": fmt.Sprintf("Re-deleted: %s", action.Path),
-	})
-}
-
-// =============================================================================
-// handleHistory — Return the current undo/redo stack state
-// =============================================================================
-
-// handleHistory handles GET requests to /api/history.
-// It returns the current undo and redo stacks as JSON so the frontend can
-// enable/disable undo/redo buttons and show action history.
-func handleHistory(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	actionMutex.Lock()
-	defer actionMutex.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"undo_count": len(undoStack),
-		"redo_count": len(redoStack),
-		"undo":       undoStack,
-		"redo":       redoStack,
-	})
-}
-
-// =============================================================================
-// handleThumbnail — Generate and serve image thumbnails
-// =============================================================================
-
-// handleThumbnail handles GET requests to /api/thumbnail?path=<filepath>.
-// It opens the image, resizes it to a maximum of 400px on the longest side
-// (maintaining aspect ratio), encodes it as JPEG, and serves it to the browser.
-//
-// Thumbnails are cached in memory (thumbnailCache) so repeated requests for
-// the same image don't require re-processing.
-func handleThumbnail(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-
-	// Read the "path" query parameter from the URL.
-	// For example, /api/thumbnail?path=/photos/sunset.jpg
-	// r.URL.Query().Get("path") extracts the value of "path".
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		http.Error(w, "path parameter is required", http.StatusBadRequest)
-		return
-	}
-
-	// -------------------------------------------------------------------------
-	// Check the cache first
-	// -------------------------------------------------------------------------
-	//
-	// sync.Map.Load returns (value, true) if the key exists, or (nil, false)
-	// if it doesn't. If we have a cached thumbnail, serve it immediately.
-	if cached, ok := thumbnailCache.Load(path); ok {
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Header().Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour.
-		w.Write(cached.([]byte))                                // Type assertion: convert interface{} to []byte.
-		return
-	}
-
-	// -------------------------------------------------------------------------
-	// Open and decode the original image
-	// -------------------------------------------------------------------------
-	file, err := os.Open(path)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("cannot open file: %v", err), http.StatusNotFound)
-		return
-	}
-	defer file.Close()
-
-	// image.Decode automatically detects the format and decodes the image.
-	// For HEIC/HEIF files (not natively supported by Go), we fall back to
-	// extracting the embedded JPEG thumbnail from the file's EXIF data.
-	img, _, err := image.Decode(file)
-	if err != nil {
-		// Fallback: try to extract embedded JPEG from HEIC/HEIF/ARW/DNG files.
-		// Many camera RAW and HEIC files contain an embedded JPEG preview that
-		// we can find by scanning for the JPEG SOI (0xFFD8) marker.
-		embeddedJPEG := extractEmbeddedJPEG(path)
-		if embeddedJPEG != nil {
-			// Cache and serve the embedded JPEG directly as the thumbnail.
-			thumbnailCache.Store(path, embeddedJPEG)
-			w.Header().Set("Content-Type", "image/jpeg")
-			w.Header().Set("Cache-Control", "public, max-age=3600")
-			w.Write(embeddedJPEG)
-			return
-		}
-		http.Error(w, fmt.Sprintf("cannot decode image: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// -------------------------------------------------------------------------
-	// Resize the image to max 400px on the longest side
-	// -------------------------------------------------------------------------
-	//
-	// We maintain the aspect ratio so the image doesn't look stretched.
-	// If the image is already smaller than 400px, we don't upscale it.
-
-	bounds := img.Bounds()
-	srcWidth := bounds.Max.X - bounds.Min.X
-	srcHeight := bounds.Max.Y - bounds.Min.Y
-
-	const maxDim = 400 // Maximum dimension (width or height) in pixels.
-
-	// Calculate the new dimensions while maintaining aspect ratio.
-	newWidth := srcWidth
-	newHeight := srcHeight
-
-	if srcWidth > maxDim || srcHeight > maxDim {
-		if srcWidth >= srcHeight {
-			// Landscape or square: constrain by width.
-			newWidth = maxDim
-			// Calculate proportional height. Integer division is fine here.
-			newHeight = srcHeight * maxDim / srcWidth
-		} else {
-			// Portrait: constrain by height.
-			newHeight = maxDim
-			newWidth = srcWidth * maxDim / srcHeight
-		}
-	}
-
-	// Ensure minimum dimensions of 1×1 (avoid division by zero).
-	if newWidth < 1 {
-		newWidth = 1
-	}
-	if newHeight < 1 {
-		newHeight = 1
-	}
-
-	// Create a new RGBA image for the thumbnail.
-	// image.NewRGBA allocates a new image with the given dimensions.
-	thumb := image.NewRGBA(image.Rect(0, 0, newWidth, newHeight))
-
-	// Nearest-neighbor resize: for each pixel in the thumbnail, sample the
-	// corresponding pixel from the original image.
-	for y := 0; y < newHeight; y++ {
-		for x := 0; x < newWidth; x++ {
-			// Map thumbnail coordinates back to original image coordinates.
-			srcX := bounds.Min.X + (x * srcWidth / newWidth)
-			srcY := bounds.Min.Y + (y * srcHeight / newHeight)
-
-			// Copy the color from the source to the thumbnail.
-			thumb.Set(x, y, img.At(srcX, srcY))
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// Encode as JPEG and cache the result
-	// -------------------------------------------------------------------------
-
-	// bytes.Buffer is an in-memory byte buffer that implements io.Writer.
-	// We encode the JPEG into this buffer, then serve it from the buffer.
-	var buf bytes.Buffer
-
-	// jpeg.Encode writes the image as JPEG to the buffer.
-	// Quality 85 is a good balance between file size and visual quality.
-	err = jpeg.Encode(&buf, thumb, &jpeg.Options{Quality: 85})
-	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to encode thumbnail: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Get the encoded bytes.
-	thumbnailBytes := buf.Bytes()
-
-	// Store in cache for future requests. sync.Map.Store is thread-safe.
-	thumbnailCache.Store(path, thumbnailBytes)
-
-	// -------------------------------------------------------------------------
-	// Serve the thumbnail
-	// -------------------------------------------------------------------------
-	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
-	w.Write(thumbnailBytes)
-}
-
-// extractEmbeddedJPEG tries to find and extract an embedded JPEG from a file.
-// Many camera formats (HEIC, HEIF, ARW, DNG, CR2) contain a full-size JPEG
-// preview embedded within the file. We scan for the JPEG SOI marker (0xFFD8)
-// and find the matching EOI marker (0xFFD9) to extract the largest one.
-// Returns the JPEG bytes, or nil if no embedded JPEG was found.
-func extractEmbeddedJPEG(filePath string) []byte {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil
-	}
-
-	// Limit search to first 50MB to avoid scanning huge files forever.
-	maxScan := len(data)
-	if maxScan > 50*1024*1024 {
-		maxScan = 50 * 1024 * 1024
-	}
-
-	var bestJPEG []byte
-
-	// Scan for JPEG SOI markers (0xFF 0xD8) and find the largest embedded JPEG.
-	// Skip the very first bytes — if the file starts with FFD8, it's already
-	// a plain JPEG and would have been decoded by image.Decode.
-	for i := 2; i < maxScan-1; i++ {
-		if data[i] != 0xFF || data[i+1] != 0xD8 {
-			continue
-		}
-
-		// Found a potential JPEG start. Now find the end (EOI: 0xFF 0xD9).
-		// Search from the SOI marker to the end of the file.
-		endSearch := maxScan
-		if endSearch > len(data) {
-			endSearch = len(data)
-		}
-		eoiIdx := -1
-		for j := i + 2; j < endSearch-1; j++ {
-			if data[j] == 0xFF && data[j+1] == 0xD9 {
-				eoiIdx = j + 2 // Include the EOI marker bytes.
-				// Don't break — keep searching for a later EOI in case
-				// the JPEG contains restart markers that look like EOI.
-				// Actually, we want the first complete JPEG, not the last EOI.
-				break
-			}
-		}
-
-		if eoiIdx <= 0 {
-			continue
-		}
-
-		jpegData := data[i:eoiIdx]
-
-		// Only accept JPEGs that are at least 10KB (skip tiny EXIF thumbnails,
-		// prefer the larger preview image if available).
-		if len(jpegData) < 10*1024 {
-			// Still keep it as a fallback if we haven't found anything better.
-			if bestJPEG == nil {
-				bestJPEG = jpegData
-			}
-			continue
-		}
-
-		// Verify it's a valid JPEG by trying to decode it.
-		_, decErr := jpeg.Decode(bytes.NewReader(jpegData))
-		if decErr == nil {
-			// Keep the largest valid JPEG we find.
-			if len(jpegData) > len(bestJPEG) {
-				bestJPEG = jpegData
-			}
-		}
-
-		// Skip ahead past this JPEG to look for more.
-		i = eoiIdx - 1
-	}
-
-	return bestJPEG
-}
-
-// =============================================================================
-// handleCancel — Cancel a running scan
-// =============================================================================
-
-func handleCancel(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	scanMutex.Lock()
-	if scanCancel != nil {
-		scanCancel()
-		log.Printf("POST /api/cancel — scan cancellation requested")
-	}
-	scanMutex.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "cancelled",
-		"message": "Scan cancellation requested",
-	})
-}
-
-// =============================================================================
-// handleBrowse — Browse directories on the server filesystem
-// =============================================================================
-
-func handleBrowse(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req BrowseRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// If no body, default to home directory.
-		req.Path = ""
-	}
-
-	// Default to user's home directory.
-	if req.Path == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			req.Path = "/"
-		} else {
-			req.Path = home
-		}
-	}
-
-	// Resolve to absolute path.
-	absPath, err := filepath.Abs(req.Path)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"invalid path: %s"}`, req.Path), http.StatusBadRequest)
-		return
-	}
-
-	info, err := os.Stat(absPath)
-	if err != nil || !info.IsDir() {
-		http.Error(w, fmt.Sprintf(`{"error":"not a directory: %s"}`, absPath), http.StatusBadRequest)
-		return
-	}
-
-	// Read directory entries.
-	dirEntries, err := os.ReadDir(absPath)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"cannot read directory: %v"}`, err), http.StatusInternalServerError)
-		return
-	}
-
-	var entries []BrowseEntry
-	for _, entry := range dirEntries {
-		if !entry.IsDir() {
-			continue
-		}
-		// Skip hidden directories.
-		if strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
-		entries = append(entries, BrowseEntry{
-			Name:  entry.Name(),
-			Path:  filepath.Join(absPath, entry.Name()),
-			IsDir: true,
-		})
-	}
-
-	// Sort entries alphabetically.
-	sort.Slice(entries, func(i, j int) bool {
-		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
-	})
-
-	// Compute parent directory.
-	parent := filepath.Dir(absPath)
-	if parent == absPath {
-		parent = "" // At root, no parent.
-	}
-
-	resp := BrowseResponse{
-		Current: absPath,
-		Parent:  parent,
-		Entries: entries,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// =============================================================================
-// handleReportMismatch — Generate a diagnostic report for algorithm improvement
-// =============================================================================
-
-func handleReportMismatch(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req ReportMismatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
-		return
-	}
-
-	// Find the group in the current scan results.
-	scanMutex.Lock()
-	var targetGroup *DuplicateGroup
-	for i := range scanResult.Groups {
-		if scanResult.Groups[i].ID == req.GroupID {
-			g := scanResult.Groups[i]
-			targetGroup = &g
-			break
-		}
-	}
-	scanMutex.Unlock()
-
-	if targetGroup == nil {
-		http.Error(w, `{"error":"group not found"}`, http.StatusNotFound)
-		return
-	}
-
-	// Build a detailed diagnostic report.
-	type ImageReport struct {
-		Path         string  `json:"path"`
-		Filename     string  `json:"filename"`
-		Size         int64   `json:"size"`
-		Width        int     `json:"width"`
-		Height       int     `json:"height"`
-		DateTaken    string  `json:"date_taken"`
-		Camera       string  `json:"camera"`
-		QualityScore int     `json:"quality_score"`
-		XXHash       string  `json:"xxhash"`
-		DHash        string  `json:"dhash"`
-		GPSLat       float64 `json:"gps_lat"`
-		GPSLon       float64 `json:"gps_lon"`
-	}
-
-	type MismatchReport struct {
-		ReportType string        `json:"report_type"`
-		GroupID    string        `json:"group_id"`
-		MatchType  string        `json:"match_type"`
-		Confidence float64       `json:"confidence"`
-		Timestamp  string        `json:"timestamp"`
-		Images     []ImageReport `json:"images"`
-	}
-
-	report := MismatchReport{
-		ReportType: "mismatch_report",
-		GroupID:    targetGroup.ID,
-		MatchType:  targetGroup.MatchType,
-		Confidence: targetGroup.Confidence,
-		Timestamp:  time.Now().Format(time.RFC3339),
-	}
-
-	for _, img := range targetGroup.Images {
-		imgReport := ImageReport{
-			Path:         img.Path,
-			Filename:     img.Filename,
-			Size:         img.Size,
-			Width:        img.Width,
-			Height:       img.Height,
-			DateTaken:    img.DateTaken,
-			Camera:       img.Camera,
-			QualityScore: img.QualityScore,
-			GPSLat:       img.GPSLat,
-			GPSLon:       img.GPSLon,
-		}
-
-		// Compute hashes for the report.
-		xxh, err := ComputeXXHash(img.Path)
-		if err == nil {
-			imgReport.XXHash = fmt.Sprintf("%016x", xxh)
-		}
-		dh, err := ComputeDHash(img.Path)
-		if err == nil {
-			imgReport.DHash = fmt.Sprintf("%016x", dh)
-		}
-
-		report.Images = append(report.Images, imgReport)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"mismatch_report_%s.json\"", targetGroup.ID[:8]))
-	json.NewEncoder(w).Encode(report)
-}
-
-// =============================================================================
-// ScanDirectoryFiltered — Scan with extension and dimension filters
-// =============================================================================
-
-// ScanDirectoryFiltered scans rootPath for image files with optional filters.
-// Parameters:
-//   - rootPath:          Directory to scan.
-//   - allowedExts:       Map of allowed extensions (empty = all supported).
+//   - rootPath:          Directory to walk.
+//   - allowedExts:       Extension filter map (empty = all supported types).
 //   - minWidth:          Minimum image width in pixels (0 = no limit).
 //   - maxHeight:         Maximum image height in pixels (0 = no limit).
-//   - includeSubfolders: If true, recurse into subfolders. If false, only scan rootPath.
+//   - includeSubfolders: Whether to recurse into subdirectories.
 //   - minFileSize:       Minimum file size in bytes (0 = no limit).
 //   - maxFileSize:       Maximum file size in bytes (0 = no limit).
 func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidth, maxHeight int, includeSubfolders bool, minFileSize, maxFileSize int64) ([]string, error) {
@@ -1313,13 +170,12 @@ func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidt
 
 	err := filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return nil // Skip unreadable entries.
 		}
-		// Skip hidden directories.
+		// Skip hidden directories (e.g. .thumbnails, .DS_Store).
 		if d.IsDir() && strings.HasPrefix(d.Name(), ".") {
 			return filepath.SkipDir
 		}
-		// If not including subfolders, skip any subdirectory (but not rootPath itself).
 		if d.IsDir() {
 			if !includeSubfolders && path != rootPath {
 				return filepath.SkipDir
@@ -1329,7 +185,7 @@ func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidt
 
 		ext := strings.ToLower(filepath.Ext(path))
 
-		// Check extension filter.
+		// Extension filter: check against allowedExts, or all supported types.
 		if len(allowedExts) > 0 {
 			if !allowedExts[ext] {
 				return nil
@@ -1340,15 +196,14 @@ func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidt
 			}
 		}
 
-		absPath, absErr := filepath.Abs(path)
-		if absErr != nil {
+		absPath, err2 := filepath.Abs(path)
+		if err2 != nil {
 			absPath = path
 		}
 
-		// Check file size filters.
+		// File size filter.
 		if minFileSize > 0 || maxFileSize > 0 {
-			info, infoErr := d.Info()
-			if infoErr == nil {
+			if info, err3 := d.Info(); err3 == nil {
 				if minFileSize > 0 && info.Size() < minFileSize {
 					return nil
 				}
@@ -1358,25 +213,23 @@ func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidt
 			}
 		}
 
-		// Check dimension filters if specified.
+		// Dimension filter — opens the file to read image config (no full decode).
 		if minWidth > 0 || maxHeight > 0 {
-			f, fErr := os.Open(absPath)
-			if fErr != nil {
+			f, err3 := os.Open(absPath)
+			if err3 != nil {
 				return nil
 			}
-			config, _, decErr := image.DecodeConfig(f)
+			cfg, _, err3 := image.DecodeConfig(f)
 			f.Close()
-			if decErr != nil {
-				// Can't read dimensions; include the file anyway.
-				imagePaths = append(imagePaths, absPath)
-				return nil
+			if err3 == nil {
+				if minWidth > 0 && cfg.Width < minWidth {
+					return nil
+				}
+				if maxHeight > 0 && cfg.Height > maxHeight {
+					return nil
+				}
 			}
-			if minWidth > 0 && config.Width < minWidth {
-				return nil
-			}
-			if maxHeight > 0 && config.Height > maxHeight {
-				return nil
-			}
+			// If we can't read dimensions, include the file anyway.
 		}
 
 		imagePaths = append(imagePaths, absPath)
@@ -1387,6 +240,68 @@ func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidt
 		return nil, err
 	}
 
-	sort.Strings(imagePaths)
+	sort.Strings(imagePaths) // Deterministic order for reproducible grouping.
 	return imagePaths, nil
+}
+
+// =============================================================================
+// extractEmbeddedJPEG — Extract JPEG preview from camera RAW / HEIC files
+// =============================================================================
+
+// extractEmbeddedJPEG scans filePath for embedded JPEG data (SOI/EOI markers).
+// Many camera formats (HEIC, HEIF, ARW, DNG, CR2) contain a full-size JPEG
+// preview. Returns the largest valid JPEG found, or nil if none.
+func extractEmbeddedJPEG(filePath string) []byte {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil
+	}
+
+	// Limit scan to first 50 MB to avoid hanging on very large RAW files.
+	maxScan := len(data)
+	if maxScan > 50*1024*1024 {
+		maxScan = 50 * 1024 * 1024
+	}
+
+	var bestJPEG []byte
+
+	// Scan for JPEG SOI markers (0xFF 0xD8). Skip byte 0 — if the file starts
+	// with FFD8, it's already a plain JPEG and would have decoded normally.
+	for i := 2; i < maxScan-1; i++ {
+		if data[i] != 0xFF || data[i+1] != 0xD8 {
+			continue
+		}
+		// Found SOI — search for the matching EOI (0xFF 0xD9).
+		eoiIdx := -1
+		for j := i + 2; j < maxScan-1; j++ {
+			if data[j] == 0xFF && data[j+1] == 0xD9 {
+				eoiIdx = j + 2
+				break
+			}
+		}
+		if eoiIdx <= 0 {
+			continue
+		}
+
+		jpegData := data[i:eoiIdx]
+
+		// Skip tiny EXIF thumbnails (< 10 KB); keep as fallback if nothing better.
+		if len(jpegData) < 10*1024 {
+			if bestJPEG == nil {
+				bestJPEG = jpegData
+			}
+			continue
+		}
+
+		// Validate by attempting a full JPEG decode.
+		if _, err := jpeg.Decode(bytes.NewReader(jpegData)); err == nil {
+			if len(jpegData) > len(bestJPEG) {
+				bestJPEG = jpegData
+			}
+		}
+
+		i = eoiIdx - 1 // Advance past this JPEG segment.
+	}
+
+	return bestJPEG
 }

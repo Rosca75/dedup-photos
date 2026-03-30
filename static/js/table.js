@@ -9,6 +9,7 @@ import { buildSidebarTree } from './sidebar.js';
 import { showPreview, clearPreview } from './preview.js';
 import { updateBatchButtons, updateConfirmButton } from './actions.js';
 import { applyFilters } from './filters.js';
+import { apiGetThumbnail } from './api.js';
 
 /**
  * Render full scan results into the main area as a data table.
@@ -401,9 +402,9 @@ function showHoverPreview(e, img) {
   tip.className = 'hover-preview';
   tip.id = 'hover-preview-tip';
   const thumb = document.createElement('img');
-  thumb.src = '/api/thumbnail?path=' + encodeURIComponent(img.path || '');
   thumb.alt = img.filename || '';
   thumb.onerror = function () { tip.style.display = 'none'; };
+  apiGetThumbnail(img.path || '').then(b64 => { if (b64) thumb.src = 'data:image/jpeg;base64,' + b64; else tip.style.display = 'none'; });
   tip.appendChild(thumb);
 
   const info = document.createElement('div');

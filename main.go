@@ -1,110 +1,84 @@
 // =============================================================================
-// main.go — Entry point for the DedupPhotos application
+// main.go — Wails v2 entry point for the DedupPhotos desktop application
 // =============================================================================
 //
-// This file is the starting point of the program. When you run the compiled
-// binary, Go looks for the "main" function inside "package main" and executes
-// it. Think of it like the "public static void main" in Java or the
-// "if __name__ == '__main__'" block in Python.
+// Wails v2 creates a native desktop window powered by the system WebView
+// (WebView2 on Windows, WebKit on macOS/Linux). The Go backend exposes
+// methods directly to JavaScript — no HTTP server, no network ports.
 //
-// What this file does:
-//   1. Defines command-line flags (--port, --help) so the user can customize
-//      behaviour when launching the program from a terminal.
-//   2. Prints a friendly ASCII-art banner so you know the server started.
-//   3. Calls StartServer() (defined in server.go) to spin up the HTTP server.
+// HOW WAILS WORKS:
+//   1. wails.Run() creates the native window and loads index.html from the
+//      embedded filesystem.
+//   2. The Wails runtime is automatically injected into the page. This makes
+//      all public methods on *App available as window.go.main.App.MethodName().
+//   3. JS calls Go methods asynchronously (they return Promises).
+//   4. Go structs are automatically serialised to/from JavaScript objects.
+//
+// BUILD COMMANDS:
+//   wails build          — Production binary for the current OS
+//   wails dev            — Development mode with live reload
+//   go build ./...       — Verify Go compilation only (no Wails window)
 // =============================================================================
 
 package main
 
 import (
-	"flag" // "flag" is Go's built-in package for parsing command-line arguments.
-	"fmt"  // "fmt" is Go's formatted I/O package — like printf in C.
-	"os"   // "os" gives us access to operating-system features like exiting.
+	"embed"
+	"io/fs"
+	"log"
+
+	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 )
 
-// main is the entry point of the application. Every Go program needs exactly
-// one main() function inside package main. Go calls this automatically when
-// the program starts.
+// assets embeds the entire static/ directory into the compiled binary.
+// "all:" includes hidden files and empty directories (needed for Wails).
+//
+//go:embed all:static
+var assets embed.FS
+
+// main is the entry point. It creates the Wails application window and
+// registers the App struct so its methods are callable from JavaScript.
 func main() {
-	// -------------------------------------------------------------------------
-	// Step 1: Define command-line flags
-	// -------------------------------------------------------------------------
-	//
-	// flag.Int creates a flag named "port" with a default value of 8080.
-	// The third argument is the help text shown when you run --help.
-	// The function returns a *int (a pointer to an int), which means "port"
-	// holds the memory address where the actual integer value lives.
-	// We dereference it later with *port to get the actual number.
-	port := flag.Int("port", 8080, "Port number for the web server (default: 8080)")
+	// Create the App instance. All public methods on *App will be exposed
+	// to the JS frontend as window.go.main.App.MethodName().
+	app := NewApp()
 
-	// flag.Bool creates a boolean flag. If the user passes --help, this
-	// becomes true. We use this to print usage information and exit.
-	help := flag.Bool("help", false, "Show this help message and exit")
-
-	// flag.Parse() actually reads the command-line arguments (os.Args) and
-	// fills in the values for all the flags we defined above. You MUST call
-	// this before accessing any flag values — otherwise they'll all be
-	// defaults regardless of what the user typed.
-	flag.Parse()
-
-	// -------------------------------------------------------------------------
-	// Step 2: Handle --help flag
-	// -------------------------------------------------------------------------
-	//
-	// If the user passed --help (or -help), we print usage info and exit.
-	// The * in *help dereferences the pointer — it gets the actual bool value.
-	if *help {
-		// Print a short description of the program.
-		fmt.Println("DedupPhotos — Find and manage duplicate photos on your computer.")
-		fmt.Println()
-		fmt.Println("Usage:")
-		fmt.Println("  dedup-photos [--port PORT]")
-		fmt.Println()
-		fmt.Println("Flags:")
-
-		// flag.PrintDefaults() prints all registered flags with their default
-		// values and help text. This is a convenience from the flag package.
-		flag.PrintDefaults()
-
-		// os.Exit(0) terminates the program immediately with exit code 0,
-		// which means "success" by convention. We exit here because --help
-		// should only print info, not start the server.
-		os.Exit(0)
+	// fs.Sub strips the "static/" prefix from the embedded filesystem.
+	// Without this, files would be served at /static/css/... instead of /css/...
+	// Wails looks for index.html at the root of the provided FS.
+	sub, err := fs.Sub(assets, "static")
+	if err != nil {
+		log.Fatalf("Failed to create sub-filesystem: %v", err)
 	}
 
-	// -------------------------------------------------------------------------
-	// Step 3: Print the ASCII art banner
-	// -------------------------------------------------------------------------
-	//
-	// This is purely cosmetic — it prints a nice logo in the terminal so the
-	// user knows the server has started and where to find it. The backtick (`)
-	// creates a "raw string literal" in Go, which can span multiple lines and
-	// doesn't process escape characters like \n.
-	banner := `
- ____           _             ____  _           _
-|  _ \  ___  __| |_   _ _ __ |  _ \| |__   ___ | |_ ___  ___
-| | | |/ _ \/ _' | | | | '_ \| |_) | '_ \ / _ \| __/ _ \/ __|
-| |_| |  __/ (_| | |_| | |_) |  __/| | | | (_) | || (_) \__ \
-|____/ \___|\__,_|\__,_| .__/|_|   |_| |_|\___/ \__\___/|___/
-                       |_|
-`
-	// fmt.Println prints the banner string followed by a newline.
-	fmt.Println(banner)
+	// wails.Run() creates the window and starts the application event loop.
+	// This function blocks until the window is closed.
+	err = wails.Run(&options.App{
+		Title:     "DedupPhotos — Duplicate Photo Finder",
+		Width:     1280,
+		Height:    900,
+		MinWidth:  900,
+		MinHeight: 600,
 
-	// fmt.Printf is like printf in C — it uses format verbs like %d (integer)
-	// to insert values into the string. \n is a newline character.
-	// *port dereferences the pointer to get the actual integer value.
-	fmt.Printf("  🌐 Server starting at: http://localhost:%d\n", *port)
-	fmt.Println("  Press Ctrl+C to stop the server.")
-	fmt.Println()
+		// AssetServer serves the embedded frontend files (HTML, CSS, JS).
+		// After sub-FS stripping, static/index.html is served as the root page,
+		// static/css/base.css is at /css/base.css, etc.
+		AssetServer: &assetserver.Options{
+			Assets: sub,
+		},
 
-	// -------------------------------------------------------------------------
-	// Step 4: Start the HTTP server
-	// -------------------------------------------------------------------------
-	//
-	// StartServer is defined in server.go. It sets up all the HTTP routes
-	// (like GET / and POST /api/scan) and begins listening for connections.
-	// This function blocks (never returns) because the server runs forever
-	// until you kill the process.
-	StartServer(*port)
+		// OnStartup is called after the window is created but before the page loads.
+		// We pass the Wails context to the App so it can call runtime APIs.
+		OnStartup: app.startup,
+
+		// Bind registers *App so all its public methods appear as
+		// window.go.main.App.* in the JavaScript frontend.
+		Bind: []interface{}{app},
+	})
+
+	if err != nil {
+		log.Fatalf("Error starting application: %v", err)
+	}
 }

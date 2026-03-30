@@ -165,10 +165,12 @@ function collectPathsForBatch(keepBest) {
   return paths;
 }
 
-/** Download a mismatch diagnostic report. */
+/** Download a mismatch diagnostic report. Wails returns JSON string (not Blob). */
 function reportMismatch(groupId) {
   apiMismatchReport(groupId)
-    .then(blob => {
+    .then(jsonStr => {
+      // Convert the returned JSON string to a Blob for download.
+      const blob = new Blob([jsonStr], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;

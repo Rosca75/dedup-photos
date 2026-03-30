@@ -1,55 +1,78 @@
-// api.js — All fetch() calls to the backend API.
-// This is the ONLY file that calls fetch(). Other modules use these functions.
+// api.js — Wails binding wrappers for all Go backend methods.
+//
+// This is the ONLY file that calls window.go.main.App.*
+// All other modules import from here — never call Wails bindings directly.
+//
+// Wails makes each public method on *App available as:
+//   window.go.main.App.MethodName(args...) → Promise
+//
+// The Go structs are automatically serialised to/from JS objects using
+// the json: struct tags defined in server.go.
 
-/** Start a scan with the given settings object. */
-export async function apiScan(settings) {
-  const resp = await fetch("/api/scan", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(settings)
-  });
-  return resp.json();
+/** Helper: return the Wails App binding. */
+const GoApp = () => window.go.main.App;
+
+/**
+ * Start a scan with the given settings object.
+ * Matches the ScanRequest struct in server.go.
+ * Returns immediately with {status:"scanning"}; poll GetResults() for progress.
+ * @param {Object} settings - ScanRequest fields (path, threshold, algorithm, ...)
+ */
+export function apiScan(settings) {
+  return GoApp().StartScan(settings);
 }
 
-/** Poll for current scan results / progress. */
-export async function apiResults() {
-  const resp = await fetch("/api/results");
-  return resp.json();
+/**
+ * Poll for current scan progress and results.
+ * Returns a ScanResult object (status, progress, stats, groups).
+ */
+export function apiResults() {
+  return GoApp().GetResults();
 }
 
-/** Cancel the currently running scan. */
-export async function apiCancel() {
-  const resp = await fetch("/api/cancel", { method: "POST" });
-  return resp.json();
+/**
+ * Cancel the currently running scan.
+ */
+export function apiCancel() {
+  return GoApp().CancelScan();
 }
 
-/** Delete a file by path (soft-delete: renames to .deleted). */
-export async function apiDelete(path) {
-  const resp = await fetch("/api/delete", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path })
-  });
-  return resp.json();
+/**
+ * Permanently delete a file by path.
+ * Returns {success: bool, message/error: string}.
+ * @param {string} path - Absolute file path to delete.
+ */
+export function apiDelete(path) {
+  return GoApp().DeleteFile(path);
 }
 
-/** Browse directories starting from the given path. */
-export async function apiBrowse(path) {
-  const resp = await fetch("/api/browse", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path })
-  });
-  return resp.json();
+/**
+ * Browse directories starting from the given path.
+ * Returns {current, parent, entries[]} — see BrowseResponse in server.go.
+ * @param {string} path - Directory to list (empty string = home directory).
+ */
+export function apiBrowse(path) {
+  return GoApp().Browse(path || '');
 }
 
-/** Download a mismatch diagnostic report for a group (returns Blob). */
-export async function apiMismatchReport(groupId) {
-  const resp = await fetch("/api/report-mismatch", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ group_id: groupId })
-  });
-  if (!resp.ok) throw new Error("Server returned " + resp.status);
-  return resp.blob();
+/**
+ * Fetch a base64-encoded JPEG thumbnail for the given image path.
+ * Returns a Promise<string> — empty string if the thumbnail cannot be made.
+ * Usage in JS:
+ *   const b64 = await apiGetThumbnail(img.path);
+ *   if (b64) imgEl.src = 'data:image/jpeg;base64,' + b64;
+ * @param {string} path - Absolute file path.
+ */
+export function apiGetThumbnail(path) {
+  return GoApp().GetThumbnail(path || '');
+}
+
+/**
+ * Generate a JSON mismatch diagnostic report for a duplicate group.
+ * Returns a Promise<string> containing the JSON. Convert to a download:
+ *   const blob = new Blob([jsonStr], { type: "application/json" });
+ * @param {string} groupId - UUID of the duplicate group.
+ */
+export function apiMismatchReport(groupId) {
+  return GoApp().ReportMismatch(groupId);
 }
