@@ -3,13 +3,14 @@
 import { state } from './state.js';
 import { apiScan, apiResults, apiCancel } from './api.js';
 import { showToast } from './components.js';
-import { renderResults } from './table.js';
+import { renderResults, toggleAllGroups } from './table.js';
 
 /** Wire up scan, cancel, refresh button event listeners. */
 export function initScan() {
   document.getElementById('scan-btn').addEventListener('click', startScan);
   document.getElementById('cancel-btn').addEventListener('click', cancelScan);
   document.getElementById('refresh-btn').addEventListener('click', refreshResults);
+  document.getElementById('collapse-all-btn').addEventListener('click', toggleAllGroups);
 
   // Threshold slider: update value label in real time.
   const slider = document.getElementById('scan-threshold');

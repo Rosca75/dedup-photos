@@ -219,7 +219,21 @@ function createSelectAllCheckbox() {
   return cb;
 }
 
-/** Append group header row + image rows to tbody. */
+/**
+ * Collapse all groups if any are expanded; expand all if all are collapsed.
+ * Re-renders the table and updates the toggle button icon.
+ */
+export function toggleAllGroups() {
+  const groups = (state.scanResult && state.scanResult.groups) || [];
+  if (groups.length === 0) return;
+  const allCollapsed = groups.every(g => state.collapsedGroups.has(g.id));
+  if (allCollapsed) {
+    state.collapsedGroups.clear();
+  } else {
+    groups.forEach(g => state.collapsedGroups.add(g.id));
+  }
+  if (state.scanResult) renderResults(state.scanResult);
+}
 function appendGroupRows(tbody, group) {
   const images = group.images || [];
   const matchType = group.match_type || 'perceptual';
