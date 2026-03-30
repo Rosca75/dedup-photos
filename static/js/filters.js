@@ -56,6 +56,24 @@ export function initFilters() {
       refilter();
     });
   }
+
+  // Min images per group.
+  const minGroupInput = document.getElementById('filter-min-group-size');
+  if (minGroupInput) {
+    minGroupInput.addEventListener('input', () => {
+      state.filters.minGroupSize = parseInt(minGroupInput.value, 10) || 0;
+      refilter();
+    });
+  }
+
+  // Max images per group.
+  const maxGroupInput = document.getElementById('filter-max-group-size');
+  if (maxGroupInput) {
+    maxGroupInput.addEventListener('input', () => {
+      state.filters.maxGroupSize = parseInt(maxGroupInput.value, 10) || 0;
+      refilter();
+    });
+  }
 }
 
 /** Re-render results using current filters. */
@@ -100,6 +118,11 @@ export function applyFilters(groups) {
 
       // Need at least 2 images for a valid duplicate group.
       if (images.length < 2) return null;
+
+      // Group size filter.
+      if (state.filters.minGroupSize > 0 && images.length < state.filters.minGroupSize) return null;
+      if (state.filters.maxGroupSize > 0 && images.length > state.filters.maxGroupSize) return null;
+
       return { ...group, images };
     })
     .filter(Boolean);

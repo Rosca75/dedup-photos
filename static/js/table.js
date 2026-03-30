@@ -174,8 +174,20 @@ function handleSort(key) {
   if (state.scanResult) renderResults(state.scanResult);
 }
 
-/** Sort groups' images by the given column key and direction. */
+/** Sort groups or images depending on the active column key.
+ *  - 'diff': sorts the duplicate groups themselves by their % difference.
+ *  - All other keys: sorts the images within each group individually.
+ */
 function sortGroups(groups, key, dir) {
+  if (key === 'diff') {
+    // Group-level sort: order groups by their % diff value.
+    return [...groups].sort((a, b) => {
+      const da = a.confidence != null ? 100 - Number(a.confidence) : 0;
+      const db = b.confidence != null ? 100 - Number(b.confidence) : 0;
+      return dir === 'asc' ? da - db : db - da;
+    });
+  }
+  // Image-level sort: reorder images within each group by the column value.
   return groups.map(g => {
     const images = [...(g.images || [])];
     images.sort((a, b) => {

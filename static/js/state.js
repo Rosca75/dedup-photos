@@ -40,6 +40,8 @@ export const state = {
     maxDiff: 100,
     extensions: new Set(),
     minFileSize: 0,
-    maxFileSize: 0
+    maxFileSize: 0,
+    minGroupSize: 0,
+    maxGroupSize: 0
   }
 };
