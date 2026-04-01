@@ -47,12 +47,11 @@ export function apiDelete(path) {
 }
 
 /**
- * Browse directories starting from the given path.
- * Returns {current, parent, entries[]} — see BrowseResponse in server.go.
- * @param {string} path - Directory to list (empty string = home directory).
+ * Open the native OS folder picker dialog.
+ * Returns a Promise<string> with the selected folder path, or empty string if cancelled.
  */
-export function apiBrowse(path) {
-  return GoApp().Browse(path || '');
+export function apiOpenFolderDialog() {
+  return GoApp().OpenFolderDialog();
 }
 
 /**

@@ -97,25 +97,6 @@ type ScanRequest struct {
 	ExtraPaths        []string `json:"extra_paths"`         // Additional directories to scan.
 }
 
-// BrowseRequest is the argument to the Browse method.
-type BrowseRequest struct {
-	Path string `json:"path"` // Directory to list (empty = home directory).
-}
-
-// BrowseEntry represents one subdirectory in a browse result.
-type BrowseEntry struct {
-	Name  string `json:"name"`   // Directory name (last segment only).
-	Path  string `json:"path"`   // Full absolute path.
-	IsDir bool   `json:"is_dir"` // Always true (we only return directories).
-}
-
-// BrowseResponse is returned by Browse().
-type BrowseResponse struct {
-	Current string        `json:"current"` // Absolute path currently being listed.
-	Parent  string        `json:"parent"`  // Parent directory (empty if at root).
-	Entries []BrowseEntry `json:"entries"` // Subdirectory entries.
-}
-
 // ReportMismatchRequest is the argument to ReportMismatch().
 type ReportMismatchRequest struct {
 	GroupID string `json:"group_id"` // UUID of the duplicate group.
