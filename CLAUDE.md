@@ -21,6 +21,10 @@ directly in the binary — no browser, no localhost port.
 - Prerequisites: Go 1.21+, Wails CLI v2 (`go install github.com/wailsapp/wails/v2/cmd/wails@latest`),
   Node.js 16+ (required by Wails toolchain), WebView2 (pre-installed on Windows 10/11)
 
+**Unsupported formats:** HEIC/HEIF files are not supported. Go has no pure-Go HEVC decoder,
+and CGo-based solutions (libde265) cause build issues on Windows. HEIC files are skipped
+during scanning.
+
 ---
 
 ## 2. Repository Structure

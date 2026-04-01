@@ -14,7 +14,6 @@ require (
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/jchv/go-winloader v0.0.0-20210711035445-715c2860da7e // indirect
-	github.com/jdeng/goheif v0.0.0-20260309214039-46ce8d592019 // indirect
 	github.com/labstack/echo/v4 v4.13.3 // indirect
 	github.com/labstack/gommon v0.4.2 // indirect
 	github.com/leaanthony/go-ansi-parser v1.6.1 // indirect
