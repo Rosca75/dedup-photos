@@ -26,11 +26,12 @@ import (
 	"image/jpeg"
 	"log"
 	"os"
-	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
+
+	// Wails runtime — aliased to avoid collision with stdlib "runtime" above.
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // App is the Wails application struct. All exported methods on *App are
@@ -281,7 +282,20 @@ func (a *App) GetThumbnail(path string) string {
 
 	img, _, err := image.Decode(f)
 	if err != nil {
-		// Fallback: extract embedded JPEG preview (e.g. from HEIC/DNG/ARW).
+		// Try HEIC-specific container parsing first (pure Go, no external deps).
+		// This handles .heic and .heif files from iPhones and other cameras.
+		if isHEICPath(path) {
+			if _, _, _, _, thumbB64, heicErr := extractHEICMeta(path); heicErr == nil && thumbB64 != "" {
+				// extractHEICMeta returns a full data URI; strip the prefix to get raw base64.
+				raw := strings.TrimPrefix(thumbB64, "data:image/jpeg;base64,")
+				if decoded, decErr := base64.StdEncoding.DecodeString(raw); decErr == nil {
+					thumbnailCache.Store(path, decoded)
+					return raw
+				}
+			}
+		}
+		// Generic fallback for other RAW formats (DNG, ARW, CR2): byte-scan for
+		// embedded JPEG SOI/EOI markers. Slower but works for many camera formats.
 		if embedded := extractEmbeddedJPEG(path); embedded != nil {
 			thumbnailCache.Store(path, embedded)
 			return base64.StdEncoding.EncodeToString(embedded)
@@ -328,54 +342,18 @@ func (a *App) GetThumbnail(path string) string {
 }
 
 // =============================================================================
-// Browse
+// OpenFolderDialog
 // =============================================================================
 
-// Browse lists subdirectories of the given path for the folder-picker dialog.
-// Pass an empty string to start from the user's home directory.
-func (a *App) Browse(path string) BrowseResponse {
-	if path == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			path = "/"
-		} else {
-			path = home
-		}
-	}
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return BrowseResponse{Current: path}
-	}
-	info, err := os.Stat(absPath)
-	if err != nil || !info.IsDir() {
-		return BrowseResponse{Current: path}
-	}
-
-	dirEntries, err := os.ReadDir(absPath)
-	if err != nil {
-		return BrowseResponse{Current: absPath}
-	}
-
-	var entries []BrowseEntry
-	for _, de := range dirEntries {
-		if !de.IsDir() || strings.HasPrefix(de.Name(), ".") {
-			continue
-		}
-		entries = append(entries, BrowseEntry{
-			Name:  de.Name(),
-			Path:  filepath.Join(absPath, de.Name()),
-			IsDir: true,
-		})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
+// OpenFolderDialog opens the native OS folder picker dialog.
+// On Windows this is the standard Explorer folder browser; on macOS it's Finder.
+//
+// Returns the selected folder path, or an empty string if the user cancelled.
+// The frontend calls this when the user clicks the "Browse..." button.
+func (a *App) OpenFolderDialog() (string, error) {
+	return wailsRuntime.OpenDirectoryDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Select folder to scan",
 	})
-
-	parent := filepath.Dir(absPath)
-	if parent == absPath {
-		parent = "" // At filesystem root — no parent.
-	}
-	return BrowseResponse{Current: absPath, Parent: parent, Entries: entries}
 }
 
 // =============================================================================

@@ -27,27 +27,38 @@ directly in the binary — no browser, no localhost port.
 
 ```
 dedup-photos/
-├── main.go          107 lines   Wails app entry point (wails.Run)
-├── app.go           601 lines   App struct — all public methods bound to the JS frontend
-├── server.go        225 lines   Shared types, global scan state, ScanDirectoryFiltered
-├── scanner.go       192 lines   Recursive filesystem walk
-├── hasher.go        471 lines   xxHash (exact) + dHash/pHash (perceptual)
-├── metadata.go      439 lines   EXIF extraction + quality scoring
-├── grouper.go       583 lines   BK-Tree indexing + duplicate grouping
+├── main.go           84 lines   Wails app entry point (wails.Run)
+├── app.go           456 lines   App struct — all public methods bound to the JS frontend
+├── server.go        307 lines   Shared types, global scan state, ScanDirectoryFiltered
+├── scanner.go       204 lines   Recursive filesystem walk
+├── hasher.go        815 lines   xxHash (exact) + dHash/pHash (perceptual)
+├── metadata.go      584 lines   EXIF extraction + quality scoring
+├── grouper.go       694 lines   BK-Tree indexing + duplicate grouping
+├── cache.go         180 lines   Persistent hash cache
 ├── wails.json               Wails config (name, version, author)
 ├── go.mod / go.sum
-├── build/
-│   └── windows/
-│       └── app.manifest
-├── frontend/                ← canonical frontend (served by Wails AssetServer)
-│   ├── index.html   113 lines
-│   ├── style.css    256 lines
-│   └── app.js       660 lines
-└── static/                  ← legacy folder from pre-Wails era, IGNORE
+└── static/                  ← active frontend (embedded by main.go via //go:embed all:static)
+    ├── index.html   205 lines
+    ├── css/
+    │   ├── base.css        73 lines    CSS variables, reset, typography
+    │   ├── layout.css     409 lines    Grid layout + left panel
+    │   ├── table.css      157 lines    Data table styles
+    │   └── components.css 319 lines    Buttons, badges, toast, browse dialog
+    └── js/
+        ├── app.js          27 lines    Entry point — imports modules, wires init()
+        ├── state.js        47 lines    Shared state object
+        ├── api.js          78 lines    All window.go.main.App.* calls (isolation layer)
+        ├── helpers.js      70 lines    Pure utility functions
+        ├── components.js   59 lines    showToast(), showConfirm()
+        ├── scan.js        150 lines    startScan(), pollResults(), cancelScan()
+        ├── browse.js      229 lines    Folder browser dialog
+        ├── sidebar.js      96 lines    Folder tree navigation
+        ├── preview.js     103 lines    Left panel image preview
+        ├── filters.js     136 lines    Result filters
+        ├── resize.js       96 lines    Panel resize handles
+        ├── table.js       507 lines    Results data table
+        └── actions.js     183 lines    deleteFile(), reportMismatch(), batch ops
 ```
-
-> `static/` is the old HTTP-server era frontend. It still exists in the repo but is **not used**.
-> All active frontend work happens exclusively in `frontend/`.
 
 ---
 
@@ -58,8 +69,8 @@ dedup-photos/
 Wails replaces the old `net/http` server entirely. There is no TCP port, no `localhost:8080`,
 no `fetch()` calls. Instead:
 
-1. `main.go` embeds the `frontend/` directory with `//go:embed all:frontend`
-2. Wails opens a native Windows window and loads `frontend/index.html` inside it
+1. `main.go` embeds the `static/` directory with `//go:embed all:static`
+2. Wails opens a native Windows window and loads `static/index.html` inside it
 3. Wails injects `window.go` into the page — a JS object with one method per bound Go function
 4. The frontend calls `window.go.main.App.MethodName(args)` which returns a **Promise**
 5. Go return values (structs, maps) are automatically serialised to JS objects
@@ -73,7 +84,6 @@ no `fetch()` calls. Instead:
 | `fetch('/api/cancel', {method:'POST'})`           | `window.go.main.App.CancelScan()`                 |
 | `fetch('/api/delete', {method:'POST', body:...})` | `window.go.main.App.DeleteFile(path)`             |
 | `img.src = '/api/thumbnail?path=...'`             | `App.GetThumbnail(path).then(b64 => img.src=...)` |
-| `fetch('/api/browse', {method:'POST', body:...})` | `window.go.main.App.Browse(path)`                 |
 | `fetch('/api/report-mismatch', ...)`              | `window.go.main.App.ReportMismatch(groupId)`      |
 
 ### Special cases
@@ -90,7 +100,7 @@ The frontend creates a `Blob` and triggers a synthetic `<a>` click for the downl
 
 ### `main.go` — entry point
 
-Calls `wails.Run()` with the App struct bound. Embeds `frontend/` via `//go:embed all:frontend`.
+Calls `wails.Run()` with the App struct bound. Embeds `static/` via `//go:embed all:static`.
 Window: 1280×900px, minimum 900×600px. Do not change window dimensions without a deliberate reason.
 
 ### `app.go` — Wails-bound methods
@@ -99,78 +109,72 @@ All public methods on `*App` are automatically callable from JavaScript.
 
 | Method | Signature | Purpose |
 |---|---|---|
-| `StartScan` | `(path string, threshold int, algorithm string, extensions []string, minWidth int, maxHeight int) map[string]string` | Start background scan |
+| `StartScan` | `(req ScanRequest) map[string]string` | Start background scan |
 | `GetResults` | `() ScanResult` | Poll scan progress and results |
 | `CancelScan` | `() map[string]string` | Cancel active scan |
-| `DeleteFile` | `(path string) map[string]interface{}` | Soft-delete (rename to `.deleted`) |
+| `DeleteFile` | `(path string) map[string]interface{}` | Permanently delete a file |
 | `GetThumbnail` | `(path string) string` | Returns base64 JPEG string |
-| `Browse` | `(path string) BrowseResponse` | List child directories |
+| `OpenFolderDialog` | `() (string, error)` | Native OS folder picker |
 | `ReportMismatch` | `(groupID string) string` | Returns JSON diagnostic report string |
 
 ### `server.go` — types and state only
 
 No HTTP handlers. Contains:
-- Type definitions: `ScanRequest`, `BrowseRequest`, `BrowseResponse`, `ScanResult`, `ImageInfo`, etc.
+- Type definitions: `ScanRequest`, `ScanResult`, `ImageInfo`, etc.
 - Global scan state: `scanMutex`, `scanResult`, `scanCancel`, `thumbnailCache`
 - `ScanDirectoryFiltered()` — filesystem walk with extension/dimension filters
 
-### Business logic files (do not modify)
+### Business logic files
+
+Avoid modifying these files (`scanner.go`, `hasher.go`, `metadata.go`, `grouper.go`, `cache.go`)
+unless the change is explicitly scoped and described in an improvement plan.
 
 | File | Lines | Purpose |
 |---|---|---|
-| `scanner.go` | 192 | Recursive filesystem walk |
-| `hasher.go` | 471 | xxHash (exact) + dHash/pHash (perceptual) |
-| `metadata.go` | 439 | EXIF extraction + quality scoring |
-| `grouper.go` | 583 | BK-Tree indexing + duplicate grouping |
+| `scanner.go` | 204 | Recursive filesystem walk |
+| `hasher.go` | 815 | xxHash (exact) + dHash/pHash (perceptual) |
+| `metadata.go` | 584 | EXIF extraction + quality scoring |
+| `grouper.go` | 694 | BK-Tree indexing + duplicate grouping |
+| `cache.go` | 180 | Persistent hash cache |
 
 ---
 
 ## 5. Frontend Architecture
 
-### Current state
+The frontend has been split into ES modules under `static/js/` and `static/css/`.
+`static/index.html` loads `js/app.js` via `<script type="module" src="/js/app.js">`.
+CSS is split into 4 files loaded via `<link>` tags.
 
-The frontend is a **single-file monolith** — all logic lives in `frontend/app.js` (660 lines)
-wrapped in an IIFE (`(function() { ... })()`). It is **not** split into ES modules yet.
-`frontend/index.html` loads `app.js` via a plain `<script src="/app.js">` (no `type="module"`).
+**`api.js` is the isolation layer** — it wraps all `window.go.main.App.*` calls;
+no other module touches `window.go` directly.
 
-CSS is a single file: `frontend/style.css` (256 lines).
-
-Static assets are served by the Wails AssetServer from the root `/` — paths have **no `/static/` prefix**.
-`style.css` is at `/style.css`, `app.js` is at `/app.js`.
-
-### Target modular structure (not yet implemented)
-
-When splitting `app.js`, the target is:
+### Current modular structure
 
 ```
-frontend/
-├── index.html                  HTML shell with 4-zone grid layout
+static/
+├── index.html
 ├── css/
-│   ├── base.css        ~60 lines   CSS variables, reset, typography
-│   ├── layout.css      ~80 lines   4-zone CSS Grid
-│   ├── cards.css       ~100 lines  Group cards, image cards, quality bar
-│   └── components.css  ~70 lines   Buttons, badges, toast, confirm, browse dialog
+│   ├── base.css        CSS variables, reset, typography
+│   ├── layout.css      Grid layout + left panel
+│   ├── table.css       Data table styles
+│   └── components.css  Buttons, badges, toast, browse dialog
 └── js/
-    ├── app.js          ~40 lines   Entry point — imports all modules, wires init()
-    ├── state.js        ~30 lines   Shared state object (single source of truth)
-    ├── wails.js        ~60 lines   All window.go.main.App.* calls (the ONLY file that touches window.go)
-    ├── helpers.js      ~55 lines   Pure utility functions (format, escape, color)
-    ├── components.js   ~50 lines   showToast(), showConfirm()
-    ├── scan.js         ~80 lines   startScan(), pollResults(), cancelScan(), updateProgress()
-    ├── browse.js       ~80 lines   Folder browser dialog
-    ├── sidebar.js      ~100 lines  Folder tree navigation within scan results
-    ├── settings.js     ~60 lines   Settings panel read/write
-    ├── render.js       ~150 lines  renderResults(), buildGroup(), buildImageCard()
-    └── actions.js      ~50 lines   deleteFile(), reportMismatch(), batchDelete()
+    ├── app.js          Entry point — imports modules, wires init()
+    ├── state.js        Shared state object (single source of truth)
+    ├── api.js          All window.go.main.App.* calls (isolation layer)
+    ├── helpers.js      Pure utility functions
+    ├── components.js   showToast(), showConfirm()
+    ├── scan.js         startScan(), pollResults(), cancelScan()
+    ├── browse.js       Folder browser (native dialog wrapper)
+    ├── sidebar.js      Folder tree navigation
+    ├── preview.js      Left panel image preview
+    ├── filters.js      Result filters
+    ├── resize.js       Panel resize handles
+    ├── table.js        Results data table
+    └── actions.js      deleteFile(), reportMismatch(), batch ops
 ```
 
-When the split is implemented:
-- `index.html` loads only `js/app.js` via `<script type="module" src="/js/app.js">`
-- `index.html` loads CSS via 4 `<link>` tags (no `/static/` prefix)
-- **`wails.js` is the isolation layer** — it wraps all `window.go.main.App.*` calls; no other module touches `window.go`
-- State lives exclusively in `state.js`
-
-### State object (target, when split is implemented)
+### State object
 
 ```js
 export const state = {
@@ -284,10 +288,10 @@ Dark navy/teal theme. Do not change values without a deliberate design decision.
 3. **No file over 150 lines.** If a file approaches this limit, split it.
 4. **No function over 50 lines.** Extract helpers when functions grow.
 5. **No HTTP, no `fetch()`.** All Go ↔ JS communication goes through `window.go.main.App.*` Promises.
-6. **Asset paths have no `/static/` prefix.** Wails serves `frontend/` at root `/`. A file at `frontend/style.css` loads as `/style.css`.
-7. **`static/` is dead code.** Never read, reference, or modify the `static/` directory.
-8. **State lives in `state.js` only** (when split). Never store shared state as module-level variables in other files.
-9. **Wails calls live in `wails.js` only** (when split). No other module calls `window.go.*` directly.
-10. **Do not touch business logic files** (`scanner.go`, `hasher.go`, `metadata.go`, `grouper.go`) unless explicitly requested.
+6. **Asset paths have no `/static/` prefix.** Wails embeds `static/` and strips the prefix via `fs.Sub`. A file at `static/css/base.css` loads as `/css/base.css`.
+7. **`static/` is the active frontend directory.** All frontend work happens here. There is no `frontend/` directory.
+8. **State lives in `state.js` only.** Never store shared state as module-level variables in other files.
+9. **Wails calls live in `api.js` only.** No other module calls `window.go.*` directly.
+10. **Avoid modifying business logic files** (`scanner.go`, `hasher.go`, `metadata.go`, `grouper.go`, `cache.go`) unless the change is explicitly scoped and described in an improvement plan.
 11. **Comment all Go code.** The owner is not a Go expert. Explain every non-obvious construct.
 12. **Test after every change.** Run `wails dev` and verify in the native window.
