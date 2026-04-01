@@ -39,9 +39,10 @@ import (
 //	.bmp         — Uncompressed bitmap, legacy format.
 //	.webp        — Modern format by Google, good compression.
 //	.gif         — Supports animation, limited to 256 colors.
-//	.heic, .heif — Apple's modern photo format (iPhones). Note: we detect
-//	               these files but can't fully process them yet (no pure-Go
-//	               HEIC decoder exists).
+//
+// Note: HEIC/HEIF (Apple iPhone format) is NOT supported. Go has no pure-Go
+// HEVC pixel decoder, and CGo-based solutions cause build issues on Windows.
+// HEIC files are skipped during scanning.
 var supportedExtensions = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,
@@ -51,8 +52,6 @@ var supportedExtensions = map[string]bool{
 	".bmp":  true,
 	".webp": true,
 	".gif":  true,
-	".heic": true,
-	".heif": true,
 	// RAW formats — decoded via embedded JPEG preview in EXIF.
 	".dng": true, // Adobe Digital Negative.
 	".arw": true, // Sony RAW.

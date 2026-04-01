@@ -226,11 +226,11 @@ func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidt
 }
 
 // =============================================================================
-// extractEmbeddedJPEG — Extract JPEG preview from camera RAW / HEIC files
+// extractEmbeddedJPEG — Extract JPEG preview from camera RAW formats
 // =============================================================================
 
 // extractEmbeddedJPEG scans filePath for embedded JPEG data (SOI/EOI markers).
-// Many camera formats (HEIC, HEIF, ARW, DNG, CR2) contain a full-size JPEG
+// Many camera RAW formats (ARW, DNG, CR2) contain a full-size JPEG
 // preview. Returns the largest valid JPEG found, or nil if none.
 func extractEmbeddedJPEG(filePath string) []byte {
 	data, err := os.ReadFile(filePath)

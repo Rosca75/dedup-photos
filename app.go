@@ -282,19 +282,7 @@ func (a *App) GetThumbnail(path string) string {
 
 	img, _, err := image.Decode(f)
 	if err != nil {
-		// Try HEIC-specific container parsing first (pure Go, no external deps).
-		// This handles .heic and .heif files from iPhones and other cameras.
-		if isHEICPath(path) {
-			if _, _, _, _, thumbB64, heicErr := extractHEICMeta(path); heicErr == nil && thumbB64 != "" {
-				// extractHEICMeta returns a full data URI; strip the prefix to get raw base64.
-				raw := strings.TrimPrefix(thumbB64, "data:image/jpeg;base64,")
-				if decoded, decErr := base64.StdEncoding.DecodeString(raw); decErr == nil {
-					thumbnailCache.Store(path, decoded)
-					return raw
-				}
-			}
-		}
-		// Generic fallback for other RAW formats (DNG, ARW, CR2): byte-scan for
+		// Fallback for RAW formats (DNG, ARW, CR2): byte-scan for
 		// embedded JPEG SOI/EOI markers. Slower but works for many camera formats.
 		if embedded := extractEmbeddedJPEG(path); embedded != nil {
 			thumbnailCache.Store(path, embedded)

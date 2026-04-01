@@ -139,23 +139,6 @@ func ExtractMetadata(path string) ImageMetadata {
 		if decErr == nil {
 			meta.Width = config.Width
 			meta.Height = config.Height
-		} else if isHEICPath(path) {
-			// HEIC fallback: image.DecodeConfig doesn't understand HEIC/HEIF.
-			// Use the pure-Go HEIC parser to get dimensions, camera, and date.
-			w, h, cam, date, _, heicErr := extractHEICMeta(path)
-			if heicErr == nil && w > 0 {
-				meta.Width = w
-				meta.Height = h
-				// Only override camera/date if they're not already set by the
-				// EXIF path below — but since we haven't run EXIF yet, set them
-				// now and let the EXIF step overwrite with more accurate values.
-				if cam != "" && cam != "unknown" {
-					meta.Camera = cam
-				}
-				if date != "" {
-					meta.DateTaken = date
-				}
-			}
 		} else {
 			// If we can't decode dimensions (unsupported format),
 			// just log it and continue. We'll still have file size and

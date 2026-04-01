@@ -30,14 +30,12 @@ package main
 import (
 	"bytes"           // For wrapping byte slices as io.Reader (used for EXIF thumbnails).
 	"context"         // For cancellation support.
-	"encoding/base64" // For decoding the base64 thumbnail returned by extractHEICMeta.
-	"fmt"             // Formatted I/O (printing).
-	"image"           // Go's standard image interface and decoding registry.
-	"math/bits"       // Bit counting functions (like popcount).
-	"os"              // File operations.
-	"runtime"         // Access to Go runtime info like number of CPUs.
-	"strings"         // strings.TrimPrefix — strip the data URI prefix from HEIC thumbnails.
-	"sync"            // Synchronization primitives (WaitGroup, Mutex).
+	"fmt"         // Formatted I/O (printing).
+	"image"       // Go's standard image interface and decoding registry.
+	"math/bits"   // Bit counting functions (like popcount).
+	"os"          // File operations.
+	"runtime"     // Access to Go runtime info like number of CPUs.
+	"sync"        // Synchronization primitives (WaitGroup, Mutex).
 	"sync/atomic"     // Atomic counters for lock-free progress tracking.
 	"time"            // For timing each phase of the pipeline.
 
@@ -242,37 +240,6 @@ func computeDHashSmart(data []byte) (uint64, error) {
 			if err == nil {
 				return computeDHashFromImage(img), nil
 			}
-		}
-	}
-
-	// Fast path 2: HEIC embedded thumbnail (pure-Go container parsing).
-	// HEIC files store a small JPEG thumbnail inside the container. We can decode
-	// that thumbnail and compute dHash on it — much faster than decoding the full
-	// HEVC stream (which Go cannot do natively anyway).
-	//
-	// heif.Open() requires an io.ReadSeeker, so we write the bytes to a temp file.
-	// We only attempt this when the buffer starts with an ISOBMFF "ftyp" box
-	// signature (bytes 4-8 == "ftyp"), which identifies HEIC/HEIF containers.
-	if len(data) > 8 && string(data[4:8]) == "ftyp" {
-		tmpFile, tmpErr := os.CreateTemp("", "dedup-heic-*.heic")
-		if tmpErr == nil {
-			tmpPath := tmpFile.Name()
-			_, writeErr := tmpFile.Write(data)
-			tmpFile.Close() // Close before passing path to extractHEICMeta.
-			if writeErr == nil {
-				_, _, _, _, thumbB64, heicErr := extractHEICMeta(tmpPath)
-				if heicErr == nil && thumbB64 != "" {
-					// Strip "data:image/jpeg;base64," prefix to get raw base64.
-					raw := strings.TrimPrefix(thumbB64, "data:image/jpeg;base64,")
-					if decoded, decErr := base64.StdEncoding.DecodeString(raw); decErr == nil {
-						if img, _, imgErr := image.Decode(bytes.NewReader(decoded)); imgErr == nil {
-							os.Remove(tmpPath)
-							return computeDHashFromImage(img), nil
-						}
-					}
-				}
-			}
-			os.Remove(tmpPath) // Clean up temp file whether we succeeded or not.
 		}
 	}
 
