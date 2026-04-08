@@ -34,8 +34,8 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
       - name: Build Windows binary
-        # -nsis  → skip NSIS installer generation (produces a bare .exe)
-        # -o     → output filename inside build/bin/
+        # -nsis  -> skip NSIS installer generation (produces a bare .exe)
+        # -o     -> output filename inside build/bin/
         run: wails build -platform windows/amd64 -o dedup-photos.exe
 
       - name: Upload Windows binary as workflow artifact
@@ -67,29 +67,17 @@ jobs:
           node-version: '20'
 
       - name: Install Linux system dependencies
-        # libgtk-3-dev          → GTK3 headers (Wails window chrome)
-        # libwebkit2gtk-4.1-dev → WebKit2GTK headers (Ubuntu 24.04 package name)
-        # pkg-config            → used by cgo to locate the above libraries
+        # libgtk-3-dev          -> GTK3 headers (Wails window chrome)
+        # libwebkit2gtk-4.1-dev -> WebKit2GTK headers (Ubuntu 24.04 package name)
+        # pkg-config            -> used by cgo to locate the above libraries
         # NOTE: Wails v2 hardcodes "webkit2gtk-4.0" in its pkg-config calls but
-        # Ubuntu 24.04 only ships webkit2gtk-4.1. We install 4.1 and then create
-        # a shim .pc file that satisfies the 4.0 lookup by forwarding it to 4.1.
+        # Ubuntu 24.04 only ships webkit2gtk-4.1. We install 4.1 then create a
+        # shim .pc file that satisfies the 4.0 lookup by forwarding it to 4.1.
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            pkg-config
-
-          # Create webkit2gtk-4.0 shim so Wails v2 pkg-config lookup succeeds
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
           PKG_DIR=$(pkg-config --variable pc_path pkg-config | cut -d: -f1)
-          sudo sh -c "cat > ${PKG_DIR}/webkit2gtk-4.0.pc << 'EOF'
-Name: webkit2gtk-4.0
-Description: Shim forwarding webkit2gtk-4.0 to webkit2gtk-4.1 (Ubuntu 24.04)
-Version: 2.40.0
-Requires: webkit2gtk-4.1
-Libs:
-Cflags:
-EOF"
+          printf 'Name: webkit2gtk-4.0\nDescription: Shim for webkit2gtk-4.1\nVersion: 2.40.0\nRequires: webkit2gtk-4.1\nLibs:\nCflags:\n' | sudo tee "${PKG_DIR}/webkit2gtk-4.0.pc" > /dev/null
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
