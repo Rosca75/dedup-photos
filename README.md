@@ -11,16 +11,33 @@ A fast, local duplicate photo detector with a web-based UI for reviewing and man
 - Perceptual hashing for visual similarity detection beyond exact matches
 - Quality scoring to recommend which duplicate to keep
 - Web-based UI for side-by-side comparison and review
-- Single self-contained binary with no external dependencies
+- Single binary — no installation required on Windows; Linux requires WebKit2GTK (see Linux Requirements)
 - Cross-platform support (Windows, macOS, Linux)
 
 ## Screenshot
 
 <!-- TODO: Add screenshot of the web UI here -->
 
+## Linux Requirements
+
+The Linux binary requires WebKit2GTK to be installed on the host system (it provides
+the embedded browser engine). Install it once with:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install libwebkit2gtk-4.0-37
+
+# Fedora / RHEL
+sudo dnf install webkit2gtk3
+```
+
+This is a runtime dependency — it is not bundled into the binary.
+
 ## Quick Start
 
 1. Download the latest binary for your platform from the [Releases](https://github.com/Rosca75/dedup-photos/releases/latest) page.
+   - **Windows**: download `dedup-photos.exe` — double-click or run from terminal, no install needed.
+   - **Linux**: download `dedup-photos-linux`. Make it executable first: `chmod +x dedup-photos-linux`. Ensure [WebKit2GTK is installed](#linux-requirements).
 
 2. Run DedupPhotos, pointing it at the directory you want to scan:
 
@@ -32,13 +49,31 @@ A fast, local duplicate photo detector with a web-based UI for reviewing and man
 
 ## Build from Source
 
-Requires Go 1.22 or later.
+Requires Go 1.22+, Node.js 20+, and the [Wails CLI](https://wails.io/docs/gettingstarted/installation).
 
-```sh
+### Install Wails
+```bash
+go install github.com/wailsapp/wails/v2/cmd/wails@latest
+```
+
+### Linux — additional system dependencies required
+```bash
+sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev pkg-config
+```
+
+### Build
+```bash
 git clone https://github.com/Rosca75/dedup-photos.git
 cd dedup-photos
-go build -o dedup-photos .
+
+# Windows
+wails build -platform windows/amd64
+
+# Linux
+wails build -platform linux/amd64
 ```
+
+Output is placed in `build/bin/`.
 
 ## How It Works
 
