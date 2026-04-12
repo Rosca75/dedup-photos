@@ -1,64 +1,60 @@
 // =============================================================================
-// hasher.go — Hashing engine with parallel processing
+// hasher.go — Hash algorithms, types, and low-level utilities
 // =============================================================================
 //
-// This file computes two types of hashes for each image:
+// This file contains the core hashing primitives:
 //
-// 1. xxHash (exact match): A very fast non-cryptographic hash of the raw file
-//    bytes. If two files have the same xxHash, they are byte-for-byte identical.
-//    Think of it like a fingerprint — identical files produce identical hashes.
+//   xxHash (exact match): A very fast non-cryptographic hash of raw file bytes.
+//   Two files with the same xxHash are byte-for-byte identical.
 //
-// 2. dHash (perceptual match): A "difference hash" that captures the visual
-//    structure of an image. Even if two photos are slightly different (resized,
-//    recompressed, color-adjusted), their dHashes will be very similar. This
-//    lets us find "visually similar" duplicates, not just exact copies.
+//   dHash / pHash (perceptual match): A "difference hash" / "average hash" that
+//   captures the visual structure of an image in 64 bits. Even slightly different
+//   photos (resized, recompressed) will have similar hashes. Hamming distance
+//   measures how visually different two images are.
 //
-// The file also implements a parallel processing pipeline using goroutines
-// (Go's lightweight threads) and channels (Go's way of communicating between
-// goroutines). This lets us hash many images simultaneously, taking advantage
-// of multi-core CPUs.
+// The parallel pipeline that coordinates these functions lives in
+// hasher_pipeline.go. The shared worker-pool helper is in parallel.go.
 //
-// Key Go concepts used here:
-//   - goroutine:    A lightweight thread. Started with the "go" keyword.
-//   - channel:      A typed pipe for sending data between goroutines.
-//   - sync.WaitGroup: A counter that lets you wait for multiple goroutines.
-//   - math/bits:    Standard library for bit manipulation (popcount, etc.).
+// Key additions vs. the original file:
+//   - ImageHash now carries Width, Height, Size (enables aspect-ratio bucketing
+//     without re-opening files later).
+//   - bufPool: sync.Pool of 64 KB buffers used for streaming partial reads and
+//     the streaming xxHash path (#5 — reduces peak memory from ~40 MB to ~0.5 MB).
+//   - computeXXHashStreaming: computes xxHash via streaming 64 KB chunks rather
+//     than loading the entire file into RAM (#5).
+//   - computeDHashFromHeader: reads only the first 128 KB of a file so that EXIF
+//     thumbnails can be extracted cheaply, avoiding full-image decodes (#1/#3b).
+//   - formatsNeedingFullDecode: the set of extensions whose images Go can decode
+//     but which have no EXIF thumbnails (PNG, BMP, GIF, WebP, TIFF).
 // =============================================================================
 
 package main
 
 import (
-	"bytes"           // For wrapping byte slices as io.Reader (used for EXIF thumbnails).
-	"context"         // For cancellation support.
-	"fmt"         // Formatted I/O (printing).
-	"image"       // Go's standard image interface and decoding registry.
-	"math/bits"   // Bit counting functions (like popcount).
-	"os"          // File operations.
-	"runtime"     // Access to Go runtime info like number of CPUs.
-	"sync"        // Synchronization primitives (WaitGroup, Mutex).
-	"sync/atomic"     // Atomic counters for lock-free progress tracking.
-	"time"            // For timing each phase of the pipeline.
+	"bytes"         // bytes.NewReader — wraps []byte as io.Reader for image/exif.
+	"fmt"           // Formatted I/O (error messages, progress).
+	"image"         // Standard image interface + DecodeConfig for dimensions.
+	"io"            // io.ReadFull used in computeDHashFromHeader.
+	"math/bits"     // bits.OnesCount64 for fast popcount (Hamming distance).
+	"os"            // File operations (Open, ReadFile, Stat).
+	"path/filepath" // filepath.Ext — extract extension in computeDHashFromHeader.
+	"strings"       // strings.ToLower — normalise file extensions.
+	"sync"          // sync.Pool for reusable 64 KB read buffers.
 
-	// Standard image format decoders. Importing these with "_" (blank import)
-	// registers them with the image package so image.Decode can recognize them.
-	// You don't call any functions from these packages directly — the import
-	// side effect is what matters.
-	_ "image/gif"  // Registers GIF decoder.
-	_ "image/jpeg" // Registers JPEG decoder.
-	_ "image/png"  // Registers PNG decoder.
+	// Image format decoders — blank imports register them with image.Decode.
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 
-	// Extended image format decoders from the Go "x" (experimental) packages.
-	// These aren't in the standard library but are maintained by the Go team.
-	_ "golang.org/x/image/bmp"  // Registers BMP decoder.
-	_ "golang.org/x/image/tiff" // Registers TIFF decoder.
-	_ "golang.org/x/image/webp" // Registers WebP decoder.
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 
-	// goexif extracts EXIF metadata from JPEG/TIFF files. We use it to
-	// pull out embedded thumbnails for fast perceptual hashing.
+	// goexif reads EXIF metadata from JPEG/TIFF files. We use it to extract
+	// the embedded thumbnail for fast perceptual hashing.
 	"github.com/rwcarlsen/goexif/exif"
 
-	// xxhash is an extremely fast non-cryptographic hash function.
-	// "v2" means we're using version 2 of the package.
+	// xxhash is an extremely fast non-cryptographic hash (several GB/s).
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -67,7 +63,7 @@ import (
 // =============================================================================
 
 // ErrNoThumbnail is returned when a file has no embedded EXIF thumbnail.
-// The caller should fall back to full-decode dHash when this occurs.
+// The caller should fall back to a full-decode dHash or skip perceptual matching.
 var ErrNoThumbnail = fmt.Errorf("no EXIF thumbnail available")
 
 // =============================================================================
@@ -75,147 +71,175 @@ var ErrNoThumbnail = fmt.Errorf("no EXIF thumbnail available")
 // =============================================================================
 
 // ImageHash holds the results of hashing a single image file.
-// Each image gets two hashes computed: an xxHash for exact matching and a
-// dHash for perceptual (visual similarity) matching.
+//
+// CHANGE: Width, Height, and Size are now populated during the hash phase so
+// that GroupDuplicates can bucket images by aspect ratio without re-opening
+// files (optimisation #3 and #4).
+//
+// XXHash = 0 means the file was a singleton (unique file size) and therefore
+// cannot be an exact duplicate. The grouper skips XXHash=0 in Pass 1.
 type ImageHash struct {
-	Path   string // The absolute filesystem path to the image file.
-	XXHash uint64 // xxHash64 of the raw file bytes — for exact duplicate detection.
-	DHash  uint64 // Perceptual difference hash — for visual similarity detection.
-	Error  error  // If something went wrong hashing this file, the error is stored here.
+	Path   string // Absolute filesystem path to the image.
+	XXHash uint64 // xxHash64 of raw file bytes. 0 = singleton (no exact dup check).
+	DHash  uint64 // Perceptual dHash. 0 = couldn't decode / skip perceptual matching.
+	Width  int    // Image width in pixels (0 if unknown).
+	Height int    // Image height in pixels (0 if unknown).
+	Size   int64  // File size in bytes from os.Stat.
+	Error  error  // Non-nil if this file failed to hash.
 }
 
-// ProgressCallback is called by HashAllImagesWithContext to report progress.
-// The hasher calls this whenever the phase changes or the count of processed
-// files updates. This lets the server update the scan progress for the UI.
-//
-// Parameters:
-//   - phase: human-readable phase description (e.g., "Computing quick fingerprints...")
-//   - current: number of items processed in the current phase
-//   - total: total number of items in the current phase
+// ProgressCallback is called periodically to report scan progress.
+// phase is a human-readable description; current and total are item counts.
 type ProgressCallback func(phase string, current int, total int)
 
 // =============================================================================
-// ComputeXXHash — Fast file-level hash for exact duplicate detection
+// bufPool — Reusable 64 KB read buffers (#5 streaming xxHash)
 // =============================================================================
 
-// ComputeXXHash reads the entire file at the given path and computes its
-// xxHash64 digest. xxHash is one of the fastest non-cryptographic hash
-// functions available — it can process several GB/s on modern hardware.
+// bufPool holds pre-allocated 64 KB byte-slice pointers for reuse across
+// goroutines. Using a pool avoids allocating a new 64 KB slab on every file
+// read, reducing GC pressure when hashing thousands of files in parallel.
 //
-// Two files with the same xxHash are (with overwhelming probability) byte-for-
-// byte identical. This is our first-pass duplicate check: fast and definitive.
-//
-// Parameters:
-//   - path: Absolute path to the file to hash.
-//
-// Returns:
-//   - uint64: The 64-bit xxHash digest.
-//   - error:  Non-nil if the file couldn't be read.
-func ComputeXXHash(path string) (uint64, error) {
-	// os.ReadFile reads the entire file into memory as a byte slice ([]byte).
-	// For very large files this could use a lot of RAM, but photos are
-	// typically 1-30 MB, which is fine.
-	data, err := os.ReadFile(path)
-	if err != nil {
-		// If we can't read the file (permissions, missing, etc.), return the
-		// error. The caller will handle it gracefully.
-		return 0, fmt.Errorf("failed to read file %s: %w", path, err)
-	}
-
-	// xxhash.Sum64 computes the xxHash64 digest of the byte slice in a single
-	// call. This is the simplest API — there's also a streaming API if you
-	// don't want to load the whole file into memory.
-	hash := xxhash.Sum64(data)
-
-	return hash, nil
+// Why 64 KB? It matches common OS page sizes and is large enough for one
+// partial hash read. The pool stores *[]byte (pointer to slice) so that
+// the slice header itself is heap-allocated and the pool can return a pointer.
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 64*1024) // 64 KB
+		return &buf
+	},
 }
 
 // =============================================================================
-// ComputePartialXXHash — Fast pre-filter using only the first N bytes
+// formatsNeedingFullDecode — Extensions where Go can fully decode the image
+// but no EXIF thumbnail is embedded. computeDHashFromHeader falls back to a
+// full os.ReadFile + image.Decode for these.
 // =============================================================================
 
-// ComputePartialXXHash reads only the first 'size' bytes of a file and computes
-// its xxHash. This is used as a fast pre-filter: files with different partial
-// hashes cannot be exact duplicates, so we can skip reading the full file.
-//
-// For a 64KB read over a network (NAS), this is ~100x faster than reading a
-// typical 6MB photo file. We use this to quickly eliminate non-duplicates
-// before doing expensive full-file reads.
-//
-// Parameters:
-//   - path: absolute file path to read
-//   - size: number of bytes to read (recommended: 65536 = 64KB)
-//
-// Returns:
-//   - uint64: partial xxHash digest of the first 'size' bytes
-//   - error: if the file cannot be opened or read
+// formatsNeedingFullDecode lists file extensions whose files Go can decode
+// via image.Decode but which typically lack EXIF thumbnails.
+// JPEG and camera RAW formats are NOT in this map; they either carry an
+// EXIF thumbnail or get dHash = 0 (skip perceptual matching).
+var formatsNeedingFullDecode = map[string]bool{
+	".png":  true,
+	".bmp":  true,
+	".gif":  true,
+	".webp": true,
+	".tiff": true,
+	".tif":  true,
+}
+
+// =============================================================================
+// ComputeXXHash — Full-file hash for exact duplicate detection
+// =============================================================================
+
+// ComputeXXHash reads the entire file and computes its xxHash64 digest.
+// Two files with the same xxHash are byte-for-byte identical.
+// Prefer computeXXHashStreaming when you want to avoid holding the full file
+// in memory (useful for large RAW files).
+func ComputeXXHash(path string) (uint64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read file %s: %w", path, err)
+	}
+	return xxhash.Sum64(data), nil
+}
+
+// =============================================================================
+// ComputePartialXXHash — Fast pre-filter using the first N bytes
+// =============================================================================
+
+// ComputePartialXXHash reads only the first 'size' bytes of a file and
+// computes their xxHash. Files with different partial hashes cannot be exact
+// duplicates, so we use this to eliminate non-candidates before doing
+// expensive full-file reads.
 func ComputePartialXXHash(path string, size int) (uint64, error) {
-	// Open the file — we only need to read the beginning, not the whole thing.
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
 
-	// Allocate a buffer of the requested size and read into it.
-	// f.Read may return fewer bytes than requested (e.g., if the file is
-	// smaller than 'size'), and that's fine — we hash whatever we got.
 	buf := make([]byte, size)
 	n, err := f.Read(buf)
 	if err != nil && n == 0 {
-		// Only treat it as an error if we read zero bytes.
-		// io.EOF with n > 0 just means the file was smaller than 'size'.
 		return 0, err
 	}
-
-	// Hash only the bytes we actually read (buf[:n]).
 	return xxhash.Sum64(buf[:n]), nil
+}
+
+// =============================================================================
+// computeXXHashStreaming — Low-memory streaming xxHash (#5)
+// =============================================================================
+
+// computeXXHashStreaming computes xxHash64 by reading the file in 64 KB chunks
+// rather than loading the entire file into memory. This reduces peak memory
+// from ~5 MB/worker to ~64 KB/worker during the exact-hash phase.
+//
+// Buffers are borrowed from bufPool and returned after each file, so the same
+// 64 KB slabs are reused across thousands of files.
+func computeXXHashStreaming(path string) (uint64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	// Borrow a 64 KB buffer from the pool; return it when done.
+	bufPtr := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	// xxhash.New() returns a streaming hasher that accepts multiple writes.
+	h := xxhash.New()
+
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n]) // Feed the chunk to the hasher.
+		}
+		if err == io.EOF {
+			break // Normal end of file.
+		}
+		if err != nil {
+			return 0, fmt.Errorf("read error in %s: %w", path, err)
+		}
+	}
+
+	return h.Sum64(), nil
 }
 
 // =============================================================================
 // ComputeDHashFromEXIFThumbnail — Fast perceptual hash via embedded thumbnail
 // =============================================================================
 
-// ComputeDHashFromEXIFThumbnail extracts the EXIF thumbnail embedded in
-// JPEG/HEIC files and computes a dHash on it. This avoids decoding the
-// full-resolution image, which is 50-100x faster.
+// ComputeDHashFromEXIFThumbnail extracts the EXIF thumbnail from a JPEG file
+// and computes a dHash on it. This is ~50-100× faster than decoding the full
+// image because the thumbnail is already a small JPEG (typically 10-20 KB).
 //
-// Most JPEG files from cameras/phones embed a small thumbnail (~10-20KB JPEG)
-// in the EXIF metadata. We decode that tiny image instead of the full 12MP one.
-//
-// Returns ErrNoThumbnail if the file has no EXIF thumbnail, in which case
-// the caller should fall back to full-decode dHash (ComputeDHash).
+// Returns ErrNoThumbnail if the file has no EXIF thumbnail.
 func ComputeDHashFromEXIFThumbnail(path string) (uint64, error) {
-	// Open the file to read EXIF data.
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, ErrNoThumbnail
 	}
 	defer f.Close()
 
-	// Parse the EXIF metadata from the file header.
 	x, err := exif.Decode(f)
 	if err != nil {
-		// No EXIF data at all — not an error, just means no thumbnail.
 		return 0, ErrNoThumbnail
 	}
 
-	// Extract the embedded JPEG thumbnail from the EXIF IFD1 block.
-	// This is typically a small JPEG (160x120 to 320x240 pixels).
 	thumb, err := x.JpegThumbnail()
 	if err != nil || len(thumb) == 0 {
-		// EXIF exists but no thumbnail embedded (common in edited images).
 		return 0, ErrNoThumbnail
 	}
 
-	// Decode the thumbnail JPEG into an image.Image.
-	// bytes.NewReader wraps the []byte so it satisfies io.Reader.
 	img, _, err := image.Decode(bytes.NewReader(thumb))
 	if err != nil {
 		return 0, ErrNoThumbnail
 	}
 
-	// Compute dHash on the thumbnail image using the same 9x8 algorithm.
 	return computeDHashFromImage(img), nil
 }
 
@@ -224,14 +248,10 @@ func ComputeDHashFromEXIFThumbnail(path string) (uint64, error) {
 // =============================================================================
 
 // computeDHashSmart computes a dHash from file bytes already in memory.
-// It tries the EXIF thumbnail first (fast — ~0.5ms) and falls back to
-// full image decode (slow — ~30-50ms) if no thumbnail is available.
-//
-// This avoids re-opening the file since we already have the bytes from
-// the single os.ReadFile call in ComputeAllHashes.
+// It tries the EXIF thumbnail first (fast — ~0.5 ms) and falls back to
+// full image decode (slow — ~30-50 ms) if no thumbnail is available.
 func computeDHashSmart(data []byte) (uint64, error) {
-	// Fast path: try to extract and use the EXIF thumbnail.
-	// Most JPEG/HEIC files from cameras embed a small thumbnail (~10-20KB).
+	// Fast path: EXIF thumbnail (typical for camera/phone JPEGs).
 	x, err := exif.Decode(bytes.NewReader(data))
 	if err == nil {
 		thumb, err := x.JpegThumbnail()
@@ -243,7 +263,7 @@ func computeDHashSmart(data []byte) (uint64, error) {
 		}
 	}
 
-	// Slow path: decode the full image (PNG, BMP, edited JPEG without thumbnail).
+	// Slow path: full decode (PNG, BMP, edited JPEG without thumbnail).
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return 0, fmt.Errorf("failed to decode image: %w", err)
@@ -255,9 +275,10 @@ func computeDHashSmart(data []byte) (uint64, error) {
 // computePHashFromData — Buffer-based pHash (average hash)
 // =============================================================================
 
-// computePHashFromData computes a pHash from file bytes already in memory.
-// Same algorithm as ComputePHash but works on a []byte buffer instead of
-// opening a file, avoiding redundant file I/O.
+// computePHashFromData computes an average-based perceptual hash from bytes
+// already in memory. The pHash compares each pixel to the image's average
+// brightness rather than to its right neighbour (as dHash does). It can be
+// more robust for certain types of edits.
 func computePHashFromData(data []byte) (uint64, error) {
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
@@ -265,8 +286,8 @@ func computePHashFromData(data []byte) (uint64, error) {
 	}
 
 	bounds := img.Bounds()
-	srcWidth := bounds.Max.X - bounds.Min.X
-	srcHeight := bounds.Max.Y - bounds.Min.Y
+	srcW := bounds.Max.X - bounds.Min.X
+	srcH := bounds.Max.Y - bounds.Min.Y
 
 	const size = 8
 	gray := make([][]uint32, size)
@@ -277,191 +298,198 @@ func computePHashFromData(data []byte) (uint64, error) {
 	var total uint64
 	for y := 0; y < size; y++ {
 		for x := 0; x < size; x++ {
-			srcX := bounds.Min.X + (x * srcWidth / size)
-			srcY := bounds.Min.Y + (y * srcHeight / size)
+			srcX := bounds.Min.X + (x * srcW / size)
+			srcY := bounds.Min.Y + (y * srcH / size)
 			r, g, b, _ := img.At(srcX, srcY).RGBA()
-			luminance := (299*r + 587*g + 114*b) / 1000
-			gray[y][x] = luminance
-			total += uint64(luminance)
+			lum := (299*r + 587*g + 114*b) / 1000
+			gray[y][x] = lum
+			total += uint64(lum)
 		}
 	}
 
 	avg := total / (size * size)
-
 	var hash uint64
-	bitPosition := 0
+	bit := 0
 	for y := 0; y < size; y++ {
 		for x := 0; x < size; x++ {
 			if uint64(gray[y][x]) > avg {
-				hash |= 1 << uint(bitPosition)
+				hash |= 1 << uint(bit)
 			}
-			bitPosition++
+			bit++
 		}
 	}
-
 	return hash, nil
 }
 
 // =============================================================================
-// ComputeAllHashes — Single-read, cache-aware hash computation
+// ComputeAllHashes — Single-read, cache-aware hash computation (utility)
 // =============================================================================
 
-// ComputeAllHashes computes both xxHash and dHash for a single file using
-// a single file read. It checks the cache first and returns cached values
-// if the file hasn't changed (same size + modification time).
-//
-// This is the core optimization: instead of opening the file 2-3 times
-// (once for xxHash, once for EXIF thumbnail, once for full decode), we
-// read the file ONCE into memory and compute everything from the buffer.
-//
-// Parameters:
-//   - path: absolute file path
-//   - info: os.FileInfo from a prior os.Stat call (for cache validation)
-//   - cache: the persistent hash cache (never nil)
-//   - algorithm: "dhash", "phash", or "both"
-//
-// Returns:
-//   - xxHash: full-file xxHash64
-//   - dHash: perceptual hash (dHash or pHash depending on algorithm)
-//   - cacheHit: true if values came from cache (no I/O performed)
-//   - error: non-nil if the file couldn't be read or decoded
+// ComputeAllHashes computes both xxHash and dHash for a file with a single
+// read, checking the cache first. This is kept as a utility for callers that
+// don't use the split pipeline in hasher_pipeline.go.
 func ComputeAllHashes(path string, info os.FileInfo, cache *HashCache, algorithm string) (xxHash uint64, dHash uint64, cacheHit bool, err error) {
-	// 1. Check cache — if the file hasn't changed, return cached hashes.
 	if xxh, dh, ok := cache.Lookup(path, info); ok {
 		return xxh, dh, true, nil
 	}
 
-	// 2. Cache miss — read the entire file ONCE into memory.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("failed to read file %s: %w", path, err)
 	}
 
-	// 3. Compute xxHash from the in-memory buffer (no file I/O).
 	xxh := xxhash.Sum64(data)
 
-	// 4. Compute perceptual hash from the same buffer.
 	var dh uint64
 	switch algorithm {
 	case "phash":
 		dh, err = computePHashFromData(data)
-	default: // "dhash" or "both"
-		// computeDHashSmart tries EXIF thumbnail first (fast), then full decode.
+	default:
 		dh, err = computeDHashSmart(data)
 	}
 	if err != nil {
-		// dHash failed but xxHash is still valid.
 		dh = 0
 	}
 
 	return xxh, dh, false, nil
 }
 
+// =============================================================================
+// computeDHashFromImage — Core 9×8 dHash algorithm
+// =============================================================================
+
 // computeDHashFromImage computes a dHash from an already-decoded image.
-// This is the shared core logic used by both ComputeDHash (full decode)
-// and ComputeDHashFromEXIFThumbnail (thumbnail decode).
+// This is the shared implementation used by all dHash code paths.
+//
+// Algorithm:
+//  1. Resize to 9×8 via nearest-neighbour (no library dependency).
+//  2. Convert to grayscale via ITU-R 601 luminance weights.
+//  3. For each row, compare each pixel to its right neighbour.
+//     Bit = 1 if left > right, else 0.
+//  4. Pack 64 comparison results into a uint64.
 func computeDHashFromImage(img image.Image) uint64 {
 	bounds := img.Bounds()
-	srcWidth := bounds.Max.X - bounds.Min.X
-	srcHeight := bounds.Max.Y - bounds.Min.Y
+	srcW := bounds.Max.X - bounds.Min.X
+	srcH := bounds.Max.Y - bounds.Min.Y
 
-	const dstWidth = 9
-	const dstHeight = 8
+	const dstW, dstH = 9, 8
 
-	// Build the 9x8 grayscale grid via nearest-neighbor sampling.
-	gray := make([][]uint32, dstHeight)
-	for y := 0; y < dstHeight; y++ {
-		gray[y] = make([]uint32, dstWidth)
+	gray := make([][]uint32, dstH)
+	for y := 0; y < dstH; y++ {
+		gray[y] = make([]uint32, dstW)
 	}
 
-	for y := 0; y < dstHeight; y++ {
-		for x := 0; x < dstWidth; x++ {
-			srcX := bounds.Min.X + (x * srcWidth / dstWidth)
-			srcY := bounds.Min.Y + (y * srcHeight / dstHeight)
+	for y := 0; y < dstH; y++ {
+		for x := 0; x < dstW; x++ {
+			srcX := bounds.Min.X + (x * srcW / dstW)
+			srcY := bounds.Min.Y + (y * srcH / dstH)
 			r, g, b, _ := img.At(srcX, srcY).RGBA()
 			gray[y][x] = (299*r + 587*g + 114*b) / 1000
 		}
 	}
 
-	// Compute the difference hash: compare each pixel to its right neighbor.
 	var hash uint64
-	bitPosition := 0
-	for y := 0; y < dstHeight; y++ {
-		for x := 0; x < dstWidth-1; x++ {
+	bit := 0
+	for y := 0; y < dstH; y++ {
+		for x := 0; x < dstW-1; x++ {
 			if gray[y][x] > gray[y][x+1] {
-				hash |= 1 << uint(bitPosition)
+				hash |= 1 << uint(bit)
 			}
-			bitPosition++
+			bit++
 		}
 	}
-
 	return hash
 }
 
 // =============================================================================
-// ComputeDHash — Perceptual "difference hash" for visual similarity
+// computeDHashFromHeader — EXIF-thumbnail dHash using only 128 KB (#1 / #3b)
 // =============================================================================
 
-// ComputeDHash computes a "difference hash" (dHash) for the image at the
-// given path. This is a perceptual hashing algorithm that captures the
-// visual structure of an image in a 64-bit integer.
+// computeDHashFromHeader computes a dHash by reading only the first 128 KB of
+// a file. For most camera/phone JPEGs this is enough to find the embedded EXIF
+// thumbnail (~10-20 KB) and compute a dHash without a full-image decode.
 //
-// HOW THE dHash ALGORITHM WORKS (step by step):
+// Also returns image dimensions (width, height) extracted from the 128 KB
+// buffer, so the caller doesn't need to re-open the file later (#3).
 //
-//  1. LOAD the image and decode it into pixels.
-//
-//  2. RESIZE to 9 columns × 8 rows. Why 9×8? Because we'll compare each
-//     pixel to its right neighbor, producing 8 comparisons per row.
-//     8 rows × 8 comparisons = 64 bits = one uint64.
-//
-//  3. CONVERT TO GRAYSCALE. We only care about brightness differences, not
-//     color. Each pixel becomes a single brightness value (0-255).
-//
-//  4. COMPUTE DIFFERENCES. For each pixel, compare it to the pixel to its
-//     right. If the left pixel is brighter, set the bit to 1; otherwise 0.
-//
-//  5. PACK INTO 64 BITS. The 64 comparison results become a 64-bit integer.
-//
-// WHY THIS WORKS:
-//   - The resize step removes fine detail, keeping only the overall structure.
-//   - Comparing neighbors instead of using absolute values makes the hash
-//     invariant to brightness/contrast changes.
-//   - Two visually similar images will have very similar dHash values.
-//   - The "Hamming distance" (number of differing bits) between two dHashes
-//     tells you how visually different the images are. 0 = identical structure,
-//     64 = completely different.
-//
-// Parameters:
-//   - path: Absolute path to an image file.
-//
-// Returns:
-//   - uint64: The 64-bit difference hash.
-//   - error:  Non-nil if the image couldn't be decoded.
+// Decision tree after reading 128 KB:
+//  1. Try EXIF thumbnail → compute dHash if found.
+//  2. If not found and format is JPEG or RAW: return (0, w, h, ErrNoThumbnail).
+//     These files get dHash=0 and are skipped in perceptual matching.
+//  3. If not found and format is PNG/BMP/GIF/WebP/TIFF: do a full os.ReadFile
+//     and decode (these formats lack EXIF but Go can decode them natively).
+func computeDHashFromHeader(path, algorithm string) (dHash uint64, width, height int, err error) {
+	ext := strings.ToLower(filepath.Ext(path))
+
+	// Read the first 128 KB. io.ReadFull returns io.ErrUnexpectedEOF if the
+	// file is shorter — that's fine, we use whatever bytes we got.
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, 0, ErrNoThumbnail
+	}
+	buf := make([]byte, 128*1024)
+	n, _ := io.ReadFull(f, buf)
+	f.Close()
+	if n == 0 {
+		return 0, 0, 0, ErrNoThumbnail
+	}
+	buf = buf[:n]
+
+	// Extract image dimensions from the header bytes (DecodeConfig is header-only).
+	if cfg, _, decErr := image.DecodeConfig(bytes.NewReader(buf)); decErr == nil {
+		width, height = cfg.Width, cfg.Height
+	}
+
+	// Try EXIF thumbnail for dHash computation.
+	if x, exifErr := exif.Decode(bytes.NewReader(buf)); exifErr == nil {
+		if thumb, thumbErr := x.JpegThumbnail(); thumbErr == nil && len(thumb) > 0 {
+			if img, _, imgErr := image.Decode(bytes.NewReader(thumb)); imgErr == nil {
+				return computeDHashFromImage(img), width, height, nil
+			}
+		}
+	}
+
+	// JPEG / RAW: no thumbnail found — skip perceptual matching for this file.
+	// These formats need full decode which is too expensive for the fast path.
+	if !formatsNeedingFullDecode[ext] {
+		return 0, width, height, ErrNoThumbnail
+	}
+
+	// PNG / BMP / GIF / WebP / TIFF: fall back to full file read + decode.
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return 0, width, height, readErr
+	}
+	switch algorithm {
+	case "phash":
+		dHash, err = computePHashFromData(data)
+	default:
+		dHash, err = computeDHashSmart(data)
+	}
+	return dHash, width, height, err
+}
+
+// =============================================================================
+// ComputeDHash / ComputePHash — Standalone file-path hash functions
+// =============================================================================
+
+// ComputeDHash computes a dHash by opening and decoding the full image.
+// Use computeDHashFromHeader or computeDHashSmart for faster alternatives.
 func ComputeDHash(path string) (uint64, error) {
-	// Open the file for reading.
 	file, err := os.Open(path)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open image %s: %w", path, err)
 	}
 	defer file.Close()
 
-	// Decode the full image (JPEG, PNG, etc. — auto-detected via magic bytes).
 	img, _, err := image.Decode(file)
 	if err != nil {
 		return 0, fmt.Errorf("failed to decode image %s: %w", path, err)
 	}
-
-	// Delegate to the shared 9x8 dHash computation.
 	return computeDHashFromImage(img), nil
 }
 
-// =============================================================================
-// ComputePHash — Average-based perceptual hash (alternative algorithm)
-// =============================================================================
-
-// ComputePHash computes a simple average-based perceptual hash. Unlike dHash
-// which compares adjacent pixels, pHash compares each pixel to the overall
-// average brightness. This can be more robust for certain types of edits.
+// ComputePHash computes a pHash by opening and decoding the full image.
 func ComputePHash(path string) (uint64, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -475,8 +503,8 @@ func ComputePHash(path string) (uint64, error) {
 	}
 
 	bounds := img.Bounds()
-	srcWidth := bounds.Max.X - bounds.Min.X
-	srcHeight := bounds.Max.Y - bounds.Min.Y
+	srcW := bounds.Max.X - bounds.Min.X
+	srcH := bounds.Max.Y - bounds.Min.Y
 
 	const size = 8
 	gray := make([][]uint32, size)
@@ -487,329 +515,43 @@ func ComputePHash(path string) (uint64, error) {
 	var total uint64
 	for y := 0; y < size; y++ {
 		for x := 0; x < size; x++ {
-			srcX := bounds.Min.X + (x * srcWidth / size)
-			srcY := bounds.Min.Y + (y * srcHeight / size)
+			srcX := bounds.Min.X + (x * srcW / size)
+			srcY := bounds.Min.Y + (y * srcH / size)
 			r, g, b, _ := img.At(srcX, srcY).RGBA()
-			luminance := (299*r + 587*g + 114*b) / 1000
-			gray[y][x] = luminance
-			total += uint64(luminance)
+			lum := (299*r + 587*g + 114*b) / 1000
+			gray[y][x] = lum
+			total += uint64(lum)
 		}
 	}
 
 	avg := total / (size * size)
-
 	var hash uint64
-	bitPosition := 0
+	bit := 0
 	for y := 0; y < size; y++ {
 		for x := 0; x < size; x++ {
 			if uint64(gray[y][x]) > avg {
-				hash |= 1 << uint(bitPosition)
+				hash |= 1 << uint(bit)
 			}
-			bitPosition++
+			bit++
 		}
 	}
-
 	return hash, nil
 }
 
 // =============================================================================
-// HashAllImagesWithContext — Parallel hashing with cancellation support
+// HammingDistance — Count differing bits between two 64-bit hashes
 // =============================================================================
 
-// HashAllImagesWithContext hashes all images using a cache-aware, single-read
-// pipeline. Each file is read at most once, and unchanged files are served
-// entirely from the persistent disk cache (zero I/O).
+// HammingDistance returns the number of bit positions where a and b differ.
+// For dHash values this measures how visually different two images are:
 //
-// Pipeline:
-//  1. Load persistent hash cache from disk
-//  2. os.Stat all files (for cache validation + progress)
-//  3. Workers call ComputeAllHashes (cache check → single read → xxHash + dHash)
-//  4. Save updated cache to disk
+//	0     — identical visual structure
+//	1-5   — very similar (resized / recompressed copy)
+//	6-10  — somewhat similar (same scene, different settings)
+//	>10   — probably different images
 //
-// The function signature is unchanged so server.go/grouper.go don't need changes.
-func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int, algorithm string) []ImageHash {
-	return HashAllImagesWithProgress(ctx, paths, numWorkers, algorithm, nil, nil)
-}
-
-// HashAllImagesWithProgress is the same as HashAllImagesWithContext but accepts
-// a ProgressCallback for reporting phase/progress updates to the UI, and a
-// list of scanPaths used to load/save the persistent hash cache.
-// The first scanPath is the "primary" — its cache file is where results are
-// saved. Additional scanPaths are loaded and merged in so that files from
-// previously-scanned directories get cache hits even in multi-folder scans.
-func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers int, algorithm string, progressFn ProgressCallback, scanPaths []string) []ImageHash {
-	if numWorkers <= 0 {
-		numWorkers = runtime.NumCPU()
-	}
-
-	totalImages := len(paths)
-	if totalImages == 0 {
-		return []ImageHash{}
-	}
-
-	// Helper to report progress (no-op if callback is nil).
-	reportProgress := func(phase string, current, total int) {
-		if progressFn != nil {
-			progressFn(phase, current, total)
-		}
-	}
-
-	fmt.Printf("[hasher] Starting cache-aware pipeline for %d images (%d workers, algorithm: %s)\n", totalImages, numWorkers, algorithm)
-
-	// =======================================================================
-	// Phase 1: Load persistent hash cache (merge from all scan paths)
-	// =======================================================================
-	phaseStart := time.Now()
-	reportProgress("Loading hash cache...", 0, totalImages)
-
-	// Load the primary cache (first scanPath), then merge entries from any
-	// additional scan paths. This ensures that files previously scanned in
-	// a different folder still get cache hits in multi-folder scans.
-	var cache *HashCache
-	if len(scanPaths) > 0 && scanPaths[0] != "" {
-		cache = LoadCache(scanPaths[0])
-		// Merge entries from additional scan path caches (extra folders).
-		for _, sp := range scanPaths[1:] {
-			if sp == "" {
-				continue
-			}
-			extra := LoadCache(sp)
-			for k, v := range extra.Entries {
-				// Only add entries not already in the primary cache
-				// (primary cache takes precedence if both have the same path).
-				if _, exists := cache.Entries[k]; !exists {
-					cache.Entries[k] = v
-				}
-			}
-			fmt.Printf("[hasher] Merged %d entries from extra cache (%s)\n", len(extra.Entries), sp)
-		}
-	} else {
-		cache = newEmptyCache()
-	}
-
-	fmt.Printf("[hasher] Cache loaded (%d total entries) → %.1fs\n", len(cache.Entries), time.Since(phaseStart).Seconds())
-
-	// =======================================================================
-	// Phase 2: os.Stat all files (needed for cache validation)
-	// =======================================================================
-	phaseStart = time.Now()
-	reportProgress("Reading file info...", 0, totalImages)
-
-	// fileInfo stores the os.FileInfo for each path.
-	fileInfo := make(map[string]os.FileInfo, totalImages)
-	var statCount atomic.Int32
-	var muInfo sync.Mutex
-
-	runParallel(ctx, paths, numWorkers, func(path string) {
-		info, err := os.Stat(path)
-		if err != nil {
-			return
-		}
-		muInfo.Lock()
-		fileInfo[path] = info
-		muInfo.Unlock()
-		cur := int(statCount.Add(1))
-		if cur%500 == 0 || cur == totalImages {
-			reportProgress("Reading file info...", cur, totalImages)
-		}
-	})
-
-	if ctx.Err() != nil {
-		return nil
-	}
-
-	fmt.Printf("[hasher] Phase 2 (stat): %d files → %.1fs\n", len(fileInfo), time.Since(phaseStart).Seconds())
-
-	// =======================================================================
-	// Phase 3: Compute hashes (cache-aware, single-read per file)
-	// =======================================================================
-	phaseStart = time.Now()
-
-	// Count cache hits vs misses for progress display.
-	var cacheHits, cacheMisses atomic.Int32
-
-	// Pre-scan to count how many will be cache hits (for progress message).
-	for _, path := range paths {
-		info, ok := fileInfo[path]
-		if !ok {
-			continue
-		}
-		if _, _, hit := cache.Lookup(path, info); hit {
-			cacheHits.Add(1)
-		} else {
-			cacheMisses.Add(1)
-		}
-	}
-	hits := int(cacheHits.Load())
-	misses := int(cacheMisses.Load())
-
-	phaseMsg := fmt.Sprintf("Computing fingerprints... (%d cached, %d to compute)", hits, misses)
-	reportProgress(phaseMsg, 0, totalImages)
-	fmt.Printf("[hasher] Cache: %d hits, %d misses\n", hits, misses)
-
-	// Reset counters for actual processing progress.
-	cacheHits.Store(0)
-	cacheMisses.Store(0)
-
-	// Build a path→index map for O(1) lookup (avoids linear scan per file).
-	pathIndex := make(map[string]int, totalImages)
-	for i, p := range paths {
-		pathIndex[p] = i
-	}
-
-	// Results are written into this slice (one per path, in order).
-	// Each index is written by exactly one goroutine, so no lock needed
-	// for the slice itself.
-	allResults := make([]ImageHash, totalImages)
-	var processedCount atomic.Int32
-	var muCache sync.Mutex
-
-	// Process each file: cache check → single read → compute hashes.
-	runParallel(ctx, paths, numWorkers, func(path string) {
-		idx := pathIndex[path]
-		result := ImageHash{Path: path}
-
-		info, ok := fileInfo[path]
-		if !ok {
-			result.Error = fmt.Errorf("could not stat file: %s", path)
-			allResults[idx] = result
-			return
-		}
-
-		// Check cache under lock (fast — just a map lookup).
-		muCache.Lock()
-		xxh, dh, wasHit := cache.Lookup(path, info)
-		muCache.Unlock()
-
-		if wasHit {
-			// Cache hit — no I/O needed at all!
-			result.XXHash = xxh
-			result.DHash = dh
-			cacheHits.Add(1)
-		} else {
-			// Cache miss — read file and compute hashes (no lock needed
-			// for file I/O, which is the slow part we want parallelized).
-			var err error
-			xxh, dh, _, err = ComputeAllHashes(path, info, cache, algorithm)
-			if err != nil {
-				result.Error = err
-			} else {
-				result.XXHash = xxh
-				result.DHash = dh
-			}
-			// Store result in cache under lock.
-			muCache.Lock()
-			cache.Store(path, info, xxh, dh)
-			muCache.Unlock()
-			cacheMisses.Add(1)
-		}
-
-		allResults[idx] = result
-
-		cur := int(processedCount.Add(1))
-		if cur%100 == 0 || cur == totalImages {
-			reportProgress(phaseMsg, cur, totalImages)
-		}
-	})
-
-	if ctx.Err() != nil {
-		return nil
-	}
-
-	fmt.Printf("[hasher] Phase 3 (hash): %d cache hits, %d computed → %.1fs\n",
-		int(cacheHits.Load()), int(cacheMisses.Load()), time.Since(phaseStart).Seconds())
-
-	// =======================================================================
-	// Phase 4: Save cache to disk
-	// =======================================================================
-	// Save the merged cache to the primary scan path's cache file.
-	// This means the primary cache now contains entries from all extra paths too,
-	// speeding up future re-scans with the same primary folder.
-	if len(scanPaths) > 0 && scanPaths[0] != "" {
-		reportProgress("Saving cache...", totalImages, totalImages)
-		if err := SaveCache(cache, scanPaths[0]); err != nil {
-			fmt.Printf("[hasher] Warning: failed to save cache: %v\n", err)
-		}
-	}
-
-	fmt.Printf("[hasher] Done! %d images hashed.\n", len(allResults))
-	return allResults
-}
-
-// runParallel executes fn for each item in paths using numWorkers goroutines.
-// It respects context cancellation — workers stop early if ctx is cancelled.
-// This is a reusable helper to avoid duplicating the worker-pool pattern
-// in every phase of the pipeline.
-func runParallel(ctx context.Context, paths []string, numWorkers int, fn func(string)) {
-	if len(paths) == 0 {
-		return
-	}
-
-	jobs := make(chan string, len(paths))
-	var wg sync.WaitGroup
-
-	// Start worker goroutines.
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for path := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
-				fn(path)
-			}
-		}()
-	}
-
-	// Send jobs, checking for cancellation.
-	for _, path := range paths {
-		if ctx.Err() != nil {
-			break
-		}
-		jobs <- path
-	}
-	close(jobs)
-
-	wg.Wait()
-}
-
-// HammingDistance computes the Hamming distance between two 64-bit integers.
-// The Hamming distance is the number of bit positions where the two values
-// differ. For dHash values:
-//
-//   - Distance 0:  The images have identical visual structure.
-//   - Distance 1-5: Very similar (probably the same photo, resized/recompressed).
-//   - Distance 6-10: Somewhat similar (maybe same scene, different angle).
-//   - Distance >10: Probably different images.
-//
-// HOW IT WORKS:
-//  1. XOR the two values. XOR produces a 1 bit wherever the inputs differ
-//     and a 0 bit wherever they match. So the XOR result has a 1 for every
-//     position where a and b are different.
-//  2. Count the number of 1 bits (called "popcount" or "population count").
-//     This gives us the total number of differing positions.
-//
-// Example:
-//
-//	a = 0b1010  (binary)
-//	b = 0b1100
-//	a ^ b = 0b0110  (two bits differ)
-//	popcount(0b0110) = 2
-//	So the Hamming distance is 2.
-//
-// Parameters:
-//   - a, b: Two 64-bit hash values to compare.
-//
-// Returns:
-//   - int: The number of differing bits (0 to 64).
+// Implementation: XOR the values (1 bit where they differ), then count the 1s
+// (popcount). bits.OnesCount64 maps to a single hardware POPCNT instruction.
 func HammingDistance(a, b uint64) int {
-	// "^" is the XOR (exclusive or) operator. It produces a 1 bit for every
-	// position where a and b differ.
-	xor := a ^ b
-
-	// bits.OnesCount64 counts the number of 1 bits in a uint64. This is also
-	// known as "popcount" (population count). Modern CPUs have a dedicated
-	// hardware instruction for this (POPCNT), so it's extremely fast.
-	return bits.OnesCount64(xor)
+	return bits.OnesCount64(a ^ b)
 }

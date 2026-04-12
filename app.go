@@ -88,8 +88,11 @@ func (a *App) StartScan(req ScanRequest) map[string]string {
 
 // runScan executes all scan phases and updates the global scanResult.
 // Runs as a goroutine launched by StartScan.
+//
+// Per-phase timing is printed to the console using the [perf] prefix so that
+// the performance improvement from each optimisation is easy to observe.
 func runScan(ctx context.Context, req ScanRequest) {
-	start := time.Now()
+	scanStart := time.Now()
 	log.Printf("[scan] Start: %s threshold=%d alg=%s", req.Path, req.Threshold, req.Algorithm)
 
 	// Build the extension filter map.
@@ -109,8 +112,22 @@ func runScan(ctx context.Context, req ScanRequest) {
 	}
 
 	// Phase 1: Walk the primary path.
+	// Use ConcurrentScanDirectory when no dimension or file-size filters are
+	// active (those require opening each file, so the concurrent walker hands
+	// off to ScanDirectoryFiltered which handles that correctly).
+	t0 := time.Now()
 	setPhase("Scanning directory...")
-	paths, err := ScanDirectoryFiltered(req.Path, allowedExts, req.MinWidth, req.MaxHeight, req.IncludeSubfolders, req.MinFileSize, req.MaxFileSize)
+
+	var paths []string
+	var err error
+	noExtraFilters := req.MinWidth == 0 && req.MaxHeight == 0 && req.MinFileSize == 0 && req.MaxFileSize == 0
+	if len(allowedExts) == 0 && noExtraFilters && req.IncludeSubfolders {
+		// Fast path: concurrent walker (#8) — best for NAS / network shares.
+		paths, err = ConcurrentScanDirectory(req.Path)
+	} else {
+		// Filtered path: sequential walker with per-file dimension / size checks.
+		paths, err = ScanDirectoryFiltered(req.Path, allowedExts, req.MinWidth, req.MaxHeight, req.IncludeSubfolders, req.MinFileSize, req.MaxFileSize)
+	}
 	if err != nil {
 		scanMutex.Lock()
 		scanResult.Status = "complete"
@@ -118,6 +135,7 @@ func runScan(ctx context.Context, req ScanRequest) {
 		scanMutex.Unlock()
 		return
 	}
+	log.Printf("[perf] Directory walk:   %.2fs  (%d files found)", time.Since(t0).Seconds(), len(paths))
 
 	// Merge extra paths (multi-folder scan).
 	for _, ep := range req.ExtraPaths {
@@ -148,12 +166,14 @@ func runScan(ctx context.Context, req ScanRequest) {
 		scanMutex.Lock()
 		scanResult.Status = "complete"
 		scanResult.Progress.Phase = "No images found"
-		scanResult.Stats = ScanStats{DurationMs: time.Since(start).Milliseconds()}
+		scanResult.Stats = ScanStats{DurationMs: time.Since(scanStart).Milliseconds()}
 		scanMutex.Unlock()
 		return
 	}
 
-	// Phase 2: Hash all images (updates progress via callback).
+	// Phase 2: Hash all images (the split pipeline in hasher_pipeline.go).
+	// The pipeline prints its own [perf] lines for each sub-phase.
+	t0 = time.Now()
 	allPaths := append([]string{req.Path}, req.ExtraPaths...)
 	hashes := HashAllImagesWithProgress(ctx, paths, runtime.NumCPU(), req.Algorithm,
 		func(phase string, cur, total int) {
@@ -168,10 +188,13 @@ func runScan(ctx context.Context, req ScanRequest) {
 		setScanCancelled()
 		return
 	}
+	log.Printf("[perf] Hash phase total: %.2fs", time.Since(t0).Seconds())
 
-	// Phase 3: Group duplicates.
+	// Phase 3: Group duplicates (parallel metadata + aspect-ratio BK-Trees).
+	t0 = time.Now()
 	setPhase("Grouping duplicates...")
 	groups := GroupDuplicates(hashes, req.Threshold)
+	log.Printf("[perf] Grouping:         %.2fs  (%d groups)", time.Since(t0).Seconds(), len(groups))
 
 	// Phase 4: Compute wasted bytes (all images except the first in each group).
 	var wastedBytes int64
@@ -183,7 +206,7 @@ func runScan(ctx context.Context, req ScanRequest) {
 		}
 	}
 
-	dur := time.Since(start)
+	dur := time.Since(scanStart)
 	scanMutex.Lock()
 	scanResult = ScanResult{
 		Status:   "complete",
@@ -197,6 +220,9 @@ func runScan(ctx context.Context, req ScanRequest) {
 		Groups: groups,
 	}
 	scanMutex.Unlock()
+
+	// Print the full summary matching the format from PERF-OPTIMISATION.
+	log.Printf("[perf] TOTAL:            %.2fs  (%d files, %d groups)", dur.Seconds(), totalFiles, len(groups))
 	log.Printf("[scan] Done: %d files, %d groups, took %v", totalFiles, len(groups), dur)
 }
 
