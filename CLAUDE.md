@@ -263,25 +263,53 @@ Expand/collapse toggles group ID in `state.expandedGroups` and re-renders that g
 
 ## 7. Design Tokens
 
-Dark navy/teal theme. Do not change values without a deliberate design decision.
+Light professional theme. Do not change values without a deliberate design decision.
 
 ```css
 :root {
-    --bg:           #0f1419;
-    --bg-card:      #1a2332;
-    --bg-hover:     #253345;
-    --border:       #2a3a4e;
-    --text:         #e2e8f0;
-    --muted:        #5a6a7a;
-    --accent:       #2dd4bf;    /* teal — primary accent */
-    --danger:       #ef4444;    /* red — delete actions */
-    --success:      #22c55e;    /* green — confirmations */
-    --warning:      #f59e0b;    /* amber — warnings */
-    --exact:        #8b5cf6;    /* purple — exact match badge */
-    --perceptual:   #06b6d4;    /* cyan — perceptual match badge */
-    --font: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+    /* Primary */
+    --primary:          #1A3A5C;   /* Deep blue — buttons, links, interactive */
+    --primary-light:    #4A90E2;   /* Sky blue — accents, active states */
+
+    /* Secondary */
+    --success:          #50C878;   /* Mint green — success, validation */
+
+    /* Neutrals */
+    --text:             #2D2D2D;   /* Dark grey — main text */
+    --text-light:       #6B6B6B;   /* Medium grey — secondary text */
+    --border:           #E0E0E0;   /* Light grey — borders */
+    --bg-subtle:        #F5F5F5;   /* Very light grey — subtle backgrounds */
+    --bg:               #FFFFFF;   /* White — main background */
+    --black:            #121212;   /* Deep black — headers */
+
+    /* Semantic */
+    --danger:           #E74C3C;   /* Red — delete, errors */
+    --warning:          #F5A623;   /* Orange — warnings, perceptual badge */
+    --exact:            #1A3A5C;   /* Deep blue — exact match badge */
+    --perceptual:       #F5A623;   /* Orange — perceptual match badge */
+    --original:         #50C878;   /* Green — "Original" badge */
+    --duplicate:        #E74C3C;   /* Red — "Duplicate" badge */
+
+    /* Typography */
+    --font:             'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+    /* Spacing (8px grid) */
+    --space-xs:         4px;
+    --space-sm:         8px;
+    --space-md:         16px;
+    --space-lg:         24px;
+    --space-xl:         32px;
+
+    /* Elements */
+    --radius:           8px;
+    --shadow:           0 2px 4px rgba(0,0,0,0.05);
+    --shadow-md:        0 4px 8px rgba(0,0,0,0.08);
+    --transition:       200ms ease;
 }
 ```
+
+`index.html` loads **Inter** via Google Fonts and **Feather Icons** via unpkg.
+`js/app.js` calls `feather.replace()` on init to activate icon sprites.
 
 ---
 
