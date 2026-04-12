@@ -39,12 +39,15 @@
 package main
 
 import (
+	"context"       // For context.Background() used in parallel metadata extraction.
 	"fmt"           // Formatted I/O.
 	"path/filepath" // For extracting filenames from paths.
 	"regexp"        // For extracting numeric suffixes from filenames.
+	"runtime"       // For runtime.NumCPU() — number of parallel workers.
 	"sort"          // Sorting algorithms.
 	"strconv"       // For converting strings to numbers.
 	"strings"       // For string manipulation.
+	"sync"          // For sync.Mutex used to protect metaMap during parallel writes.
 
 	// uuid generates random UUIDs (Universally Unique Identifiers).
 	// A UUID looks like "550e8400-e29b-41d4-a716-446655440000".
@@ -391,7 +394,7 @@ func GroupDuplicates(hashes []ImageHash, threshold int) []DuplicateGroup {
 	//
 	// Time complexity: O(n) — we just iterate through all hashes once.
 
-	fmt.Println("[grouper] Pass 1: Finding exact duplicates (same xxHash)...")
+	fmt.Println("[grouper] Pass 1a: Bucketing exact duplicates (same xxHash)...")
 
 	// xxHashMap maps each xxHash value to a slice of ImageHash structs that
 	// share that hash. If two files are byte-identical, their xxHash will
@@ -407,46 +410,24 @@ func GroupDuplicates(hashes []ImageHash, threshold int) []DuplicateGroup {
 		xxHashMap[h.XXHash] = append(xxHashMap[h.XXHash], h)
 	}
 
-	// Now check each xxHash bucket. If a bucket has >1 images, they're exact
-	// duplicates.
+	// Mark all paths that are in exact-duplicate buckets so Pass 2 can skip
+	// them. We do this NOW (before Pass 2 builds the BK-Tree) because Pass 2
+	// reads exactGrouped to exclude already-grouped images.
+	//
+	// We do NOT build the DuplicateGroup structs yet — that happens after
+	// parallel metadata extraction below.
+	exactGroupCount := 0
 	for _, bucket := range xxHashMap {
 		if len(bucket) < 2 {
-			// Only one image with this hash — no duplicates.
 			continue
 		}
-
-		// We found exact duplicates! Create a group for them.
-		group := DuplicateGroup{
-			ID:         uuid.New().String(), // Generate a random UUID.
-			MatchType:  "exact",
-			Confidence: 100.0, // Byte-identical = 100% confident.
-		}
-
-		// Extract metadata for each image in the group and mark them as
-		// grouped so we don't re-group them in pass 2.
 		for _, h := range bucket {
-			meta := ExtractMetadata(h.Path)
-			group.Images = append(group.Images, meta)
 			exactGrouped[h.Path] = true
 		}
-
-		// Sort images within the group by quality score (highest first).
-		// sort.Slice sorts in-place using a custom comparison function.
-		// The function returns true if Images[i] should come before Images[j].
-		sort.Slice(group.Images, func(i, j int) bool {
-			return group.Images[i].QualityScore > group.Images[j].QualityScore
-		})
-
-		// Mark the first image (highest quality) as the "best" — the one
-		// we recommend keeping.
-		if len(group.Images) > 0 {
-			group.Images[0].IsBest = true
-		}
-
-		groups = append(groups, group)
+		exactGroupCount++
 	}
 
-	fmt.Printf("[grouper] Pass 1 complete: found %d exact duplicate groups.\n", len(groups))
+	fmt.Printf("[grouper] Pass 1a complete: found %d exact duplicate buckets.\n", exactGroupCount)
 
 	// =========================================================================
 	// PASS 2: Perceptual duplicates (similar dHash via BK-Tree)
@@ -530,6 +511,106 @@ func GroupDuplicates(hashes []ImageHash, threshold int) []DuplicateGroup {
 		perceptualGroups[root] = append(perceptualGroups[root], h.Path)
 	}
 
+	// =========================================================================
+	// Parallel metadata extraction
+	// =========================================================================
+	//
+	// At this point we know exactly which paths will appear in duplicate groups
+	// (exact buckets with 2+ files, perceptual groups with 2+ files). We collect
+	// them all and extract their metadata concurrently across all CPU cores.
+	//
+	// WHY HERE: Both exact and perceptual grouping are now complete, so we know
+	// the full set of paths that need metadata. Running all extractions in
+	// parallel (instead of serially inside each group-building loop) is the
+	// key performance win of this optimization.
+
+	// Collect all unique paths that need metadata.
+	// We use a "seen" map to avoid duplicates (a path can only be in one group,
+	// but we build this defensively in case logic ever changes).
+	var allDupPaths []string
+	seen := make(map[string]bool)
+
+	// Exact-duplicate paths.
+	for _, bucket := range xxHashMap {
+		if len(bucket) < 2 {
+			continue
+		}
+		for _, h := range bucket {
+			if !seen[h.Path] {
+				allDupPaths = append(allDupPaths, h.Path)
+				seen[h.Path] = true
+			}
+		}
+	}
+
+	// Perceptual-duplicate paths.
+	for _, paths := range perceptualGroups {
+		if len(paths) < 2 {
+			continue
+		}
+		for _, path := range paths {
+			if !seen[path] {
+				allDupPaths = append(allDupPaths, path)
+				seen[path] = true
+			}
+		}
+	}
+
+	// Run ExtractMetadata in parallel. Each worker writes into metaMap under
+	// a mutex. Reading is done only after runParallel returns (no races).
+	metaMap := make(map[string]ImageMetadata, len(allDupPaths))
+	var muMeta sync.Mutex
+
+	fmt.Printf("[grouper] Extracting metadata for %d duplicate images in parallel (%d workers)...\n",
+		len(allDupPaths), runtime.NumCPU())
+
+	runParallel(context.Background(), allDupPaths, runtime.NumCPU(), func(path string) {
+		meta := ExtractMetadata(path)
+		muMeta.Lock()
+		metaMap[path] = meta
+		muMeta.Unlock()
+	})
+
+	// =========================================================================
+	// Pass 1b: Build exact DuplicateGroup structs using pre-computed metadata
+	// =========================================================================
+
+	for _, bucket := range xxHashMap {
+		if len(bucket) < 2 {
+			continue
+		}
+
+		group := DuplicateGroup{
+			ID:         uuid.New().String(), // Generate a random UUID.
+			MatchType:  "exact",
+			Confidence: 100.0, // Byte-identical = 100% confident.
+		}
+
+		// Look up pre-computed metadata from metaMap (no file I/O here).
+		for _, h := range bucket {
+			group.Images = append(group.Images, metaMap[h.Path])
+		}
+
+		// Sort images within the group by quality score (highest first).
+		sort.Slice(group.Images, func(i, j int) bool {
+			return group.Images[i].QualityScore > group.Images[j].QualityScore
+		})
+
+		// Mark the first image (highest quality) as the "best" — the one
+		// we recommend keeping.
+		if len(group.Images) > 0 {
+			group.Images[0].IsBest = true
+		}
+
+		groups = append(groups, group)
+	}
+
+	fmt.Printf("[grouper] Pass 1b complete: built %d exact duplicate groups.\n", exactGroupCount)
+
+	// =========================================================================
+	// Pass 2b: Build perceptual DuplicateGroup structs using pre-computed metadata
+	// =========================================================================
+
 	// Step 2d: Build DuplicateGroup structs for groups with 2+ images.
 	perceptualCount := 0
 	for root, paths := range perceptualGroups {
@@ -552,10 +633,9 @@ func GroupDuplicates(hashes []ImageHash, threshold int) []DuplicateGroup {
 			Confidence: confidence,
 		}
 
-		// Extract metadata for each image in the group.
+		// Look up pre-computed metadata from metaMap (no file I/O here).
 		for _, path := range paths {
-			meta := ExtractMetadata(path)
-			group.Images = append(group.Images, meta)
+			group.Images = append(group.Images, metaMap[path])
 		}
 
 		// Sort by quality score descending (best first).
@@ -572,7 +652,7 @@ func GroupDuplicates(hashes []ImageHash, threshold int) []DuplicateGroup {
 		perceptualCount++
 	}
 
-	fmt.Printf("[grouper] Pass 2 complete: found %d perceptual duplicate groups.\n", perceptualCount)
+	fmt.Printf("[grouper] Pass 2b complete: built %d perceptual duplicate groups.\n", perceptualCount)
 
 	// =========================================================================
 	// PASS 3: Detect "series" (burst/rafale) groups among perceptual matches

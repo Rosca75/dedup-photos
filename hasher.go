@@ -736,43 +736,7 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 	return allResults
 }
 
-// runParallel executes fn for each item in paths using numWorkers goroutines.
-// It respects context cancellation — workers stop early if ctx is cancelled.
-// This is a reusable helper to avoid duplicating the worker-pool pattern
-// in every phase of the pipeline.
-func runParallel(ctx context.Context, paths []string, numWorkers int, fn func(string)) {
-	if len(paths) == 0 {
-		return
-	}
-
-	jobs := make(chan string, len(paths))
-	var wg sync.WaitGroup
-
-	// Start worker goroutines.
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for path := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
-				fn(path)
-			}
-		}()
-	}
-
-	// Send jobs, checking for cancellation.
-	for _, path := range paths {
-		if ctx.Err() != nil {
-			break
-		}
-		jobs <- path
-	}
-	close(jobs)
-
-	wg.Wait()
-}
+// runParallel is defined in parallel.go (shared with grouper.go).
 
 // HammingDistance computes the Hamming distance between two 64-bit integers.
 // The Hamming distance is the number of bit positions where the two values
