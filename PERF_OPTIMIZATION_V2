@@ -1,0 +1,576 @@
+# PERF_OPTIMIZATION_V2.md — Series Detection Overhaul + Grouping Performance Fix
+
+> **Purpose:** Step-by-step Claude Code implementation plan.
+> **Branch:** `preview`
+> **Constraints:** No CGo, no ImageMagick, no external binary deps. Heavily commented Go code.
+> Execute each section in order. Run `go build ./...` after each.
+
+---
+
+## Diagnosis — Where the Time Actually Goes
+
+Real-world logs on Z: drive (USB/external) reveal the **grouping phase is the #1 bottleneck**, not hashing:
+
+| Phase | Scan 1 (2 812 files) | Scan 2 (5 777 files) | % of total (Scan 2) |
+|-------|---------------------|---------------------|---------------------|
+| Directory walk | 0.63 s | 4.54 s | 0.7% |
+| File stat | 1.41 s | 1.93 s | 0.3% |
+| Hashing (3a+3b) | 65.98 s | 156.34 s | 23% |
+| **Grouping** | **108.11 s** | **515.68 s** | **76%** |
+| **Total** | **178.93 s** | **676.55 s** | |
+
+### Root cause: `ExtractMetadata` opens each file 3 times on a slow drive
+
+`ExtractMetadata` (called for every image in every duplicate group) performs:
+1. `os.Stat(path)` — 1 file open
+2. `os.Open(path)` + `image.DecodeConfig` — 2nd file open (for dimensions)
+3. `os.Open(path)` + `exif.Decode` — 3rd file open (for EXIF data)
+
+On SSD this takes ~8 ms/file. On USB/NAS (Z: drive), each open costs ~50 ms,
+so it's ~173 ms/file. For 2 972 metadata files in Scan 2: **2 972 × 173 ms ≈ 514 s**.
+
+### Second root cause: Too many files in perceptual groups
+
+Scan 2 has 2 972 files across only 121 groups = **24.6 files/group average**.
+Many of these are burst/series shots (same scene, same second, sequential filenames)
+that the current series detector misses because it requires **strictly consecutive**
+filenames (gap ≤ 1). iPhone naming sometimes skips numbers
+(IMG_4446, IMG_4448, IMG_4450) which breaks the gap=1 rule.
+
+---
+
+## Change Request #1 — Improved Series Detection
+
+### Current algorithm (in `isSeriesGroup`, grouper.go lines 466-506):
+- Requires all filenames to share the same prefix
+- Requires numeric suffixes to be **strictly consecutive** (gap ≤ 1)
+- Only checks filenames, ignores EXIF timestamps and camera info
+- Only activates on groups with confidence ≥ 95%
+
+### New algorithm — Two independent criteria (either triggers "series"):
+
+**Criterion A — Filename sequential (relaxed):**
+- Same filename prefix (case-insensitive)
+- Numeric suffixes sorted: max gap ≤ 5 (not 1)
+- This catches IMG_4446, IMG_4448, IMG_4450, IMG_4451
+
+**Criterion B — Time+Camera proximity (new):**
+- All files have the same EXIF camera make+model
+- All files have EXIF DateTimeOriginal within 60 seconds of each other
+- This catches bursts where filenames don't follow a pattern
+
+Either criterion A OR B triggers "series" classification.
+
+### Implementation
+
+#### Step 1: Add `IncludeSeries` field to `ScanRequest` (server.go)
+
+```go
+type ScanRequest struct {
+    // ... existing fields ...
+    IncludeSeries     bool     `json:"include_series"`      // Include burst/series groups in results.
+}
+```
+
+#### Step 2: Pass `IncludeSeries` through to `GroupDuplicates` (app.go)
+
+Change `GroupDuplicates(hashes, req.Threshold)` to:
+```go
+GroupDuplicates(hashes, req.Threshold, req.IncludeSeries)
+```
+
+Update the `GroupDuplicates` signature in grouper.go:
+```go
+func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []DuplicateGroup {
+```
+
+#### Step 3: Rewrite `isSeriesGroup` in grouper.go
+
+Replace the current `isSeriesGroup(images []ImageMetadata) bool` with a two-criterion version:
+
+```go
+// isSeriesGroup returns true when images form a burst/series sequence.
+//
+// Two independent criteria (either one is sufficient):
+//
+// Criterion A — Filename sequential (relaxed):
+//   All filenames share the same prefix with numeric suffixes.
+//   Max gap between sorted consecutive suffixes ≤ 5.
+//   (Catches IMG_4446, IMG_4448, IMG_4450, IMG_4451)
+//
+// Criterion B — Time + Camera proximity:
+//   All files have the same camera make+model (non-empty).
+//   All EXIF DateTimeOriginal values fall within a 60-second window.
+//   (Catches bursts with any naming scheme)
+func isSeriesGroup(images []ImageMetadata) bool {
+    if len(images) < 2 {
+        return false
+    }
+
+    // --- Criterion B: Time + Camera proximity (check first, cheaper) ---
+    if isTimeCameraSeries(images) {
+        return true
+    }
+
+    // --- Criterion A: Filename sequential (relaxed gap) ---
+    return isFilenameSeries(images)
+}
+```
+
+Create two helper functions:
+
+```go
+// isTimeCameraSeries checks if all images share the same camera and were
+// taken within 60 seconds of each other (EXIF DateTimeOriginal).
+func isTimeCameraSeries(images []ImageMetadata) bool {
+    // 1. Check all have non-empty Camera and DateTaken fields.
+    // 2. Check all Camera values are identical.
+    // 3. Parse all DateTaken strings to time.Time.
+    // 4. Find min and max timestamps.
+    // 5. Return true if (max - min) <= 60 seconds.
+    //
+    // If any image lacks Camera or DateTaken, return false (can't confirm burst).
+    
+    if images[0].Camera == "" || images[0].DateTaken == "" {
+        return false
+    }
+    
+    refCamera := images[0].Camera
+    var times []time.Time
+    
+    for _, img := range images {
+        if img.Camera != refCamera {
+            return false // Different cameras → not a burst
+        }
+        if img.DateTaken == "" {
+            return false
+        }
+        t, err := time.Parse("2006-01-02T15:04:05", img.DateTaken)
+        if err != nil {
+            return false
+        }
+        times = append(times, t)
+    }
+    
+    // Find time window.
+    minT, maxT := times[0], times[0]
+    for _, t := range times[1:] {
+        if t.Before(minT) { minT = t }
+        if t.After(maxT)  { maxT = t }
+    }
+    
+    return maxT.Sub(minT) <= 60*time.Second
+}
+
+// isFilenameSeries checks if filenames share a common prefix with numeric
+// suffixes that are near-consecutive (max gap ≤ 5).
+func isFilenameSeries(images []ImageMetadata) bool {
+    type parsed struct {
+        prefix string
+        number int
+    }
+    var items []parsed
+
+    for _, img := range images {
+        base := filepath.Base(img.Path)
+        stem := strings.TrimSuffix(base, filepath.Ext(base))
+        m := numericSuffixRegex.FindStringSubmatch(stem)
+        if m == nil {
+            return false
+        }
+        num, err := strconv.Atoi(m[2])
+        if err != nil {
+            return false
+        }
+        items = append(items, parsed{prefix: strings.ToLower(m[1]), number: num})
+    }
+
+    // All must share the same prefix.
+    for i := 1; i < len(items); i++ {
+        if items[i].prefix != items[0].prefix {
+            return false
+        }
+    }
+
+    // Sorted suffixes must have max gap ≤ 5.
+    sort.Slice(items, func(i, j int) bool { return items[i].number < items[j].number })
+    for i := 1; i < len(items); i++ {
+        gap := items[i].number - items[i-1].number
+        if gap < 0 || gap > 5 {
+            return false
+        }
+    }
+    return true
+}
+```
+
+Add `"time"` to the import list in grouper.go.
+
+#### Step 4: Filter out series groups when `IncludeSeries=false`
+
+In `GroupDuplicates`, after `detectSeriesGroups(groups)`, add:
+
+```go
+// If the user opted out of series groups, remove them from results.
+// This saves the frontend from rendering large burst groups and keeps
+// the results focused on actual duplicates.
+if !includeSeries {
+    filtered := groups[:0] // Reuse the underlying slice.
+    for _, g := range groups {
+        if g.MatchType != "series" {
+            filtered = append(filtered, g)
+        }
+    }
+    groups = filtered
+    fmt.Printf("[grouper] Filtered out series groups. Remaining: %d groups.\n", len(groups))
+}
+```
+
+#### Step 5: Add the UI toggle (frontend)
+
+In `static/index.html`, add a checkbox in the settings area (after the normalised-size select, around line 83):
+
+```html
+<div class="topbar-field">
+  <label class="checkbox-label">
+    <input type="checkbox" id="setting-include-series">
+    Include burst/series
+  </label>
+</div>
+```
+
+In `static/js/scan.js`, read the checkbox and add it to the API call:
+
+```javascript
+const includeSeries = document.getElementById('setting-include-series').checked;
+```
+
+Add `include_series: includeSeries` to the `apiScan({...})` call object.
+
+---
+
+## Change Request #2 — Performance Improvements
+
+### Optimization A — Single-Open ExtractMetadata (biggest win: ~3× faster)
+
+**Impact: Reduces grouping from 515s to ~170s on Scan 2 (saves ~345s)**
+
+The current `ExtractMetadata` opens the file 3 separate times. On a slow Z: drive,
+each open costs ~50ms. Replace with a single-open approach:
+
+#### Implementation in metadata.go
+
+Create a new function `ExtractMetadataFast` that:
+1. Opens the file **once**
+2. Reads the first 128 KB into a buffer
+3. Extracts EXIF from the buffer (no second open)
+4. Accepts pre-computed Width/Height/Size (from ImageHash) to skip DecodeConfig entirely
+
+```go
+// ExtractMetadataFast is a faster version of ExtractMetadata that opens the
+// file only ONCE and accepts pre-computed dimensions. On USB/NAS drives where
+// each file open costs ~50ms, this is 3× faster than the original which opens
+// the file 3 times (stat + DecodeConfig + EXIF).
+//
+// Parameters:
+//   - path:   Absolute file path.
+//   - width:  Pre-computed image width (0 if unknown → will try DecodeConfig).
+//   - height: Pre-computed image height (0 if unknown).
+//   - size:   Pre-computed file size in bytes (0 → will call os.Stat).
+func ExtractMetadataFast(path string, width, height int, size int64) ImageMetadata {
+    meta := ImageMetadata{
+        Path:     path,
+        Filename: filepath.Base(path),
+        Width:    width,
+        Height:   height,
+        Size:     size,
+    }
+
+    // Step 1: If size is missing, stat the file.
+    if meta.Size == 0 {
+        if info, err := os.Stat(path); err == nil {
+            meta.Size = info.Size()
+        }
+    }
+
+    // Step 2: Single file open → read first 128KB → extract everything.
+    f, err := os.Open(path)
+    if err != nil {
+        // Can't open → compute quality from what we have and return.
+        meta.QualityScore = computeQualityScore(meta)
+        return meta
+    }
+
+    buf := make([]byte, 128*1024)
+    n, _ := io.ReadFull(f, buf)
+    f.Close() // Close immediately — we have the bytes we need.
+
+    if n == 0 {
+        meta.QualityScore = computeQualityScore(meta)
+        return meta
+    }
+    buf = buf[:n]
+
+    // Step 3: If dimensions are missing, try DecodeConfig from buffer.
+    if meta.Width == 0 || meta.Height == 0 {
+        if cfg, _, err := image.DecodeConfig(bytes.NewReader(buf)); err == nil {
+            meta.Width = cfg.Width
+            meta.Height = cfg.Height
+        }
+    }
+
+    // Step 4: Extract EXIF from buffer (no second file open!).
+    exifData, exifErr := exif.Decode(bytes.NewReader(buf))
+    if exifErr == nil {
+        // DateTimeOriginal
+        if dt, err := exifData.DateTime(); err == nil {
+            meta.DateTaken = dt.Format("2006-01-02T15:04:05")
+        }
+        // GPS
+        if lat, lon, err := exifData.LatLong(); err == nil {
+            meta.GPSLat = lat
+            meta.GPSLon = lon
+        }
+        // Camera
+        cameraMake := getExifString(exifData, exif.Make)
+        cameraModel := getExifString(exifData, exif.Model)
+        meta.Camera = strings.TrimSpace(cameraMake + " " + cameraModel)
+        // Lens
+        meta.Lens = getExifString(exifData, exif.LensModel)
+        // ISO
+        if isoTag, err := exifData.Get(exif.ISOSpeedRatings); err == nil {
+            if v, err := isoTag.Int(0); err == nil {
+                meta.ISO = v
+            }
+        }
+        // Focal length
+        if focalTag, err := exifData.Get(exif.FocalLength); err == nil {
+            if num, den, err := focalTag.Rat2(0); err == nil && den != 0 {
+                meta.FocalLength = fmt.Sprintf("%.1fmm", float64(num)/float64(den))
+            }
+        }
+        // Description
+        meta.Description = getExifString(exifData, exif.ImageDescription)
+    }
+
+    // Step 5: Compute quality score (same logic as original, uses all collected fields).
+    meta.QualityScore = computeQualityScore(meta)
+    return meta
+}
+```
+
+Add `"bytes"` and `"io"` to metadata.go imports.
+
+You need to refactor `computeQualityScore` as a standalone function extracted from
+the current quality-score section of `ExtractMetadata` (around lines 250-380).
+The logic is identical — just accept an `ImageMetadata` and return an `int`.
+
+#### Update `parallelExtractMetadata` in grouper.go
+
+Change to pass pre-computed dimensions from the ImageHash:
+
+```go
+func parallelExtractMetadata(ctx context.Context, paths []string, hashMap map[string]ImageHash) map[string]ImageMetadata {
+    metaMap := make(map[string]ImageMetadata, len(paths))
+    var mu sync.Mutex
+    runParallel(ctx, paths, runtime.NumCPU(), func(path string) {
+        h := hashMap[path]
+        meta := ExtractMetadataFast(path, h.Width, h.Height, h.Size)
+        mu.Lock()
+        metaMap[path] = meta
+        mu.Unlock()
+    })
+    return metaMap
+}
+```
+
+Build a `hashMap` from the `[]ImageHash` slice in `GroupDuplicates`:
+
+```go
+// Build a quick lookup from path → ImageHash for pre-computed dimensions.
+hashMap := make(map[string]ImageHash, len(hashes))
+for _, h := range hashes {
+    hashMap[h.Path] = h
+}
+```
+
+Pass `hashMap` to `parallelExtractMetadata`:
+```go
+metaMap := parallelExtractMetadata(context.Background(), allPaths, hashMap)
+```
+
+Update `GroupDuplicates` signature to also receive hashMap or build it inside.
+
+### Optimization B — Early Series Detection (skip metadata for series when excluded)
+
+**Impact: If 50% of perceptual groups are series and IncludeSeries=false, saves ~257s on Scan 2**
+
+Currently, `detectSeriesGroups` runs AFTER all metadata has been extracted. If the user
+doesn't want series, we're doing expensive metadata extraction for nothing.
+
+#### New approach: detect series BEFORE expensive metadata extraction
+
+After the BK-Tree pass (Pass 2) but BEFORE `parallelExtractMetadata`:
+
+1. For each perceptual group with confidence ≥ 95%, do a **lightweight series check**
+   using only filename pattern matching (Criterion A — no file I/O needed).
+2. If `IncludeSeries=false`, remove detected series groups from the metadata list entirely.
+3. The remaining groups still go through full metadata extraction.
+4. After metadata extraction, run the full `isSeriesGroup` (including Criterion B,
+   time+camera) on remaining high-confidence groups.
+
+```go
+// In GroupDuplicates, after findPerceptualPaths, BEFORE parallelExtractMetadata:
+
+if !includeSeries {
+    // Lightweight pre-filter: remove filename-sequential groups before metadata extraction.
+    // This avoids opening thousands of series files on slow drives.
+    for root, paths := range percGroups {
+        if len(paths) < 2 {
+            continue
+        }
+        // Quick filename-only check (no file I/O).
+        if percMinDist[root] <= 3 { // High confidence = likely series
+            if isFilenameSeriesFromPaths(paths) {
+                delete(percGroups, root) // Remove from perceptual groups entirely.
+            }
+        }
+    }
+    fmt.Printf("[grouper] Pre-filtered series groups. Remaining perceptual: %d\n", len(percGroups))
+}
+```
+
+Create `isFilenameSeriesFromPaths` that works directly on paths (no ImageMetadata needed):
+
+```go
+// isFilenameSeriesFromPaths checks if a list of file paths have sequential
+// filenames (relaxed gap ≤ 5). This is a lightweight check that requires no
+// file I/O — it only looks at the path strings.
+func isFilenameSeriesFromPaths(paths []string) bool {
+    if len(paths) < 2 {
+        return false
+    }
+    type parsed struct {
+        prefix string
+        number int
+    }
+    var items []parsed
+    for _, p := range paths {
+        base := filepath.Base(p)
+        stem := strings.TrimSuffix(base, filepath.Ext(base))
+        m := numericSuffixRegex.FindStringSubmatch(stem)
+        if m == nil {
+            return false
+        }
+        num, err := strconv.Atoi(m[2])
+        if err != nil {
+            return false
+        }
+        items = append(items, parsed{prefix: strings.ToLower(m[1]), number: num})
+    }
+    // All same prefix.
+    for i := 1; i < len(items); i++ {
+        if items[i].prefix != items[0].prefix {
+            return false
+        }
+    }
+    // Sorted suffixes: max gap ≤ 5.
+    sort.Slice(items, func(i, j int) bool { return items[i].number < items[j].number })
+    for i := 1; i < len(items); i++ {
+        if gap := items[i].number - items[i-1].number; gap < 0 || gap > 5 {
+            return false
+        }
+    }
+    return true
+}
+```
+
+### Optimization C — Reduce Perceptual Hash I/O (Phase 3b buffer reuse)
+
+**Impact: Moderate (saves ~10-15s on Scan 2)**
+
+In `computeDHashFromHeader`, each call allocates a fresh 128 KB buffer:
+```go
+buf := make([]byte, 128*1024) // line 430
+```
+
+Replace with a `sync.Pool` of 128 KB buffers (similar to the existing `bufPool` for 64 KB):
+
+```go
+// headerBufPool holds reusable 128 KB buffers for computeDHashFromHeader.
+var headerBufPool = sync.Pool{
+    New: func() interface{} {
+        buf := make([]byte, 128*1024)
+        return &buf
+    },
+}
+```
+
+In `computeDHashFromHeader`:
+```go
+bufPtr := headerBufPool.Get().(*[]byte)
+buf := *bufPtr
+n, _ := io.ReadFull(f, buf)
+f.Close()
+// ... use buf[:n] ...
+// At the end (all return paths), put buffer back:
+headerBufPool.Put(bufPtr)
+```
+
+This eliminates ~6000 allocations of 128 KB each, reducing GC pressure significantly.
+
+---
+
+## Implementation Order
+
+```
+1. Optimization A — ExtractMetadataFast (single file open)     [biggest win]
+2. CR #1 — Improved isSeriesGroup (relaxed gap + time+camera)  [correctness]
+3. CR #1 — IncludeSeries parameter (frontend + backend)        [feature]
+4. Optimization B — Early series pre-filter                    [perf + feature]
+5. Optimization C — headerBufPool in computeDHashFromHeader    [small perf win]
+```
+
+Dependencies: Step 2 needs Step 1 (metadata has Camera/DateTaken). Step 4 needs Steps 2+3.
+
+---
+
+## Estimated Impact
+
+| Scenario | Before | After (est.) | Speedup |
+|----------|--------|-------------|---------|
+| Scan 2 (5777 files, IncludeSeries=true) | 676s | ~310s | 2.2× |
+| Scan 2 (5777 files, IncludeSeries=false) | 676s | ~180s | 3.8× |
+| Scan 1 (2812 files, IncludeSeries=true) | 179s | ~85s | 2.1× |
+| Scan 1 (2812 files, IncludeSeries=false) | 179s | ~55s | 3.3× |
+
+The biggest single gain comes from ExtractMetadataFast (single open instead of 3 on Z: drive).
+The IncludeSeries=false option compounds with it by skipping metadata entirely for burst groups.
+
+---
+
+## Testing Checklist
+
+- [ ] `go build ./...` succeeds.
+- [ ] Sample images (IMG_1366–1369): detected as "series" (same camera, same second).
+- [ ] Files with gaps (IMG_4446, IMG_4448, IMG_4450): detected as "series" (gap ≤ 5).
+- [ ] IncludeSeries=false: series groups are absent from results.
+- [ ] IncludeSeries=true: series groups appear with "Series" badge.
+- [ ] Console [perf] timing shows grouping time reduction.
+- [ ] Exact duplicates and non-series perceptual duplicates still detected correctly.
+- [ ] `go build -race ./...` passes without data race warnings.
+- [ ] Checkbox default is unchecked (series excluded by default for performance).
+
+---
+
+## Files Modified
+
+| File | Changes |
+|------|---------|
+| `server.go` | Add `IncludeSeries` to `ScanRequest` |
+| `app.go` | Pass `req.IncludeSeries` to `GroupDuplicates` |
+| `metadata.go` | Add `ExtractMetadataFast`, refactor `computeQualityScore` as standalone fn |
+| `grouper.go` | New `isTimeCameraSeries`, `isFilenameSeries`, `isFilenameSeriesFromPaths`; update `GroupDuplicates` sig; early series pre-filter; update `parallelExtractMetadata` to use fast path |
+| `hasher.go` | Add `headerBufPool`; update `computeDHashFromHeader` to use pool |
+| `static/index.html` | Add "Include burst/series" checkbox |
+| `static/js/scan.js` | Read checkbox, pass `include_series` in API call |
