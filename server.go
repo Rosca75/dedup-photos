@@ -95,6 +95,7 @@ type ScanRequest struct {
 	MinFileSize       int64    `json:"min_file_size"`       // Minimum file size in bytes.
 	MaxFileSize       int64    `json:"max_file_size"`       // Maximum file size in bytes.
 	ExtraPaths        []string `json:"extra_paths"`         // Additional directories to scan.
+	IncludeSeries     bool     `json:"include_series"`      // Include burst/series groups in results.
 }
 
 // ReportMismatchRequest is the argument to ReportMismatch().

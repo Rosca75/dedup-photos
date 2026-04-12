@@ -110,6 +110,16 @@ var bufPool = sync.Pool{
 	},
 }
 
+// headerBufPool holds reusable 128 KB buffers for computeDHashFromHeader.
+// This eliminates ~6000 allocations of 128 KB each when hashing thousands of
+// files, significantly reducing GC pressure (Optimization C).
+var headerBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 128*1024) // 128 KB
+		return &buf
+	},
+}
+
 // =============================================================================
 // formatsNeedingFullDecode — Extensions where Go can fully decode the image
 // but no EXIF thumbnail is embedded. computeDHashFromHeader falls back to a
@@ -423,17 +433,24 @@ func computeDHashFromHeader(path, algorithm string) (dHash uint64, width, height
 
 	// Read the first 128 KB. io.ReadFull returns io.ErrUnexpectedEOF if the
 	// file is shorter — that's fine, we use whatever bytes we got.
+	// Borrow a 128 KB buffer from the pool to avoid per-call allocation
+	// (Optimization C — reduces GC pressure for thousands of files).
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, 0, 0, ErrNoThumbnail
 	}
-	buf := make([]byte, 128*1024)
+	bufPtr := headerBufPool.Get().(*[]byte)
+	buf := *bufPtr
 	n, _ := io.ReadFull(f, buf)
 	f.Close()
 	if n == 0 {
+		headerBufPool.Put(bufPtr)
 		return 0, 0, 0, ErrNoThumbnail
 	}
 	buf = buf[:n]
+	// Return the buffer to the pool when we're done with it.
+	// defer is safe here — all remaining code paths only read from buf.
+	defer headerBufPool.Put(bufPtr)
 
 	// Extract image dimensions from the header bytes (DecodeConfig is header-only).
 	if cfg, _, decErr := image.DecodeConfig(bytes.NewReader(buf)); decErr == nil {
