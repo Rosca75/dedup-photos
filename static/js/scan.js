@@ -44,6 +44,7 @@ function startScan() {
   const maxFileSize = (parseInt(document.getElementById('setting-max-filesize').value, 10) || 0) * 1024 * 1024;
 
   const includeSubfolders = window._includeSubfolders !== false;
+  const includeSeries = document.getElementById('setting-include-series').checked;
 
   const extensions = [];
   document.querySelectorAll('.topbar-extensions .ext-grid input[type="checkbox"]:checked')
@@ -65,6 +66,7 @@ function startScan() {
     min_width: maxWidth, max_height: maxHeight,
     normalised_size: normalisedSize,
     include_subfolders: includeSubfolders,
+    include_series: includeSeries,
     min_file_size: minFileSize,
     max_file_size: maxFileSize
   })

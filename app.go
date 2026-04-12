@@ -193,7 +193,7 @@ func runScan(ctx context.Context, req ScanRequest) {
 	// Phase 3: Group duplicates (parallel metadata + aspect-ratio BK-Trees).
 	t0 = time.Now()
 	setPhase("Grouping duplicates...")
-	groups := GroupDuplicates(hashes, req.Threshold)
+	groups := GroupDuplicates(hashes, req.Threshold, req.IncludeSeries)
 	log.Printf("[perf] Grouping:         %.2fs  (%d groups)", time.Since(t0).Seconds(), len(groups))
 
 	// Phase 4: Compute wasted bytes (all images except the first in each group).
