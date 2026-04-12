@@ -436,21 +436,28 @@ func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []Du
 	// Optimization B: Lightweight pre-filter to remove filename-sequential
 	// groups BEFORE metadata extraction when the user doesn't want series.
 	// This avoids opening thousands of burst files on slow drives.
+	//
+	// We use threshold/2 as the distance cutoff (instead of the old hard-coded 3)
+	// to catch more burst groups. For the default threshold of 10, this means
+	// distance ≤ 5 → confidence ≥ 92%. Most burst shots have distance 2-5 and
+	// sequential filenames, so this catches the vast majority.
 	if !includeSeries {
 		preFilterCount := 0
+		preFilterThreshold := threshold / 2
 		for root, paths := range percGroups {
 			if len(paths) < 2 {
 				continue
 			}
-			// Only check high-confidence groups (distance ≤ 3 → confidence ≥ 95%).
-			if dist, ok := percMinDist[root]; ok && dist <= 3 {
+			// Check groups with distance ≤ half the scan threshold
+			// (confidence ≥ ~85-92% depending on the threshold value).
+			if dist, ok := percMinDist[root]; ok && dist <= preFilterThreshold {
 				if isFilenameSeriesFromPaths(paths) {
 					delete(percGroups, root)
 					preFilterCount++
 				}
 			}
 		}
-		fmt.Printf("[grouper] Pre-filtered %d series groups. Remaining perceptual: %d\n", preFilterCount, len(percGroups))
+		fmt.Printf("[grouper] Pre-filtered %d series groups (dist ≤ %d). Remaining perceptual: %d\n", preFilterCount, preFilterThreshold, len(percGroups))
 	}
 
 	// Parallel metadata extraction for all duplicate files (#2).

@@ -33,6 +33,7 @@ import (
 	"os"            // File operations (stat, open).
 	"path/filepath" // File path manipulation (extracting filenames).
 	"strings"       // String manipulation.
+	"sync"          // sync.Pool — reusable buffer pool for ExtractMetadataFast.
 
 	// Standard image decoders (registered via blank imports in hasher.go,
 	// but we list them here too for clarity about what formats we support).
@@ -256,16 +257,26 @@ func ExtractMetadata(path string) ImageMetadata {
 	// for the scoring algorithm.
 	meta.QualityScore = ComputeQualityScore(&meta)
 
-	// -------------------------------------------------------------------------
-	// Step 6: Compute blockiness and blurring scores
-	// -------------------------------------------------------------------------
-	//
-	// These metrics help identify JPEG compression artifacts (blockiness) and
-	// out-of-focus or motion-blurred images (blurring). They're computed from
-	// the image pixels and displayed in the results table.
-	meta.Blockiness, meta.Blurring = ComputeImageQualityMetrics(path)
+	// Blockiness and Blurring are left at 0.0 (Go zero values).
+	// ComputeImageQualityMetrics was removed from the scan pipeline because it
+	// does a full JPEG decode (~150 ms/file on USB), which made the grouping
+	// phase take 8+ minutes for large scans. These metrics are now computed
+	// lazily via the GetImageQualityMetrics Wails method when the user
+	// expands a duplicate group in the UI.
 
 	return meta
+}
+
+// metaBufPool holds reusable 128 KB buffers for ExtractMetadataFast.
+// Instead of allocating a fresh 128 KB buffer on every call (2 771 allocations
+// when running in parallel), we reuse buffers from this pool, reducing GC
+// pressure and memory churn. The pool stores *[]byte pointers to avoid
+// interface boxing overhead.
+var metaBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 128*1024)
+		return &buf
+	},
 }
 
 // =============================================================================
@@ -309,7 +320,12 @@ func ExtractMetadataFast(path string, width, height int, size int64) ImageMetada
 		return meta
 	}
 
-	buf := make([]byte, 128*1024)
+	// Grab a reusable 128 KB buffer from the pool instead of allocating
+	// a new one each time. This reduces GC pressure when processing
+	// thousands of files in parallel.
+	bufPtr := metaBufPool.Get().(*[]byte)
+	defer metaBufPool.Put(bufPtr)
+	buf := *bufPtr
 	n, _ := io.ReadFull(f, buf)
 	f.Close() // Close immediately — we have the bytes we need.
 
@@ -365,11 +381,12 @@ func ExtractMetadataFast(path string, width, height int, size int64) ImageMetada
 	// Step 5: Compute quality score (same logic as original, uses all fields).
 	meta.QualityScore = ComputeQualityScore(&meta)
 
-	// Step 6: Compute blockiness and blurring scores.
-	// NOTE: This still opens the file for a full image decode. This is
-	// acceptable because these metrics need actual pixel data, and the
-	// dominant cost we're optimising away is the triple-open for metadata.
-	meta.Blockiness, meta.Blurring = ComputeImageQualityMetrics(path)
+	// Blockiness and Blurring are left at 0.0 (Go zero values).
+	// ComputeImageQualityMetrics was removed from the scan pipeline because it
+	// does a full JPEG decode (~150 ms/file on USB), which made the grouping
+	// phase take 8+ minutes for large scans. These metrics are now computed
+	// lazily via the GetImageQualityMetrics Wails method when the user
+	// expands a duplicate group in the UI.
 
 	return meta
 }
