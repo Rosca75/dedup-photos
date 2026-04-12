@@ -33,7 +33,7 @@
 package main
 
 import (
-	"context"       // context.Background() for parallel metadata extraction.
+	"context"       // For context.Background() used in parallel metadata extraction.
 	"fmt"           // Formatted I/O.
 	"math"          // math.Round for aspect-ratio quantisation.
 	"path/filepath" // For extracting filenames from paths.
