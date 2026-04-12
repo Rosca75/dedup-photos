@@ -356,6 +356,28 @@ func (a *App) GetThumbnail(path string) string {
 }
 
 // =============================================================================
+// GetImageQualityMetrics
+// =============================================================================
+
+// GetImageQualityMetrics computes blockiness and blurring scores for a single
+// image. Called lazily by the frontend when the user expands a duplicate group,
+// so the expensive full-image decode only happens for images the user views.
+//
+// This was moved out of the scan pipeline because ComputeImageQualityMetrics
+// does a full JPEG decode (~150 ms/file on USB), which was causing the grouping
+// phase to take 8+ minutes for large scans on external drives.
+//
+// Returns a map with "blockiness" and "blurring" float64 values (both 0.0 if
+// the image cannot be decoded).
+func (a *App) GetImageQualityMetrics(path string) map[string]interface{} {
+	blockiness, blurring := ComputeImageQualityMetrics(path)
+	return map[string]interface{}{
+		"blockiness": blockiness,
+		"blurring":   blurring,
+	}
+}
+
+// =============================================================================
 // OpenFolderDialog
 // =============================================================================
 

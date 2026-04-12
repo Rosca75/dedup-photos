@@ -75,3 +75,14 @@ export function apiGetThumbnail(path) {
 export function apiMismatchReport(groupId) {
   return GoApp().ReportMismatch(groupId);
 }
+
+/**
+ * Compute blockiness and blurring scores for a single image (lazy).
+ * Called when the user expands a group, so the expensive full-image decode
+ * only happens for images actually viewed — not during the scan.
+ * Returns a Promise<{blockiness: number, blurring: number}>.
+ * @param {string} path - Absolute file path.
+ */
+export function apiGetImageQualityMetrics(path) {
+  return GoApp().GetImageQualityMetrics(path || '');
+}

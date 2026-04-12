@@ -9,7 +9,7 @@ import { buildSidebarTree } from './sidebar.js';
 import { showPreview, clearPreview } from './preview.js';
 import { updateBatchButtons, updateConfirmButton } from './actions.js';
 import { applyFilters } from './filters.js';
-import { apiGetThumbnail } from './api.js';
+import { apiGetThumbnail, apiGetImageQualityMetrics } from './api.js';
 
 /**
  * Render full scan results into the main area as a data table.
@@ -388,10 +388,35 @@ function buildImageRow(img, groupId) {
   addCell(tr, extractExt(img.filename));
   // File size.
   addCell(tr, formatBytes(img.size));
-  // Blockiness.
-  addCell(tr, img.blockiness != null ? Number(img.blockiness).toFixed(2) : '--');
-  // Blurring.
-  addCell(tr, img.blurring != null ? Number(img.blurring).toFixed(2) : '--');
+  // Blockiness — lazily computed. Show cached value or fetch on demand.
+  const blockTd = document.createElement('td');
+  blockTd.className = 'cell-blockiness';
+  blockTd.textContent = (img.blockiness != null && img.blockiness !== 0)
+    ? Number(img.blockiness).toFixed(2) : '\u2026';
+  tr.appendChild(blockTd);
+
+  // Blurring — lazily computed alongside blockiness.
+  const blurTd = document.createElement('td');
+  blurTd.className = 'cell-blurring';
+  blurTd.textContent = (img.blurring != null && img.blurring !== 0)
+    ? Number(img.blurring).toFixed(2) : '\u2026';
+  tr.appendChild(blurTd);
+
+  // Fetch blockiness/blurring lazily if not yet computed (both are 0).
+  if (img.path && (!img.blockiness || img.blockiness === 0) && (!img.blurring || img.blurring === 0)) {
+    apiGetImageQualityMetrics(img.path).then(metrics => {
+      if (metrics) {
+        blockTd.textContent = Number(metrics.blockiness).toFixed(2);
+        blurTd.textContent = Number(metrics.blurring).toFixed(2);
+        // Cache on the image object so re-renders don't re-fetch.
+        img.blockiness = metrics.blockiness;
+        img.blurring = metrics.blurring;
+      }
+    }).catch(() => {
+      blockTd.textContent = '--';
+      blurTd.textContent = '--';
+    });
+  }
 
   // Delete / Undo button cell.
   const delTd = document.createElement('td');
