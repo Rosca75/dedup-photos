@@ -25,12 +25,15 @@
 package main
 
 import (
+	"bytes"         // bytes.NewReader — wraps []byte as io.Reader for EXIF from buffer.
 	"fmt"           // Formatted I/O.
 	"image"         // Standard image interface for getting dimensions.
+	"io"            // io.ReadFull — read exactly N bytes from a file.
 	"math"          // Math functions like Log2, Min, Max.
 	"os"            // File operations (stat, open).
 	"path/filepath" // File path manipulation (extracting filenames).
 	"strings"       // String manipulation.
+	"sync"          // sync.Pool — reusable buffer pool for ExtractMetadataFast.
 
 	// Standard image decoders (registered via blank imports in hasher.go,
 	// but we list them here too for clarity about what formats we support).
@@ -254,14 +257,136 @@ func ExtractMetadata(path string) ImageMetadata {
 	// for the scoring algorithm.
 	meta.QualityScore = ComputeQualityScore(&meta)
 
-	// -------------------------------------------------------------------------
-	// Step 6: Compute blockiness and blurring scores
-	// -------------------------------------------------------------------------
-	//
-	// These metrics help identify JPEG compression artifacts (blockiness) and
-	// out-of-focus or motion-blurred images (blurring). They're computed from
-	// the image pixels and displayed in the results table.
-	meta.Blockiness, meta.Blurring = ComputeImageQualityMetrics(path)
+	// Blockiness and Blurring are left at 0.0 (Go zero values).
+	// ComputeImageQualityMetrics was removed from the scan pipeline because it
+	// does a full JPEG decode (~150 ms/file on USB), which made the grouping
+	// phase take 8+ minutes for large scans. These metrics are now computed
+	// lazily via the GetImageQualityMetrics Wails method when the user
+	// expands a duplicate group in the UI.
+
+	return meta
+}
+
+// metaBufPool holds reusable 128 KB buffers for ExtractMetadataFast.
+// Instead of allocating a fresh 128 KB buffer on every call (2 771 allocations
+// when running in parallel), we reuse buffers from this pool, reducing GC
+// pressure and memory churn. The pool stores *[]byte pointers to avoid
+// interface boxing overhead.
+var metaBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 128*1024)
+		return &buf
+	},
+}
+
+// =============================================================================
+// ExtractMetadataFast — Single-open metadata extraction (Optimization A)
+// =============================================================================
+
+// ExtractMetadataFast is a faster version of ExtractMetadata that opens the
+// file only ONCE and accepts pre-computed dimensions. On USB/NAS drives where
+// each file open costs ~50ms, this is 3× faster than the original which opens
+// the file 3 times (stat + DecodeConfig + EXIF).
+//
+// Parameters:
+//   - path:   Absolute file path.
+//   - width:  Pre-computed image width (0 if unknown → will try DecodeConfig).
+//   - height: Pre-computed image height (0 if unknown).
+//   - size:   Pre-computed file size in bytes (0 → will call os.Stat).
+func ExtractMetadataFast(path string, width, height int, size int64) ImageMetadata {
+	// Start with pre-computed values.
+	meta := ImageMetadata{
+		Path:     path,
+		Filename: filepath.Base(path),
+		Width:    width,
+		Height:   height,
+		Size:     size,
+	}
+
+	// Step 1: If size is missing, stat the file to get it.
+	if meta.Size == 0 {
+		if info, err := os.Stat(path); err == nil {
+			meta.Size = info.Size()
+		}
+	}
+
+	// Step 2: Single file open → read first 128 KB → extract everything.
+	// 128 KB is enough to contain the full EXIF header for virtually all
+	// camera JPEGs. This avoids reading the entire file.
+	f, err := os.Open(path)
+	if err != nil {
+		// Can't open → compute quality from what we have and return.
+		meta.QualityScore = ComputeQualityScore(&meta)
+		return meta
+	}
+
+	// Grab a reusable 128 KB buffer from the pool instead of allocating
+	// a new one each time. This reduces GC pressure when processing
+	// thousands of files in parallel.
+	bufPtr := metaBufPool.Get().(*[]byte)
+	defer metaBufPool.Put(bufPtr)
+	buf := *bufPtr
+	n, _ := io.ReadFull(f, buf)
+	f.Close() // Close immediately — we have the bytes we need.
+
+	if n == 0 {
+		meta.QualityScore = ComputeQualityScore(&meta)
+		return meta
+	}
+	buf = buf[:n]
+
+	// Step 3: If dimensions are missing, try DecodeConfig from the buffer.
+	// DecodeConfig reads only the image header (not full pixel data).
+	if meta.Width == 0 || meta.Height == 0 {
+		if cfg, _, err := image.DecodeConfig(bytes.NewReader(buf)); err == nil {
+			meta.Width = cfg.Width
+			meta.Height = cfg.Height
+		}
+	}
+
+	// Step 4: Extract EXIF from the buffer (no second file open!).
+	exifData, exifErr := exif.Decode(bytes.NewReader(buf))
+	if exifErr == nil {
+		// --- Date/Time the photo was taken ---
+		if dt, err := exifData.DateTime(); err == nil {
+			meta.DateTaken = dt.Format("2006-01-02T15:04:05")
+		}
+		// --- GPS coordinates ---
+		if lat, lon, err := exifData.LatLong(); err == nil {
+			meta.GPSLat = lat
+			meta.GPSLon = lon
+		}
+		// --- Camera make + model ---
+		cameraMake := getExifString(exifData, exif.Make)
+		cameraModel := getExifString(exifData, exif.Model)
+		meta.Camera = strings.TrimSpace(cameraMake + " " + cameraModel)
+		// --- Lens model ---
+		meta.Lens = getExifString(exifData, exif.LensModel)
+		// --- ISO sensitivity ---
+		if isoTag, err := exifData.Get(exif.ISOSpeedRatings); err == nil {
+			if v, err := isoTag.Int(0); err == nil {
+				meta.ISO = v
+			}
+		}
+		// --- Focal length ---
+		if focalTag, err := exifData.Get(exif.FocalLength); err == nil {
+			if num, den, err := focalTag.Rat2(0); err == nil && den != 0 {
+				meta.FocalLength = fmt.Sprintf("%.1fmm", float64(num)/float64(den))
+			}
+		}
+		// --- Description ---
+		meta.Description = getExifString(exifData, exif.ImageDescription)
+	}
+
+	// Step 5: Compute quality score (same logic as original, uses all fields).
+	meta.QualityScore = ComputeQualityScore(&meta)
+
+	// Blockiness and Blurring are left at 0.0 (Go zero values).
+	// ComputeImageQualityMetrics was removed from the scan pipeline because it
+	// does a full JPEG decode (~150 ms/file on USB), which made the grouping
+	// phase take 8+ minutes for large scans. These metrics are now computed
+	// lazily via the GetImageQualityMetrics Wails method when the user
+	// expands a duplicate group in the UI.
 
 	return meta
 }
