@@ -85,17 +85,17 @@ type Action struct {
 // Wails automatically deserialises the JS object into this struct.
 type ScanRequest struct {
 	Path              string   `json:"path"`               // Primary directory to scan.
-	Threshold         int      `json:"threshold"`           // Hamming distance threshold (0–100).
-	Algorithm         string   `json:"algorithm"`           // "dhash", "phash", or "both".
-	MinWidth          int      `json:"min_width"`           // Minimum image width in px (0=no limit).
-	MaxHeight         int      `json:"max_height"`          // Maximum image height in px (0=no limit).
-	Extensions        []string `json:"extensions"`          // e.g. ["jpg","png"] (empty=all).
-	NormalisedSize    int      `json:"normalised_size"`     // Hash grid size: 16, 32, 64, or 128.
-	IncludeSubfolders bool     `json:"include_subfolders"`  // Recurse into subdirectories.
-	MinFileSize       int64    `json:"min_file_size"`       // Minimum file size in bytes.
-	MaxFileSize       int64    `json:"max_file_size"`       // Maximum file size in bytes.
-	ExtraPaths        []string `json:"extra_paths"`         // Additional directories to scan.
-	IncludeSeries     bool     `json:"include_series"`      // Include burst/series groups in results.
+	Threshold         int      `json:"threshold"`          // Hamming distance threshold (0–100).
+	Algorithm         string   `json:"algorithm"`          // "dhash", "phash", or "both".
+	MinWidth          int      `json:"min_width"`          // Minimum image width in px (0=no limit).
+	MaxHeight         int      `json:"max_height"`         // Maximum image height in px (0=no limit).
+	Extensions        []string `json:"extensions"`         // e.g. ["jpg","png"] (empty=all).
+	NormalisedSize    int      `json:"normalised_size"`    // Hash grid size: 16, 32, 64, or 128.
+	IncludeSubfolders bool     `json:"include_subfolders"` // Recurse into subdirectories.
+	MinFileSize       int64    `json:"min_file_size"`      // Minimum file size in bytes.
+	MaxFileSize       int64    `json:"max_file_size"`      // Maximum file size in bytes.
+	ExtraPaths        []string `json:"extra_paths"`        // Additional directories to scan.
+	IncludeSeries     bool     `json:"include_series"`     // Include burst/series groups in results.
 }
 
 // ReportMismatchRequest is the argument to ReportMismatch().

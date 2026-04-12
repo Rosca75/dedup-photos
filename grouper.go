@@ -207,7 +207,7 @@ func aspectBucket(width, height int) string {
 // Returns:
 //   - groups:       slice of path-lists; each list has 2+ identical files.
 //   - exactGrouped: set of paths already assigned to an exact group (excluded
-//                   from Pass 2 to avoid double-reporting).
+//     from Pass 2 to avoid double-reporting).
 func findExactPaths(hashes []ImageHash) (groups [][]string, exactGrouped map[string]bool) {
 	xxMap := make(map[uint64][]string)
 	for _, h := range hashes {
@@ -268,7 +268,7 @@ func searchBKBucket(bucketHashes []ImageHash, threshold int, uf *UnionFind, minD
 // Returns:
 //   - groups:  map from Union-Find root → list of duplicate paths.
 //   - minDist: map from root → minimum Hamming distance in that group
-//              (used to compute confidence: (1 - dist/64) × 100%).
+//     (used to compute confidence: (1 - dist/64) × 100%).
 func findPerceptualPaths(hashes []ImageHash, exactGrouped map[string]bool, threshold int) (
 	groups map[string][]string,
 	minDist map[string]int,
@@ -402,12 +402,12 @@ func detectSeriesGroups(groups []DuplicateGroup) {
 // pipeline and returns a sorted list of duplicate groups.
 //
 // The restructured flow vs. the original:
-//   1. findExactPaths    — O(n) grouping by xxHash.
-//   2. findPerceptualPaths — aspect-ratio bucketed BK-Trees (#4).
-//   3. collectUniquePaths + parallelExtractMetadata — all file opens run
-//      concurrently instead of single-threaded (#2).
-//   4. buildGroup — look up pre-computed metadata from the map.
-//   5. detectSeriesGroups — relabel burst sequences.
+//  1. findExactPaths    — O(n) grouping by xxHash.
+//  2. findPerceptualPaths — aspect-ratio bucketed BK-Trees (#4).
+//  3. collectUniquePaths + parallelExtractMetadata — all file opens run
+//     concurrently instead of single-threaded (#2).
+//  4. buildGroup — look up pre-computed metadata from the map.
+//  5. detectSeriesGroups — relabel burst sequences.
 func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []DuplicateGroup {
 	// Build a quick lookup from path → ImageHash for pre-computed dimensions.
 	// This lets parallelExtractMetadata skip re-opening files for dimensions
