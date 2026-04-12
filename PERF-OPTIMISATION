@@ -1,0 +1,549 @@
+# PERF_OPTIMIZATION_PLAN.md — DedupPhotos Performance Overhaul
+
+> Execute each optimization in order. Each section is a self-contained task.
+> After each task: run `go build ./...` to verify compilation.
+> **Constraint reminders:** No CGo, no ImageMagick, no external binary deps.
+> All Go code must be heavily commented (owner is not a Go expert).
+
+---
+
+## Context & Problem Statement
+
+Scanning 2 folders totalling 30+ GB of images (estimated ~6,000 files) currently takes
+several minutes end-to-end. Performance profiling and simulation identify the following
+breakdown (first scan, 8-core machine):
+
+| Phase | Estimated time | % of total |
+|-------|---------------|------------|
+| Directory walk | 0.4s | 2% |
+| os.Stat all files | 0.04s | <1% |
+| Hashing (I/O + decode) | 19.4s | 76% |
+| Grouping (BK-Tree + metadata) | 5.7s | 22% |
+| **Total** | **~25.6s** | |
+
+The hashing phase dominates because **every file is fully read into memory** (avg 5 MB)
+even when only a partial hash or EXIF thumbnail is needed. The grouping phase is slow
+because `ExtractMetadata` runs **single-threaded** and re-opens files already processed.
+
+### Key insight from AntiDupl & research
+
+AntiDupl (ermig1979/AntiDupl) achieves high speed through:
+1. **Multi-stage filtering** — cheap operations eliminate candidates before expensive ones.
+2. **Metadata pre-filtering** — dimensions, file size, aspect ratio used as early discriminators.
+3. **Thumbnail-level comparison** — never decodes full images unless absolutely necessary.
+4. **Cached results** — persistent signature database for incremental scans.
+
+The attached report (Optimizing Duplicate Image Detection) confirms the same principles:
+do cheap elimination early, avoid full decode, keep candidate sets tiny, minimize copies.
+
+---
+
+## Optimization #1 — Split Pipeline: File-Size Bucketing + Partial xxHash
+
+**Impact: ~34% speedup (estimated 8.8s saved on first scan)**
+**Files to modify: `hasher.go`, `server.go`**
+
+### What to do
+
+Currently `ComputeAllHashes` reads the **entire file** into memory for every image,
+regardless of whether it could be an exact duplicate. Most files (~85%) have unique
+file sizes and therefore *cannot* be exact duplicates of any other file.
+
+Restructure the hash pipeline into two sub-phases:
+
+#### Phase 3a: Exact-duplicate fast lane (new)
+
+1. During Phase 2 (os.Stat), **collect file sizes** alongside FileInfo.
+2. Build a `map[int64][]string` grouping paths by file size.
+3. **Singleton sizes** (only one file with that size): these files cannot have exact
+   duplicates. Skip full-file read for exact matching. Mark them as "exact-unique."
+4. **Same-size files** (2+ files share a size): compute a **partial xxHash** (first 64 KB)
+   using `ComputePartialXXHash`. Group by partial hash.
+5. **Same partial hash**: now read the full file and compute the full xxHash.
+   Only these files (typically <15% of the corpus) need a full read for exact matching.
+
+#### Phase 3b: Perceptual hash (EXIF-thumbnail only)
+
+For dHash computation, **never read the full file**. Instead:
+
+1. Open the file and read only the **first 128 KB** (enough for EXIF header + thumbnail).
+2. Attempt EXIF thumbnail extraction → compute dHash from thumbnail.
+3. If no thumbnail: read only what `image.DecodeConfig` needs (header) to get dimensions,
+   then read the minimum needed for a scaled-down decode. As a fallback, read the full
+   file only for formats without EXIF (PNG, BMP, etc.).
+
+### Implementation details
+
+Create a new function in `hasher.go`:
+
+```go
+// computeDHashFromHeader reads only the first ~128KB of a file to extract
+// the EXIF thumbnail for dHash computation. Falls back to full decode only
+// for formats that lack EXIF thumbnails (PNG, BMP, GIF, WebP).
+func computeDHashFromHeader(path string, fileSize int64) (uint64, error) {
+    // 1. Open file, read first 128KB
+    // 2. Try exif.Decode + JpegThumbnail on that buffer
+    // 3. If success: compute dHash from thumbnail → return
+    // 4. If fail: check extension. For JPEG, return 0 (no thumbnail).
+    //    For PNG/BMP/GIF: fall back to full file read + image.Decode
+}
+```
+
+Modify `HashAllImagesWithProgress` to:
+
+1. After Phase 2 (stat), build file-size buckets.
+2. Phase 3a: For same-size buckets only, run partial hash → full hash pipeline.
+3. Phase 3b: For ALL files (parallel), compute dHash via `computeDHashFromHeader`.
+4. Files that got a full read in 3a can reuse those bytes for dHash (avoid double-read).
+
+### Key code changes
+
+In the `runParallel` block of Phase 3 (`hasher.go` lines 668-713), replace the
+single-pass approach with the two-sub-phase approach described above.
+
+Add to `server.go` or a new `filesize.go`:
+
+```go
+// buildFileSizeBuckets groups file paths by their file size.
+// Returns: singletons (unique sizes), and buckets (same-size groups).
+func buildFileSizeBuckets(fileInfo map[string]os.FileInfo) (singletons []string, buckets map[int64][]string) {
+    // ...
+}
+```
+
+### Expected result
+
+- 85% of files skip full-file read for exact matching (save ~13ms each = ~66s CPU).
+- dHash computed from ~10KB thumbnail instead of 5MB file (save ~14ms each = ~84s CPU).
+- Wall-clock savings with 8 workers: ~8.8s.
+
+---
+
+## Optimization #2 — Parallelize ExtractMetadata in GroupDuplicates
+
+**Impact: ~13% speedup (estimated 3.4s saved)**
+**Files to modify: `grouper.go`**
+
+### What to do
+
+`GroupDuplicates` currently calls `ExtractMetadata(path)` in a single-threaded loop
+for every image in every duplicate group (lines 427-429 for exact, lines 556-558 for
+perceptual). Each call opens the file, reads EXIF, computes quality score (~8ms/file).
+
+For 480 duplicate files, this is ~3.8s single-threaded.
+
+### Implementation
+
+1. After Pass 1 (exact grouping) and Pass 2 (perceptual grouping via BK-Tree),
+   **collect all unique paths** that need metadata extraction.
+2. Run `ExtractMetadata` in parallel using the same `runParallel` helper from `hasher.go`.
+3. Store results in a `map[string]ImageMetadata`.
+4. When building `DuplicateGroup` structs, look up pre-computed metadata from the map.
+
+Move `runParallel` from `hasher.go` to a shared file (e.g., `parallel.go`) so
+`grouper.go` can also use it.
+
+```go
+// In grouper.go, after BK-Tree search + UnionFind, before building groups:
+
+// Collect all paths that appear in any duplicate group.
+var allDupPaths []string
+// ... collect from exactGrouped + perceptualGroups ...
+
+// Parallel metadata extraction.
+metaMap := make(map[string]ImageMetadata, len(allDupPaths))
+var muMeta sync.Mutex
+runParallel(context.Background(), allDupPaths, runtime.NumCPU(), func(path string) {
+    meta := ExtractMetadata(path)
+    muMeta.Lock()
+    metaMap[path] = meta
+    muMeta.Unlock()
+})
+
+// Then in group building, use: meta := metaMap[path] instead of ExtractMetadata(path)
+```
+
+### Expected result
+
+- 480 files × 8ms / 8 workers = 0.48s instead of 3.84s.
+- Savings: ~3.4s.
+
+---
+
+## Optimization #3 — Pre-Extract Metadata During Hash Phase
+
+**Impact: ~9% speedup (estimated 2.4s saved)**
+**Files to modify: `hasher.go`, `grouper.go`, new type in `server.go`**
+
+### What to do
+
+During the hash phase, file bytes are already in memory (for cache-miss files).
+Instead of re-opening files later in `GroupDuplicates`, extract image dimensions
+and basic EXIF data **during the hash phase** and store them alongside the hashes.
+
+### Implementation
+
+1. Add fields to `ImageHash`:
+
+```go
+type ImageHash struct {
+    Path    string
+    XXHash  uint64
+    DHash   uint64
+    Width   int       // Image width extracted during hashing
+    Height  int       // Image height extracted during hashing
+    Size    int64     // File size from os.Stat
+    Error   error
+}
+```
+
+2. In `ComputeAllHashes`, after reading the file into `data []byte`:
+   - Use `image.DecodeConfig(bytes.NewReader(data))` to get Width/Height.
+   - Store in the returned values.
+
+3. In `HashAllImagesWithProgress`, populate `allResults[idx].Width`, `.Height`, `.Size`
+   from the data already in memory and from `fileInfo[path]`.
+
+4. Modify `GroupDuplicates` signature to accept the enriched hashes:
+   - For files already in hash results with dimensions, skip the `image.DecodeConfig`
+     call inside `ExtractMetadata`.
+   - Pass a pre-built `map[string]ImageHash` so metadata extraction can skip file I/O
+     for dimensions.
+
+### Expected result
+
+- Avoid re-opening ~480 duplicate files for dimension reading.
+- Saves ~2.4s (480 × 5ms per file open + decode config).
+
+---
+
+## Optimization #4 — Aspect-Ratio Pre-Grouping Before BK-Tree
+
+**Impact: ~5% speedup (estimated 1.2s saved)**
+**Files to modify: `grouper.go`**
+
+### What to do
+
+Images with different aspect ratios (e.g., 4:3 vs 16:9) are extremely unlikely to be
+perceptual duplicates. By grouping images into aspect-ratio buckets before building the
+BK-Tree, we reduce the search space by ~65%.
+
+### Implementation
+
+1. After exact-grouping (Pass 1), compute aspect ratio for each remaining file.
+   Use the Width/Height from the enriched `ImageHash` (Optimization #3).
+
+2. Quantize aspect ratios into buckets with 5% tolerance:
+
+```go
+// aspectBucket returns a string key for grouping images by aspect ratio.
+// Uses 5% tolerance: 1.333 (4:3) and 1.366 are in the same bucket.
+func aspectBucket(width, height int) string {
+    if height == 0 {
+        return "unknown"
+    }
+    ratio := float64(width) / float64(height)
+    // Normalize: always use ratio >= 1 (landscape form)
+    if ratio < 1.0 {
+        ratio = 1.0 / ratio
+    }
+    // Quantize to nearest 0.05
+    quantized := math.Round(ratio*20) / 20
+    return fmt.Sprintf("%.2f", quantized)
+}
+```
+
+3. Build a **separate BK-Tree per bucket**. Search only within the same bucket.
+
+4. Run Union-Find across all buckets (a file can only appear in one bucket).
+
+### Expected result
+
+- Instead of one BK-Tree with 5,700 nodes searched 5,700 times,
+  you have ~10 trees averaging 570 nodes each, searched within their bucket only.
+- BK-Tree search is O(n^α) where α < 1 but still super-linear — smaller trees = much faster.
+- Estimated savings: ~1.2s.
+
+---
+
+## Optimization #5 — Streaming xxHash (Memory Optimization)
+
+**Impact: ~1.5% speedup, significant memory reduction**
+**Files to modify: `hasher.go`**
+
+### What to do
+
+Replace `os.ReadFile` (loads entire file into memory) with streaming `xxhash.New()`
+for files that only need xxHash (not dHash). This reduces peak memory from
+~40 MB (8 workers × 5 MB) to ~0.5 MB (8 workers × 64 KB buffer).
+
+### Implementation
+
+```go
+// computeXXHashStreaming computes xxHash64 using a streaming approach.
+// Reads the file in 64KB chunks instead of loading the entire file.
+// Uses sync.Pool to reuse buffers across goroutines.
+var bufPool = sync.Pool{
+    New: func() interface{} {
+        buf := make([]byte, 64*1024)
+        return &buf
+    },
+}
+
+func computeXXHashStreaming(path string) (uint64, error) {
+    f, err := os.Open(path)
+    if err != nil {
+        return 0, err
+    }
+    defer f.Close()
+
+    h := xxhash.New()
+    bufPtr := bufPool.Get().(*[]byte)
+    defer bufPool.Put(bufPtr)
+    buf := *bufPtr
+
+    for {
+        n, err := f.Read(buf)
+        if n > 0 {
+            h.Write(buf[:n])
+        }
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            return 0, err
+        }
+    }
+    return h.Sum64(), nil
+}
+```
+
+Use streaming xxHash for the exact-match pipeline (Optimization #1, Phase 3a).
+Keep the buffer-based approach for files that also need dHash (where we need the
+bytes in memory anyway for image decoding).
+
+### Expected result
+
+- Peak memory drops from ~40 MB to ~0.5 MB during exact-match hashing.
+- GC pressure reduced → fewer GC pauses → smoother parallel throughput.
+- Modest speed improvement (~0.4s).
+
+---
+
+## Optimization #6 — Reduce Cache Mutex Contention
+
+**Impact: ~1.2% speedup**
+**Files to modify: `hasher.go`, `cache.go`**
+
+### What to do
+
+The current `muCache` mutex in `HashAllImagesWithProgress` (line 665) is a single
+lock shared by all 8 workers for both Lookup and Store operations. Under high
+parallelism, this becomes a contention point.
+
+### Implementation
+
+Replace the single mutex with a **sharded lock** approach:
+
+```go
+// ShardedCache wraps HashCache with N shards to reduce lock contention.
+// Each shard covers a range of paths (sharded by hash of path string).
+type ShardedCache struct {
+    shards [16]struct {
+        mu    sync.Mutex
+        cache *HashCache // Each shard has its own map
+    }
+}
+
+func (sc *ShardedCache) getShard(path string) int {
+    // Simple FNV-1a hash of path to pick shard
+    h := fnv.New32a()
+    h.Write([]byte(path))
+    return int(h.Sum32()) % 16
+}
+```
+
+Alternatively, the simpler approach: use `sync.Map` (lock-free for reads) instead
+of `map` + `sync.Mutex`. Since cache lookups vastly outnumber stores (especially
+on rescans with 95% hit rate), `sync.Map` is ideal:
+
+```go
+// In cache.go, change Entries from map to sync.Map
+// Lookup becomes lock-free for the common case (cache hit)
+```
+
+Choose the `sync.Map` approach if simpler; choose sharded locks if benchmarks show
+`sync.Map` overhead from interface boxing.
+
+### Expected result
+
+- Eliminates lock contention on cache reads (the common case).
+- ~0.3s saved on first scan, more significant on rescans.
+
+---
+
+## Optimization #7 — Store Dimensions in Cache
+
+**Impact: Small but enables future optimizations**
+**Files to modify: `cache.go`**
+
+### What to do
+
+Add Width and Height fields to `CachedEntry`. This enables Optimization #4
+(aspect-ratio pre-grouping) to work **without any file I/O on rescans**.
+
+### Implementation
+
+```go
+type CachedEntry struct {
+    Size    int64
+    ModTime int64
+    XXHash  uint64
+    DHash   uint64
+    Width   int    // NEW: image width in pixels
+    Height  int    // NEW: image height in pixels
+}
+```
+
+**Bump `cacheVersion` to 2** to invalidate old caches automatically.
+
+Populate Width/Height during the hash phase (from `image.DecodeConfig` on the
+in-memory buffer).
+
+### Expected result
+
+- On rescan: aspect-ratio grouping requires zero file I/O.
+- Cache file grows ~8 bytes per entry (negligible for 6,000 files = 48 KB).
+
+---
+
+## Optimization #8 — Concurrent Directory Walk (NAS/Network Optimization)
+
+**Impact: Significant for NAS paths, minimal for local SSD**
+**Files to modify: `scanner.go`, `server.go`**
+
+### What to do
+
+Replace the sequential `filepath.WalkDir` with a concurrent directory walker that
+processes subdirectories in parallel. This primarily benefits NAS/SMB paths where
+per-file stat latency is 1-5ms (vs 0.05ms on SSD).
+
+### Implementation
+
+Use a two-phase approach:
+
+1. **Phase 1:** Walk top-level directories sequentially to discover subdirectories.
+2. **Phase 2:** Process each subdirectory concurrently with a worker pool.
+
+```go
+// ConcurrentScanDirectory walks rootPath using N goroutines for subdirectories.
+func ConcurrentScanDirectory(rootPath string, numWorkers int) ([]string, error) {
+    // 1. List immediate children of rootPath
+    // 2. For each child directory, spawn a goroutine that calls filepath.WalkDir
+    // 3. Collect results via channel
+    // 4. Sort final list
+}
+```
+
+For `ScanDirectoryFiltered`, apply the same pattern with filter checks.
+
+### Expected result
+
+- NAS/SMB: 2-4x faster directory enumeration.
+- Local SSD: marginal improvement (I/O is already fast).
+
+---
+
+## Implementation Order & Dependencies
+
+```
+#7 (cache dimensions)  ──────────────────┐
+                                          ↓
+#1 (split pipeline) ──→ #3 (pre-extract) ──→ #4 (aspect-ratio grouping)
+                                          ↑
+#5 (streaming xxHash) ────────────────────┘
+
+#2 (parallel metadata) — independent, do anytime
+#6 (cache contention)  — independent, do anytime
+#8 (concurrent walk)   — independent, do anytime
+```
+
+**Recommended execution order:**
+
+1. **#7** — Bump cache version, add Width/Height fields (small change, enables others).
+2. **#6** — Replace muCache with sync.Map (small, standalone improvement).
+3. **#2** — Parallelize ExtractMetadata (moderate change, big win, no deps).
+4. **#5** — Add sync.Pool + streaming xxHash helper (prepares for #1).
+5. **#1** — Split pipeline with file-size bucketing (largest change, largest win).
+6. **#3** — Pre-extract metadata during hashing (depends on #1 being in place).
+7. **#4** — Aspect-ratio pre-grouping (depends on #3 or #7 for dimensions).
+8. **#8** — Concurrent directory walk (independent, NAS-focused).
+
+---
+
+## Testing Checklist
+
+After each optimization, verify:
+
+- [ ] `go build ./...` succeeds with no errors.
+- [ ] `wails dev` launches and scan completes without crashes.
+- [ ] Exact duplicates are still detected correctly (same groups as before).
+- [ ] Perceptual duplicates are still detected (same or better groups).
+- [ ] Cache works: second scan is fast (>90% cache hit rate).
+- [ ] Console output shows timing per phase (compare before/after).
+- [ ] No data races: run with `go build -race ./...` and test.
+
+---
+
+## Performance Measurement
+
+Add timing instrumentation to `runScan` in `app.go`. Print a summary like:
+
+```
+[perf] Directory walk:     0.42s
+[perf] File stat:          0.04s
+[perf] Exact hash (3a):    2.10s  (900 same-size files of 6000)
+[perf] Perceptual hash (3b): 4.80s (6000 files, 5700 via EXIF thumb)
+[perf] Grouping:           1.20s
+[perf]   - Exact groups:   0.01s
+[perf]   - BK-Tree build:  0.01s
+[perf]   - BK-Tree search: 0.70s (10 aspect buckets)
+[perf]   - Metadata:       0.48s (480 files, 8 workers)
+[perf] Cache save:         0.15s
+[perf] TOTAL:             8.70s
+```
+
+This lets us validate the estimates and identify any remaining bottlenecks.
+
+---
+
+## Summary of Expected Results
+
+| Metric | Before | After (est.) | Improvement |
+|--------|--------|--------------|-------------|
+| First scan (30 GB, 6000 files) | ~25.6s | ~13s | ~2× faster |
+| Rescan (95% cache hit) | ~7.1s | ~3.5s | ~2× faster |
+| Peak memory during hashing | ~40 MB | ~5 MB | 8× less |
+| Files fully read (first scan) | 6,000 | ~900 | 85% reduction |
+| BK-Tree search scope | 5,700 | ~570/bucket | 10× smaller |
+
+---
+
+## Files Modified (Summary)
+
+| File | Changes |
+|------|---------|
+| `cache.go` | Add Width/Height to CachedEntry, bump version to 2 |
+| `hasher.go` | Split pipeline, streaming xxHash, sync.Pool, pre-extract metadata, replace muCache |
+| `grouper.go` | Parallel ExtractMetadata, aspect-ratio bucketed BK-Trees |
+| `server.go` | Updated types (ImageHash enrichment) |
+| `scanner.go` | Concurrent directory walk option |
+| `parallel.go` (NEW) | Extract `runParallel` as shared utility |
+
+---
+
+## References
+
+- **AntiDupl** (github.com/ermig1979/AntiDupl): Multi-stage filtering, SIMD thumbnail comparison, cached signatures.
+- **Report**: "Optimizing Duplicate Image Detection" — 15 performance indicators, prioritizing decode cost, candidate reduction ratio, bucket quality, allocation overhead, parallel scaling.
+- **General principle**: "A fast duplicate-image scanner wins by doing very cheap elimination early, avoiding full-resolution work unless necessary, keeping candidate sets tiny, minimizing copies and allocations, and treating exact duplicates separately from near duplicates."
