@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- dedup-photos v2: two overlapping photo cards + detection badge.
+       Palette: primary #1A3A5C, primary-light #4A90E2, mid-tone #2E5B8A.
+       Centered in 1024x1024 with ~8% padding. -->
+
+  <!-- Back photo card -->
+  <g transform="translate(560 420) rotate(-14) translate(-260 -260)">
+    <rect x="0" y="0" width="520" height="520" rx="48" ry="48" fill="#2E5B8A"/>
+    <rect x="60" y="60" width="400" height="280" rx="20" ry="20" fill="#5E89B3"/>
+    <rect x="60" y="370" width="260" height="20" rx="10" ry="10" fill="#1A3A5C" opacity="0.35"/>
+    <rect x="60" y="410" width="200" height="20" rx="10" ry="10" fill="#1A3A5C" opacity="0.25"/>
+  </g>
+
+  <!-- Front photo card -->
+  <g transform="translate(120 280)">
+    <rect x="0" y="0" width="560" height="560" rx="52" ry="52" fill="#1A3A5C"/>
+    <rect x="56" y="56" width="448" height="312" rx="20" ry="20" fill="#4A90E2"/>
+    <circle cx="400" cy="150" r="48" fill="#FFFFFF"/>
+    <path d="M56 368 L220 170 L380 368 Z" fill="#1A3A5C"/>
+    <path d="M56 368 L160 230 L280 368 Z" fill="#2E5B8A"/>
+    <rect x="76" y="410" width="320" height="22" rx="11" ry="11" fill="#FFFFFF" opacity="0.95"/>
+    <rect x="76" y="450" width="220" height="18" rx="9" ry="9" fill="#FFFFFF" opacity="0.55"/>
+  </g>
+
+  <!-- Detection badge: turns "two photos" into "duplicate detected" -->
+  <g transform="translate(720 720)">
+    <circle cx="0" cy="0" r="140" fill="#FFFFFF"/>
+    <circle cx="0" cy="0" r="116" fill="#4A90E2"/>
+    <path d="M -50 8 L -14 44 L 54 -36"
+          stroke="#FFFFFF" stroke-width="22" stroke-linecap="round"
+          stroke-linejoin="round" fill="none"/>
+  </g>
+</svg>
