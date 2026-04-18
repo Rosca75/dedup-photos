@@ -22,6 +22,7 @@ Thumbs.db
 Desktop.ini
 
 # Test coverage
+samples/
 coverage.out
 coverage.html
 *.coverprofile
