@@ -39,7 +39,7 @@ require (
 )
 
 require (
-	github.com/Rosca75/heic v0.0.0-20260419154356-2b6ae9e88bbd
+	github.com/Rosca75/heic v0.1.0
 	github.com/bep/imagemeta v0.17.1
 	github.com/ebitengine/purego v0.10.0
 	github.com/wailsapp/wails/v2 v2.10.1

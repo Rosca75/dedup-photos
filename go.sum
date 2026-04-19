@@ -1,5 +1,5 @@
-github.com/Rosca75/heic v0.0.0-20260419154356-2b6ae9e88bbd h1:gMWapvvHxGSc+h5+fnnemYyT+D+ubgF47XJ1qJgFibY=
-github.com/Rosca75/heic v0.0.0-20260419154356-2b6ae9e88bbd/go.mod h1:iwcIBF6L/90qVKyVeEzF4ThYD3V/N4bStRyIlb0xc3I=
+github.com/Rosca75/heic v0.1.0 h1:wTxNvBPAXU3LrA3AVLoywJis/h6NGrJDo3w5CROhLQ0=
+github.com/Rosca75/heic v0.1.0/go.mod h1:iwcIBF6L/90qVKyVeEzF4ThYD3V/N4bStRyIlb0xc3I=
 github.com/bep/debounce v1.2.1 h1:v67fRdBA9UQu2NhLFXrSg0Brw7CexQekrBwDMM8bzeY=
 github.com/bep/debounce v1.2.1/go.mod h1:H8yggRPQKLUhUoqrJC1bO2xNya7vanpDl7xR3ISbCJ0=
 github.com/bep/imagemeta v0.17.1 h1:YZ3CBhdcmiPMpYGslQZ+6LKs5mN3el0/7srSm4Sxtlg=
