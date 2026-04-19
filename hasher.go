@@ -431,6 +431,11 @@ func computeDHashFromImage(img image.Image) uint64 {
 func computeDHashFromHeader(path, algorithm string) (dHash uint64, width, height int, err error) {
 	ext := strings.ToLower(filepath.Ext(path))
 
+	// HEIC/HEIF: the container requires full file access; use dedicated decoder.
+	if ext == ".heic" || ext == ".heif" {
+		return computeDHashHEIC(path, algorithm)
+	}
+
 	// Read the first 128 KB. io.ReadFull returns io.ErrUnexpectedEOF if the
 	// file is shorter — that's fine, we use whatever bytes we got.
 	// Borrow a 128 KB buffer from the pool to avoid per-call allocation

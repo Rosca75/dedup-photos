@@ -49,6 +49,7 @@ func NewApp() *App {
 // The ctx allows calling Wails runtime APIs (e.g. file dialogs, events).
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	initHEIC()
 }
 
 // =============================================================================
@@ -297,6 +298,16 @@ func (a *App) GetThumbnail(path string) string {
 	// Serve from in-memory cache if available.
 	if cached, ok := thumbnailCache.Load(path); ok {
 		return base64.StdEncoding.EncodeToString(cached.([]byte))
+	}
+
+	// HEIC/HEIF fast path: use embedded thumbnail when available.
+	if isHEIC(path) {
+		jpegBytes, err := heicThumbnailJPEG(path)
+		if err != nil {
+			return ""
+		}
+		thumbnailCache.Store(path, jpegBytes)
+		return base64.StdEncoding.EncodeToString(jpegBytes)
 	}
 
 	// Open and decode the image file.

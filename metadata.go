@@ -249,6 +249,12 @@ func ExtractMetadata(path string) ImageMetadata {
 	}
 
 	// -------------------------------------------------------------------------
+	// HEIC EXIF: goexif cannot parse HEIC containers; use bep/imagemeta instead.
+	if isHEIC(path) {
+		extractHEICExif(path, &meta)
+	}
+
+	// -------------------------------------------------------------------------
 	// Step 4: Compute quality score
 	// -------------------------------------------------------------------------
 	//
@@ -376,6 +382,11 @@ func ExtractMetadataFast(path string, width, height int, size int64) ImageMetada
 		}
 		// --- Description ---
 		meta.Description = getExifString(exifData, exif.ImageDescription)
+	}
+
+	// HEIC EXIF: goexif cannot parse HEIC containers; use bep/imagemeta instead.
+	if isHEIC(path) {
+		extractHEICExif(path, &meta)
 	}
 
 	// Step 5: Compute quality score (same logic as original, uses all fields).

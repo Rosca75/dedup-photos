@@ -34,18 +34,18 @@ import (
 // Why these formats?
 //
 //	.jpg, .jpeg  — The most common photo format (lossy compression).
+//	.heic, .heif — Apple iPhone format (HEVC); decoded via Rosca75/heic.
 //	.png         — Lossless compression, common for screenshots.
 //	.tiff, .tif  — High-quality format used in professional photography.
 //	.bmp         — Uncompressed bitmap, legacy format.
 //	.webp        — Modern format by Google, good compression.
 //	.gif         — Supports animation, limited to 256 colors.
 //
-// Note: HEIC/HEIF (Apple iPhone format) is NOT supported. Go has no pure-Go
-// HEVC pixel decoder, and CGo-based solutions cause build issues on Windows.
-// HEIC files are skipped during scanning.
 var supportedExtensions = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,
+	".heic": true,
+	".heif": true,
 	".png":  true,
 	".tiff": true,
 	".tif":  true,
