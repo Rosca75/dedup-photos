@@ -115,8 +115,13 @@ func computeDHashHEIC(path, algorithm string) (dHash uint64, width, height int, 
 		return 0, 0, 0, ErrNoThumbnail
 	}
 
-	if cfg, cfgErr := heic.DecodeConfig(bytes.NewReader(data)); cfgErr == nil {
-		width, height = cfg.Width, cfg.Height
+	// Get full-image dimensions from the ISOBMFF container metadata — no WASM.
+	if res, metaErr := imagemeta.Decode(imagemeta.Options{
+		R:           bytes.NewReader(data),
+		ImageFormat: imagemeta.HEIF,
+		Sources:     imagemeta.CONFIG,
+	}); metaErr == nil && res.ImageConfig.Width > 0 {
+		width, height = res.ImageConfig.Width, res.ImageConfig.Height
 	}
 
 	img, thumbErr := heic.DecodeThumbnail(bytes.NewReader(data))
