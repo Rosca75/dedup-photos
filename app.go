@@ -112,23 +112,12 @@ func runScan(ctx context.Context, req ScanRequest) {
 		scanMutex.Unlock()
 	}
 
-	// Phase 1: Walk the primary path.
-	// Use ConcurrentScanDirectory when no dimension or file-size filters are
-	// active (those require opening each file, so the concurrent walker hands
-	// off to ScanDirectoryFiltered which handles that correctly).
+	// Phase 1: Walk the primary path via walkScanRoot, which routes to the
+	// concurrent or filtered walker depending on which filters are active.
 	t0 := time.Now()
 	setPhase("Scanning directory...")
 
-	var paths []string
-	var err error
-	noExtraFilters := req.MinWidth == 0 && req.MaxHeight == 0 && req.MinFileSize == 0 && req.MaxFileSize == 0
-	if len(allowedExts) == 0 && noExtraFilters && req.IncludeSubfolders {
-		// Fast path: concurrent walker (#8) — best for NAS / network shares.
-		paths, err = ConcurrentScanDirectory(req.Path)
-	} else {
-		// Filtered path: sequential walker with per-file dimension / size checks.
-		paths, err = ScanDirectoryFiltered(req.Path, allowedExts, req.MinWidth, req.MaxHeight, req.IncludeSubfolders, req.MinFileSize, req.MaxFileSize)
-	}
+	paths, err := walkScanRoot(req.Path, allowedExts, req)
 	if err != nil {
 		scanMutex.Lock()
 		scanResult.Status = "complete"
@@ -319,8 +308,7 @@ func (a *App) GetThumbnail(path string) string {
 
 	img, _, err := image.Decode(f)
 	if err != nil {
-		// Fallback for RAW formats (DNG, ARW, CR2): byte-scan for
-		// embedded JPEG SOI/EOI markers. Slower but works for many camera formats.
+		// Fallback for RAW formats (DNG, ARW, CR2): scan for embedded JPEG preview.
 		if embedded := extractEmbeddedJPEG(path); embedded != nil {
 			thumbnailCache.Store(path, embedded)
 			return base64.StdEncoding.EncodeToString(embedded)
@@ -464,11 +452,12 @@ func (a *App) ReportMismatch(groupID string) string {
 			Camera: img.Camera, QualityScore: img.QualityScore,
 			GPSLat: img.GPSLat, GPSLon: img.GPSLon,
 		}
-		if h, err := ComputeXXHash(img.Path); err == nil {
-			ir.XXHash = fmt.Sprintf("%016x", h)
+		// Use cached hash values from the scan — no file re-reads needed.
+		if img.XXHash != 0 {
+			ir.XXHash = fmt.Sprintf("%016x", img.XXHash)
 		}
-		if h, err := ComputeDHash(img.Path); err == nil {
-			ir.DHash = fmt.Sprintf("%016x", h)
+		if img.DHash != 0 {
+			ir.DHash = fmt.Sprintf("%016x", img.DHash)
 		}
 		rpt.Images = append(rpt.Images, ir)
 	}

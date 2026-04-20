@@ -18,6 +18,7 @@
 package main
 
 import (
+	"image"         // image.DecodeConfig for dimension filtering in ScanDirectoryFiltered.
 	"os"            // Provides file system operations and types.
 	"path/filepath" // Provides utilities for manipulating file paths.
 	"sort"          // Provides sorting algorithms for slices.
@@ -270,4 +271,116 @@ func ScanDirectory(rootPath string) ([]string, error) {
 
 	// Return the sorted list of image paths and nil (no error).
 	return imagePaths, nil
+}
+
+// =============================================================================
+// ScanDirectoryFiltered — Walk a directory tree with optional filters
+// =============================================================================
+
+// ScanDirectoryFiltered walks rootPath and returns image file paths that match
+// all active filters. Used by both the primary path and extra paths in StartScan.
+//
+// Parameters:
+//   - rootPath:          Directory to walk.
+//   - allowedExts:       Extension filter map (empty = all supported types).
+//   - minWidth:          Minimum image width in pixels (0 = no limit).
+//   - maxHeight:         Maximum image height in pixels (0 = no limit).
+//   - includeSubfolders: Whether to recurse into subdirectories.
+//   - minFileSize:       Minimum file size in bytes (0 = no limit).
+//   - maxFileSize:       Maximum file size in bytes (0 = no limit).
+func ScanDirectoryFiltered(rootPath string, allowedExts map[string]bool, minWidth, maxHeight int, includeSubfolders bool, minFileSize, maxFileSize int64) ([]string, error) {
+	var imagePaths []string
+
+	err := filepath.WalkDir(rootPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // Skip unreadable entries.
+		}
+		// Skip hidden directories (e.g. .thumbnails, .DS_Store).
+		if d.IsDir() && strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			if !includeSubfolders && path != rootPath {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(path))
+
+		// Extension filter: check against allowedExts, or all supported types.
+		if len(allowedExts) > 0 {
+			if !allowedExts[ext] {
+				return nil
+			}
+		} else {
+			if !supportedExtensions[ext] {
+				return nil
+			}
+		}
+
+		absPath, err2 := filepath.Abs(path)
+		if err2 != nil {
+			absPath = path
+		}
+
+		// File size filter.
+		if minFileSize > 0 || maxFileSize > 0 {
+			if info, err3 := d.Info(); err3 == nil {
+				if minFileSize > 0 && info.Size() < minFileSize {
+					return nil
+				}
+				if maxFileSize > 0 && info.Size() > maxFileSize {
+					return nil
+				}
+			}
+		}
+
+		// Dimension filter — opens the file to read image config (no full decode).
+		if minWidth > 0 || maxHeight > 0 {
+			f, err3 := os.Open(absPath)
+			if err3 != nil {
+				return nil
+			}
+			cfg, _, err3 := image.DecodeConfig(f)
+			f.Close()
+			if err3 == nil {
+				if minWidth > 0 && cfg.Width < minWidth {
+					return nil
+				}
+				if maxHeight > 0 && cfg.Height > maxHeight {
+					return nil
+				}
+			}
+			// If we can't read dimensions, include the file anyway.
+		}
+
+		imagePaths = append(imagePaths, absPath)
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Strings(imagePaths) // Deterministic order for reproducible grouping.
+	return imagePaths, nil
+}
+
+// =============================================================================
+// walkScanRoot — Unified scanner entry point used by runScan
+// =============================================================================
+
+// walkScanRoot returns all image paths under path, applying filters from req.
+// Routes to ConcurrentScanDirectory (parallel, best for NAS / network shares)
+// when no per-file filters are active, or ScanDirectoryFiltered otherwise.
+// This wrapper keeps Plan 2's walker consolidation to a single-file change.
+func walkScanRoot(path string, allowedExts map[string]bool, req ScanRequest) ([]string, error) {
+	noExtraFilters := req.MinWidth == 0 && req.MaxHeight == 0 && req.MinFileSize == 0 && req.MaxFileSize == 0
+	if len(allowedExts) == 0 && noExtraFilters && req.IncludeSubfolders {
+		// Fast path: concurrent walker — best for NAS / network shares.
+		return ConcurrentScanDirectory(path)
+	}
+	// Filtered path: sequential walker with per-file dimension / size checks.
+	return ScanDirectoryFiltered(path, allowedExts, req.MinWidth, req.MaxHeight, req.IncludeSubfolders, req.MinFileSize, req.MaxFileSize)
 }

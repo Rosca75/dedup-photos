@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/Rosca75/heic"
 	"github.com/bep/imagemeta"
@@ -135,98 +134,14 @@ func computeDHashHEIC(path, algorithm string) (dHash uint64, width, height int, 
 	return computeDHashFromImage(img), width, height, nil
 }
 
-// extractHEICExif populates meta with EXIF data from a HEIC file using
-// bep/imagemeta, which natively handles the HEIC ISOBMFF EXIF container.
+// extractHEICExif populates meta with EXIF data from a HEIC file.
+// Delegates to extractExifInto with the HEIF format hint; the ISOBMFF container
+// is handled transparently by bep/imagemeta.
 func extractHEICExif(path string, meta *ImageMetadata) {
 	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-
-	var make_, model string
-	var latRef, lonRef string
-	var lat, lon float64
-	var hasLat, hasLon bool
-
-	_, _ = imagemeta.Decode(imagemeta.Options{
-		R:           f,
-		ImageFormat: imagemeta.HEIF,
-		HandleTag: func(ti imagemeta.TagInfo) error {
-			switch ti.Tag {
-			case "DateTimeOriginal":
-				if s, ok := ti.Value.(string); ok && s != "" && meta.DateTaken == "" {
-					if t, parseErr := time.Parse("2006:01:02 15:04:05", s); parseErr == nil {
-						meta.DateTaken = t.Format("2006-01-02T15:04:05")
-					}
-				}
-			case "Make":
-				if s, ok := ti.Value.(string); ok {
-					make_ = strings.TrimSpace(s)
-				}
-			case "Model":
-				if s, ok := ti.Value.(string); ok {
-					model = strings.TrimSpace(s)
-				}
-			case "LensModel":
-				if s, ok := ti.Value.(string); ok && meta.Lens == "" {
-					meta.Lens = strings.TrimSpace(s)
-				}
-			case "ISO":
-				if meta.ISO == 0 {
-					switch v := ti.Value.(type) {
-					case uint16:
-						meta.ISO = int(v)
-					case uint32:
-						meta.ISO = int(v)
-					}
-				}
-			case "FocalLength":
-				if meta.FocalLength == "" {
-					if r, ok := ti.Value.(imagemeta.Rat[uint32]); ok {
-						meta.FocalLength = fmt.Sprintf("%.1fmm", r.Float64())
-					}
-				}
-			case "GPSLatitudeRef":
-				if s, ok := ti.Value.(string); ok {
-					latRef = s
-				}
-			case "GPSLongitudeRef":
-				if s, ok := ti.Value.(string); ok {
-					lonRef = s
-				}
-			case "GPSLatitude":
-				if fv, ok := ti.Value.(float64); ok {
-					lat = fv
-					hasLat = true
-				}
-			case "GPSLongitude":
-				if fv, ok := ti.Value.(float64); ok {
-					lon = fv
-					hasLon = true
-				}
-			case "ImageDescription":
-				if s, ok := ti.Value.(string); ok && meta.Description == "" {
-					meta.Description = strings.TrimSpace(s)
-				}
-			}
-			return nil
-		},
-	})
-
-	if meta.Camera == "" && (make_ != "" || model != "") {
-		meta.Camera = strings.TrimSpace(make_ + " " + model)
-	}
-	if hasLat && meta.GPSLat == 0 {
-		meta.GPSLat = lat
-		if strings.HasPrefix(strings.ToUpper(latRef), "S") {
-			meta.GPSLat = -lat
-		}
-	}
-	if hasLon && meta.GPSLon == 0 {
-		meta.GPSLon = lon
-		if strings.HasPrefix(strings.ToUpper(lonRef), "W") {
-			meta.GPSLon = -lon
-		}
-	}
+	extractExifInto(f, imagemeta.HEIF, meta)
 }

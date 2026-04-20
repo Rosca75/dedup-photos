@@ -177,24 +177,6 @@ func (c *HashCache) StoreAll(path string, info os.FileInfo, xxHash, dHash uint64
 	}
 }
 
-// =============================================================================
-// Lookup / Store — Backwards-compatible wrappers (width/height default to 0)
-// =============================================================================
-
-// Lookup checks if a cached entry exists and is still valid.
-// Returns (xxHash, dHash, true) on a cache hit; (0, 0, false) on a miss.
-// Use LookupAll to also retrieve cached image dimensions.
-func (c *HashCache) Lookup(path string, info os.FileInfo) (uint64, uint64, bool) {
-	xxh, dh, _, _, ok := c.LookupAll(path, info)
-	return xxh, dh, ok
-}
-
-// Store adds or updates a cache entry. Width and Height are not stored (0).
-// Use StoreAll when image dimensions are available.
-func (c *HashCache) Store(path string, info os.FileInfo, xxHash, dHash uint64) {
-	c.StoreAll(path, info, xxHash, dHash, 0, 0)
-}
-
 // newEmptyCache creates a new, empty cache with the current version.
 func newEmptyCache() *HashCache {
 	return &HashCache{

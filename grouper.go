@@ -358,8 +358,9 @@ func collectUniquePaths(exactGroups [][]string, percGroups map[string][]string) 
 
 // buildGroup creates a DuplicateGroup for the given paths and matchType.
 // It looks up each path in metaMap (parallel-extracted) rather than calling
-// ExtractMetadata inline, which is the key change that achieves #2's speedup.
-func buildGroup(matchType string, confidence float64, paths []string, metaMap map[string]ImageMetadata) DuplicateGroup {
+// ExtractMetadata inline. hashMap provides the pre-computed XXHash and DHash
+// values so ReportMismatch can use them without re-reading files.
+func buildGroup(matchType string, confidence float64, paths []string, metaMap map[string]ImageMetadata, hashMap map[string]ImageHash) DuplicateGroup {
 	group := DuplicateGroup{
 		ID:         uuid.New().String(),
 		MatchType:  matchType,
@@ -369,6 +370,11 @@ func buildGroup(matchType string, confidence float64, paths []string, metaMap ma
 		meta, ok := metaMap[path]
 		if !ok {
 			meta = ExtractMetadata(path) // Fallback — should not occur in practice.
+		}
+		// Copy pre-computed hash values so ReportMismatch doesn't re-read files.
+		if h, ok := hashMap[path]; ok {
+			meta.XXHash = h.XXHash
+			meta.DHash = h.DHash
 		}
 		group.Images = append(group.Images, meta)
 	}
@@ -469,7 +475,7 @@ func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []Du
 	// Build DuplicateGroup structs from pre-computed metadata.
 	var groups []DuplicateGroup
 	for _, paths := range exactGroups {
-		groups = append(groups, buildGroup("exact", 100.0, paths, metaMap))
+		groups = append(groups, buildGroup("exact", 100.0, paths, metaMap, hashMap))
 	}
 	for root, paths := range percGroups {
 		if len(paths) < 2 {
@@ -477,7 +483,7 @@ func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []Du
 		}
 		dist := percMinDist[root]
 		confidence := (1.0 - float64(dist)/64.0) * 100.0
-		groups = append(groups, buildGroup("perceptual", confidence, paths, metaMap))
+		groups = append(groups, buildGroup("perceptual", confidence, paths, metaMap, hashMap))
 	}
 
 	// Pass 3: Detect burst/series groups among perceptual matches.
