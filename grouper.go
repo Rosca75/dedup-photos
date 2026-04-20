@@ -42,7 +42,6 @@ import (
 	"sort"          // For sorting groups and images.
 	"strconv"       // String → int conversion for series detection.
 	"strings"       // String manipulation.
-	"sync"          // sync.Mutex for thread-safe writes to shared maps.
 	"time"          // time.Parse / time.Second for burst time-window detection.
 
 	"github.com/google/uuid" // UUID for unique group IDs.
@@ -315,16 +314,21 @@ func findPerceptualPaths(hashes []ImageHash, exactGrouped map[string]bool, thres
 // using all available CPU cores. It accepts a hashMap of pre-computed dimensions
 // from the hashing phase so that ExtractMetadataFast can skip re-opening files
 // for DecodeConfig (Optimization A — single file open).
+//
+// Workers write into an index-aligned slice; the final map is assembled
+// sequentially, avoiding a mutex on the hot path.
 func parallelExtractMetadata(ctx context.Context, paths []string, hashMap map[string]ImageHash) map[string]ImageMetadata {
-	metaMap := make(map[string]ImageMetadata, len(paths))
-	var mu sync.Mutex
-	runParallel(ctx, paths, runtime.NumCPU(), func(path string) {
+	n := len(paths)
+	metaSlice := make([]ImageMetadata, n)
+	runParallelIndexed(ctx, n, runtime.NumCPU(), func(i int) {
+		path := paths[i]
 		h := hashMap[path]
-		meta := ExtractMetadataFast(path, h.Width, h.Height, h.Size)
-		mu.Lock()
-		metaMap[path] = meta
-		mu.Unlock()
+		metaSlice[i] = ExtractMetadataFast(path, h.Width, h.Height, h.Size)
 	})
+	metaMap := make(map[string]ImageMetadata, n)
+	for i, path := range paths {
+		metaMap[path] = metaSlice[i]
+	}
 	return metaMap
 }
 

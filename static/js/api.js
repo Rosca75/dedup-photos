@@ -31,6 +31,15 @@ export function apiResults() {
 }
 
 /**
+ * Lightweight progress-only poll used during an active scan.
+ * Returns {status, progress} — no duplicate groups, so serialisation cost
+ * stays small regardless of how many groups have been detected so far.
+ */
+export function apiProgress() {
+  return GoApp().GetProgress();
+}
+
+/**
  * Cancel the currently running scan.
  */
 export function apiCancel() {

@@ -289,10 +289,29 @@ func computeDHashFromHeader(path, algorithm string) (dHash uint64, width, height
 		headerBufPool.Put(bufPtr)
 		return 0, 0, 0, ErrNoThumbnail
 	}
-	buf = buf[:n]
 	// Return the buffer to the pool when we're done with it.
 	// defer is safe here — all remaining code paths only read from buf.
 	defer headerBufPool.Put(bufPtr)
+
+	return computeDHashFromHeaderBuffer(path, buf[:n], algorithm)
+}
+
+// computeDHashFromHeaderBuffer runs the same decision tree as
+// computeDHashFromHeader but skips the file-open/read step because the header
+// bytes are already in buf. Used by the pipeline to reuse 64 KB buffers read
+// during the partial-hash phase instead of re-opening the file.
+func computeDHashFromHeaderBuffer(path string, buf []byte, algorithm string) (dHash uint64, width, height int, err error) {
+	ext := strings.ToLower(filepath.Ext(path))
+
+	// HEIC/HEIF: defer to the dedicated HEIC fast path — it does its own read
+	// at 192 KB which is larger than our 64 KB partial-hash buffer anyway.
+	if ext == ".heic" || ext == ".heif" {
+		return computeDHashHEIC(path, algorithm)
+	}
+
+	if len(buf) == 0 {
+		return 0, 0, 0, ErrNoThumbnail
+	}
 
 	// Extract image dimensions from the header bytes (DecodeConfig is header-only).
 	if cfg, _, decErr := image.DecodeConfig(bytes.NewReader(buf)); decErr == nil {

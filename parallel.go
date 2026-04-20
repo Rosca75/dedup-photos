@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 // runParallel executes fn for each item in paths using numWorkers goroutines.
@@ -67,4 +68,44 @@ func runParallel(ctx context.Context, paths []string, numWorkers int, fn func(st
 	close(jobs) // Signal workers: no more items; exit when channel is empty.
 
 	wg.Wait() // Block until all workers have finished their current item.
+}
+
+// runParallelIndexed is like runParallel but passes the slice index to fn.
+// Callers pre-allocate a result slice and write results by index — no mutex
+// needed because each goroutine writes to a distinct slot.
+//
+// Uses an atomic counter instead of a buffered channel: on workloads with
+// thousands of tiny jobs, the counter avoids channel-scheduling overhead and
+// per-item allocations entirely.
+//
+// Parameters:
+//   - ctx:        Cancellation context; workers exit early when cancelled.
+//   - n:          Number of jobs (fn is called with i in [0, n)).
+//   - numWorkers: Degree of parallelism.
+//   - fn:         Work function receiving the job index. MUST be safe to call
+//                 concurrently. Writes to shared slices at index i are safe
+//                 as long as each i is written by only one goroutine.
+func runParallelIndexed(ctx context.Context, n int, numWorkers int, fn func(i int)) {
+	if n == 0 {
+		return
+	}
+	var idx atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				i := int(idx.Add(1)) - 1
+				if i >= n {
+					return
+				}
+				fn(i)
+			}
+		}()
+	}
+	wg.Wait()
 }

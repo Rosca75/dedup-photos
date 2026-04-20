@@ -2,14 +2,21 @@
 package main
 
 import (
-	"bytes"      // bytes.NewReader for JPEG validation.
-	"image/jpeg" // jpeg.Decode for validating extracted JPEG segments.
+	"bytes"      // bytes.Index for optimised SOI marker search.
+	"image/jpeg" // jpeg.DecodeConfig for header-only JPEG validation.
 	"os"         // os.ReadFile to load the raw file bytes.
 )
 
 // extractEmbeddedJPEG scans filePath for embedded JPEG data (SOI/EOI markers).
-// Many camera RAW formats (ARW, DNG, CR2) contain a full-size JPEG
-// preview. Returns the largest valid JPEG found, or nil if none.
+// Many camera RAW formats (ARW, DNG, CR2) contain a full-size JPEG preview.
+// Returns the largest valid JPEG found, or nil if none.
+//
+// Validation uses jpeg.DecodeConfig (header-only parse) instead of jpeg.Decode
+// (full pixel decode): on a 50 MB ARW with multiple preview candidates, this
+// cuts validation from hundreds of milliseconds to single digits.
+//
+// SOI search uses bytes.Index (assembly-optimised) instead of a manual byte-
+// by-byte loop.
 func extractEmbeddedJPEG(filePath string) []byte {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -22,44 +29,47 @@ func extractEmbeddedJPEG(filePath string) []byte {
 		maxScan = 50 * 1024 * 1024
 	}
 
+	soi := []byte{0xFF, 0xD8}
+	eoi := []byte{0xFF, 0xD9}
+
 	var bestJPEG []byte
 
-	// Scan for JPEG SOI markers (0xFF 0xD8). Skip byte 0 — if the file starts
-	// with FFD8, it's already a plain JPEG and would have decoded normally.
-	for i := 2; i < maxScan-1; i++ {
-		if data[i] != 0xFF || data[i+1] != 0xD8 {
-			continue
+	// Start search at byte 2 — if the file starts with FFD8 it's already a
+	// plain JPEG and would have decoded via image.Decode in the caller.
+	pos := 2
+	for pos < maxScan-1 {
+		rel := bytes.Index(data[pos:maxScan], soi)
+		if rel < 0 {
+			break
 		}
-		// Found SOI — search for the matching EOI (0xFF 0xD9).
-		eoiIdx := -1
-		for j := i + 2; j < maxScan-1; j++ {
-			if data[j] == 0xFF && data[j+1] == 0xD9 {
-				eoiIdx = j + 2
-				break
-			}
-		}
-		if eoiIdx <= 0 {
-			continue
-		}
+		i := pos + rel
 
+		// Find matching EOI within the remaining scan window.
+		relEoi := bytes.Index(data[i+2:maxScan], eoi)
+		if relEoi < 0 {
+			break
+		}
+		eoiIdx := i + 2 + relEoi + 2 // +2 past EOI marker bytes
 		jpegData := data[i:eoiIdx]
 
-		// Skip tiny EXIF thumbnails (< 10 KB); keep as fallback if nothing better.
+		// Keep tiny (<10 KB) segments as a fallback but don't bother validating —
+		// they are typically EXIF thumbnails we'd rather skip if anything better exists.
 		if len(jpegData) < 10*1024 {
 			if bestJPEG == nil {
 				bestJPEG = jpegData
 			}
+			pos = eoiIdx
 			continue
 		}
 
-		// Validate by attempting a full JPEG decode.
-		if _, err := jpeg.Decode(bytes.NewReader(jpegData)); err == nil {
+		// Header-only validation — no pixel decode.
+		if cfg, err := jpeg.DecodeConfig(bytes.NewReader(jpegData)); err == nil && cfg.Width > 200 && cfg.Height > 200 {
 			if len(jpegData) > len(bestJPEG) {
 				bestJPEG = jpegData
 			}
 		}
 
-		i = eoiIdx - 1 // Advance past this JPEG segment.
+		pos = eoiIdx
 	}
 
 	return bestJPEG

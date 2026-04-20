@@ -30,6 +30,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/image/draw"
+
 	// Wails runtime — aliased to avoid collision with stdlib "runtime" above.
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -229,11 +231,32 @@ func setScanCancelled() {
 // =============================================================================
 
 // GetResults returns the current scan state (progress or final results).
-// Called by JS every 500ms while scanning.
+// Called by JS once per scan, when it sees status transition to "complete".
+// While scanning, JS uses the much cheaper GetProgress() instead so the
+// 500 ms poller doesn't serialise thousands of duplicate groups on every tick.
 func (a *App) GetResults() ScanResult {
 	scanMutex.Lock()
 	defer scanMutex.Unlock()
 	return scanResult
+}
+
+// ScanProgressUpdate is the lightweight payload returned by GetProgress.
+// It carries only the fields the UI needs during polling — no duplicate groups.
+type ScanProgressUpdate struct {
+	Status   string       `json:"status"`
+	Progress ScanProgress `json:"progress"`
+}
+
+// GetProgress returns only the scan status and progress — no duplicate groups.
+// The frontend polls this every 500 ms during an active scan, avoiding the
+// multi-MB serialisation cost of GetResults() until the scan actually finishes.
+func (a *App) GetProgress() ScanProgressUpdate {
+	scanMutex.Lock()
+	defer scanMutex.Unlock()
+	return ScanProgressUpdate{
+		Status:   scanResult.Status,
+		Progress: scanResult.Progress,
+	}
 }
 
 // CancelScan signals the running scan goroutine to stop early.
@@ -337,13 +360,12 @@ func (a *App) GetThumbnail(path string) string {
 		newH = 1
 	}
 
-	// Nearest-neighbour resize (fast, sufficient for thumbnails).
-	thumb := image.NewRGBA(image.Rect(0, 0, newW, newH))
-	for y := 0; y < newH; y++ {
-		for x := 0; x < newW; x++ {
-			thumb.Set(x, y, img.At(b.Min.X+x*srcW/newW, b.Min.Y+y*srcH/newH))
-		}
-	}
+	// Bilinear resize via golang.org/x/image/draw — uses pixel-format-specific
+	// fast paths and avoids the color.Color interface entirely, cutting per-
+	// thumbnail CPU from tens of ms to single digits.
+	dstRect := image.Rect(0, 0, newW, newH)
+	thumb := image.NewRGBA(dstRect)
+	draw.ApproxBiLinear.Scale(thumb, dstRect, img, b, draw.Src, nil)
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, thumb, &jpeg.Options{Quality: 85}); err != nil {

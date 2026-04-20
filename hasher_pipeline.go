@@ -47,12 +47,18 @@ import (
 	"image"       // image.DecodeConfig for extracting dimensions from buffers.
 	"os"          // os.FileInfo, os.ReadFile, os.Stat.
 	"runtime"     // runtime.NumCPU — default worker count.
-	"sync"        // sync.Mutex for protecting shared result maps.
 	"sync/atomic" // atomic.Int32 for lock-free progress counters.
 	"time"        // time.Now / time.Since for [perf] phase timing.
 
 	"github.com/cespare/xxhash/v2" // xxHash: fast non-cryptographic hash.
 )
+
+// headerBufRetentionLimit caps how many 64 KB header buffers we retain for
+// reuse across the exact/perceptual phases. At 64 KB × 1000 buffers this
+// keeps peak extra memory below 64 MB — well under any reasonable RAM
+// budget — while still covering the typical singleton-by-partial-hash case
+// for corpora of a few thousand files.
+const headerBufRetentionLimit = 1000
 
 // =============================================================================
 // buildFileSizeBuckets — Identify singleton files vs. same-size groups (#1)
@@ -96,21 +102,34 @@ func buildFileSizeBuckets(paths []string, fileInfo map[string]os.FileInfo) (sing
 // =============================================================================
 
 // runPartialHashPhase computes a 64 KB partial xxHash for every path in
-// same-size groups. Uses bufPool to reuse 64 KB buffers across goroutines,
-// keeping peak memory near 0.5 MB instead of 40 MB.
+// same-size groups.
+//
+// Workers write results into index-aligned slices (no mutex). The 64 KB
+// header bytes are also retained per path so that the later perceptual-hash
+// phase can reuse them without re-opening the file.
 //
 // Returns:
 //   - partials:      path → 64 KB partial xxHash value.
 //   - partialGroups: partial hash → list of paths (for collision detection).
+//   - headerBytes:   path → 64 KB header buffer (only for paths whose partial
+//                    hash is unique across the batch; buffers for collision
+//                    candidates are dropped since those files are re-read in
+//                    full during the collision phase).
 func runPartialHashPhase(ctx context.Context, sameSizePaths []string, numWorkers int) (
 	partials map[string]uint64,
 	partialGroups map[uint64][]string,
+	headerBytes map[string][]byte,
 ) {
-	partials = make(map[string]uint64, len(sameSizePaths))
-	var mu sync.Mutex
+	n := len(sameSizePaths)
+	hashSlice := make([]uint64, n)
+	bufSlice := make([][]byte, n) // owned copies of the header bytes
 
-	runParallel(ctx, sameSizePaths, numWorkers, func(path string) {
-		// Borrow a 64 KB buffer from the pool; return it when done.
+	runParallelIndexed(ctx, n, numWorkers, func(i int) {
+		path := sameSizePaths[i]
+
+		// Borrow a 64 KB buffer from the pool — used only for the hash read.
+		// We then allocate a fresh, path-owned copy of the bytes actually read
+		// so the pool buffer can be returned immediately.
 		bufPtr := bufPool.Get().(*[]byte)
 		buf := *bufPtr
 
@@ -119,24 +138,59 @@ func runPartialHashPhase(ctx context.Context, sameSizePaths []string, numWorkers
 			bufPool.Put(bufPtr)
 			return
 		}
-		n, _ := f.Read(buf) // Read up to 64 KB; fewer bytes on small files.
+		nb, _ := f.Read(buf) // Read up to 64 KB; fewer bytes on small files.
 		f.Close()
-		bufPool.Put(bufPtr)
-
-		if n == 0 {
+		if nb == 0 {
+			bufPool.Put(bufPtr)
 			return
 		}
-		h := xxhash.Sum64(buf[:n])
 
-		mu.Lock()
-		partials[path] = h
-		mu.Unlock()
+		hashSlice[i] = xxhash.Sum64(buf[:nb])
+
+		// Keep a private copy of the header bytes for possible reuse.
+		owned := make([]byte, nb)
+		copy(owned, buf[:nb])
+		bufSlice[i] = owned
+		bufPool.Put(bufPtr)
 	})
 
-	// Build a map from partial hash → paths so collision groups are easy to find.
-	partialGroups = make(map[uint64][]string)
-	for path, h := range partials {
+	// Reassemble results into maps (sequential, no contention).
+	partials = make(map[string]uint64, n)
+	partialGroups = make(map[uint64][]string, n)
+	headerBytes = make(map[string][]byte, n)
+	for i, path := range sameSizePaths {
+		h := hashSlice[i]
+		if h == 0 && bufSlice[i] == nil {
+			continue // Open failed or empty file.
+		}
+		partials[path] = h
 		partialGroups[h] = append(partialGroups[h], path)
+		if bufSlice[i] != nil {
+			headerBytes[path] = bufSlice[i]
+		}
+	}
+
+	// Prune header buffers for collision-group paths: those files get a full
+	// read in runCollisionHashPhase so their header bytes are redundant.
+	for _, group := range partialGroups {
+		if len(group) >= 2 {
+			for _, path := range group {
+				delete(headerBytes, path)
+			}
+		}
+	}
+
+	// Cap retention so peak memory stays bounded on very large scans.
+	// 64 KB × 1000 = ~64 MB; the cap rarely fires in practice (most scans
+	// have a few thousand singleton-size files at most).
+	if len(headerBytes) > headerBufRetentionLimit {
+		kept := 0
+		for path := range headerBytes {
+			kept++
+			if kept > headerBufRetentionLimit {
+				delete(headerBytes, path)
+			}
+		}
 	}
 	return
 }
@@ -170,30 +224,39 @@ func runCollisionHashPhase(ctx context.Context, partialGroups map[uint64][]strin
 		}
 	}
 
-	fullHashes = make(map[string]uint64, len(needFull))
-	fullData = make(map[string][]byte, len(needFull))
-	dims = make(map[string][2]int, len(needFull))
-	var mu sync.Mutex
+	n := len(needFull)
+	hashSlice := make([]uint64, n)
+	dataSlice := make([][]byte, n)
+	dimSlice := make([][2]int, n)
 
-	runParallel(ctx, needFull, numWorkers, func(path string) {
+	runParallelIndexed(ctx, n, numWorkers, func(i int) {
+		path := needFull[i]
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return
 		}
-		h := xxhash.Sum64(data)
+		hashSlice[i] = xxhash.Sum64(data)
 
 		// Extract dimensions while the bytes are in memory — no extra I/O (#3).
 		var w, ht int
 		if cfg, _, decErr := image.DecodeConfig(bytes.NewReader(data)); decErr == nil {
 			w, ht = cfg.Width, cfg.Height
 		}
-
-		mu.Lock()
-		fullHashes[path] = h
-		fullData[path] = data // Kept for Phase 3b dHash reuse.
-		dims[path] = [2]int{w, ht}
-		mu.Unlock()
+		dataSlice[i] = data // Kept for Phase 3b dHash reuse.
+		dimSlice[i] = [2]int{w, ht}
 	})
+
+	fullHashes = make(map[string]uint64, n)
+	fullData = make(map[string][]byte, n)
+	dims = make(map[string][2]int, n)
+	for i, path := range needFull {
+		if dataSlice[i] == nil {
+			continue // Read failed.
+		}
+		fullHashes[path] = hashSlice[i]
+		fullData[path] = dataSlice[i]
+		dims[path] = dimSlice[i]
+	}
 	return
 }
 
@@ -213,6 +276,7 @@ func runExactHashPhase(ctx context.Context, misses []string, fileInfo map[string
 	xxHashes map[string]uint64,
 	fullData map[string][]byte,
 	dims map[string][2]int,
+	headerBytes map[string][]byte,
 ) {
 	// Separate singleton sizes from same-size groups.
 	_, sameSizeBuckets := buildFileSizeBuckets(misses, fileInfo)
@@ -225,13 +289,14 @@ func runExactHashPhase(ctx context.Context, misses []string, fileInfo map[string
 
 	if len(sameSizePaths) == 0 {
 		// No same-size files in this batch — nothing to check for exact dups.
-		return make(map[string]uint64), make(map[string][]byte), make(map[string][2]int)
+		return make(map[string]uint64), make(map[string][]byte), make(map[string][2]int), make(map[string][]byte)
 	}
 
 	// Phase 3a-i: 64 KB partial hash for all same-size files.
-	_, partialGroups := runPartialHashPhase(ctx, sameSizePaths, numWorkers)
+	// headerBytes carries the 64 KB reads forward to Phase 3b for reuse.
+	_, partialGroups, headerBytes := runPartialHashPhase(ctx, sameSizePaths, numWorkers)
 	if ctx.Err() != nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	// Phase 3a-ii: Full reads for files sharing a partial hash.
@@ -254,20 +319,26 @@ func runExactHashPhase(ctx context.Context, misses []string, fileInfo map[string
 // Returns:
 //   - dHashes: path → dHash (omitted when 0 — skip perceptual matching).
 //   - dims:    path → [width, height] (omitted when 0×0 — unknown dimensions).
-func computePerceptualHashes(ctx context.Context, misses []string, fullData map[string][]byte, numWorkers int, algorithm string) (
+func computePerceptualHashes(ctx context.Context, misses []string, fullData map[string][]byte, headerBytes map[string][]byte, numWorkers int, algorithm string) (
 	dHashes map[string]uint64,
 	dims map[string][2]int,
 ) {
-	dHashes = make(map[string]uint64, len(misses))
-	dims = make(map[string][2]int, len(misses))
-	var mu sync.Mutex
+	n := len(misses)
+	hashSlice := make([]uint64, n)
+	dimSlice := make([][2]int, n)
 
-	runParallel(ctx, misses, numWorkers, func(path string) {
+	// Lock-free counters for visibility into the header-buffer reuse ratio.
+	// These inform whether the retention cap needs tuning on larger corpora.
+	var hitsFullData, hitsHeaderBuf, reopenCount atomic.Int64
+
+	runParallelIndexed(ctx, n, numWorkers, func(i int) {
+		path := misses[i]
 		var dh uint64
 		var w, h int
 
 		if data, ok := fullData[path]; ok {
 			// Reuse in-memory bytes from the full-read (collision) phase.
+			hitsFullData.Add(1)
 			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 				w, h = cfg.Width, cfg.Height
 			}
@@ -277,20 +348,33 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 			default:
 				dh, _ = computeDHashSmart(data)
 			}
+		} else if header, ok := headerBytes[path]; ok {
+			// Reuse the 64 KB header read from runPartialHashPhase — no new I/O.
+			hitsHeaderBuf.Add(1)
+			dh, w, h, _ = computeDHashFromHeaderBuffer(path, header, algorithm)
 		} else {
-			// Header-only path: reads ~128 KB for EXIF thumbnail + dimensions.
+			// Singleton-by-size (never opened before) or retention-capped:
+			// header-only path reads ~128 KB for EXIF thumbnail + dimensions.
+			reopenCount.Add(1)
 			dh, w, h, _ = computeDHashFromHeader(path, algorithm)
 		}
 
-		mu.Lock()
-		if dh != 0 {
-			dHashes[path] = dh
-		}
-		if w > 0 && h > 0 {
-			dims[path] = [2]int{w, h}
-		}
-		mu.Unlock()
+		hashSlice[i] = dh
+		dimSlice[i] = [2]int{w, h}
 	})
+
+	dHashes = make(map[string]uint64, n)
+	dims = make(map[string][2]int, n)
+	for i, path := range misses {
+		if hashSlice[i] != 0 {
+			dHashes[path] = hashSlice[i]
+		}
+		if dimSlice[i][0] > 0 && dimSlice[i][1] > 0 {
+			dims[path] = dimSlice[i]
+		}
+	}
+	fmt.Printf("[perf] dHash reuse:       fullData=%d headerBuf=%d reopen=%d\n",
+		hitsFullData.Load(), hitsHeaderBuf.Load(), reopenCount.Load())
 	return
 }
 
@@ -322,24 +406,32 @@ func loadMergedCache(scanPaths []string) *HashCache {
 
 // statAllFiles runs os.Stat on every path in parallel and returns a map of
 // path → os.FileInfo. Needed for cache validation and file-size bucketing.
+//
+// Workers write into an index-aligned slice (no mutex). The map is built
+// sequentially once all stats complete.
 func statAllFiles(ctx context.Context, paths []string, numWorkers int, reportFn ProgressCallback, total int) map[string]os.FileInfo {
-	fileInfo := make(map[string]os.FileInfo, total)
+	n := len(paths)
+	infos := make([]os.FileInfo, n)
 	var count atomic.Int32
-	var mu sync.Mutex
 
-	runParallel(ctx, paths, numWorkers, func(path string) {
-		info, err := os.Stat(path)
+	runParallelIndexed(ctx, n, numWorkers, func(i int) {
+		info, err := os.Stat(paths[i])
 		if err != nil {
 			return
 		}
-		mu.Lock()
-		fileInfo[path] = info
-		mu.Unlock()
+		infos[i] = info
 		cur := int(count.Add(1))
 		if (cur%500 == 0 || cur == total) && reportFn != nil {
 			reportFn("Reading file info...", cur, total)
 		}
 	})
+
+	fileInfo := make(map[string]os.FileInfo, n)
+	for i, path := range paths {
+		if infos[i] != nil {
+			fileInfo[path] = infos[i]
+		}
+	}
 	return fileInfo
 }
 
@@ -474,15 +566,16 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 
 	// Phase 3a: Exact-duplicate fast lane (file-size bucketing + partial xxHash).
 	t0 = time.Now()
-	xxHashes, fullData, exactDims := runExactHashPhase(ctx, misses, fileInfo, numWorkers)
+	xxHashes, fullData, exactDims, headerBytes := runExactHashPhase(ctx, misses, fileInfo, numWorkers)
 	if ctx.Err() != nil {
 		return nil
 	}
-	fmt.Printf("[perf] Exact hash (3a):  %.2fs  (%d full reads)\n", time.Since(t0).Seconds(), len(fullData))
+	fmt.Printf("[perf] Exact hash (3a):  %.2fs  (%d full reads, %d header buffers retained)\n",
+		time.Since(t0).Seconds(), len(fullData), len(headerBytes))
 
 	// Phase 3b: Perceptual hash for all cache misses (EXIF thumbnail fast-path).
 	t0 = time.Now()
-	dHashes, percDims := computePerceptualHashes(ctx, misses, fullData, numWorkers, algorithm)
+	dHashes, percDims := computePerceptualHashes(ctx, misses, fullData, headerBytes, numWorkers, algorithm)
 	if ctx.Err() != nil {
 		return nil
 	}
