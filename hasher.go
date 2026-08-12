@@ -48,6 +48,7 @@ import (
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
+	"github.com/Rosca75/heic" // heic.Decoder — reusable HEIC decoder threaded into the HEIC path.
 )
 
 // =============================================================================
@@ -266,12 +267,12 @@ func computeDHashFromImage(img image.Image) uint64 {
 //     These files get dHash=0 and are skipped in perceptual matching.
 //  3. If not found and format is PNG/BMP/GIF/WebP/TIFF: do a full os.ReadFile
 //     and decode (these formats lack embedded thumbnails but Go can decode them).
-func computeDHashFromHeader(path, algorithm string) (dHash uint64, width, height int, err error) {
+func computeDHashFromHeader(dec *heic.Decoder, path, algorithm string) (dHash uint64, width, height int, err error) {
 	ext := strings.ToLower(filepath.Ext(path))
 
 	// HEIC/HEIF: the container requires full file access; use dedicated decoder.
 	if ext == ".heic" || ext == ".heif" {
-		return computeDHashHEIC(path, algorithm)
+		return computeDHashHEIC(dec, path, algorithm)
 	}
 
 	// Read the first 128 KB. io.ReadFull returns io.ErrUnexpectedEOF if the
@@ -293,20 +294,20 @@ func computeDHashFromHeader(path, algorithm string) (dHash uint64, width, height
 	// defer is safe here — all remaining code paths only read from buf.
 	defer headerBufPool.Put(bufPtr)
 
-	return computeDHashFromHeaderBuffer(path, buf[:n], algorithm)
+	return computeDHashFromHeaderBuffer(dec, path, buf[:n], algorithm)
 }
 
 // computeDHashFromHeaderBuffer runs the same decision tree as
 // computeDHashFromHeader but skips the file-open/read step because the header
 // bytes are already in buf. Used by the pipeline to reuse 64 KB buffers read
 // during the partial-hash phase instead of re-opening the file.
-func computeDHashFromHeaderBuffer(path string, buf []byte, algorithm string) (dHash uint64, width, height int, err error) {
+func computeDHashFromHeaderBuffer(dec *heic.Decoder, path string, buf []byte, algorithm string) (dHash uint64, width, height int, err error) {
 	ext := strings.ToLower(filepath.Ext(path))
 
 	// HEIC/HEIF: defer to the dedicated HEIC fast path — it does its own read
 	// at 192 KB which is larger than our 64 KB partial-hash buffer anyway.
 	if ext == ".heic" || ext == ".heif" {
-		return computeDHashHEIC(path, algorithm)
+		return computeDHashHEIC(dec, path, algorithm)
 	}
 
 	if len(buf) == 0 {

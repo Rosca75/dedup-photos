@@ -109,3 +109,60 @@ func runParallelIndexed(ctx context.Context, n int, numWorkers int, fn func(i in
 	}
 	wg.Wait()
 }
+
+// runParallelIndexedWorker is like runParallelIndexed but additionally gives
+// each worker goroutine its own private, reusable state object. This is for
+// work where each goroutine needs a non-concurrency-safe resource that is
+// expensive to create per item — e.g. a reusable HEIC WASM decoder.
+//
+// HOW IT WORKS:
+//   - N goroutines are launched, sharing the same atomic job counter.
+//   - Each goroutine calls newState() ONCE (if provided) to build its private
+//     state, then passes that same state to every fn call it makes.
+//   - When a goroutine finishes, closeState(state) is called (if provided) so
+//     the resource can be released.
+//
+// Because each goroutine owns exactly one state for its whole lifetime, fn may
+// safely use non-concurrency-safe resources stored in state.
+//
+// Parameters:
+//   - ctx:        Cancellation context; workers exit early when cancelled.
+//   - n:          Number of jobs (fn is called with i in [0, n)).
+//   - numWorkers: Degree of parallelism.
+//   - newState:   Builds a worker's private state (called once per goroutine).
+//                 May be nil, in which case state is always nil.
+//   - closeState: Releases a worker's state when the goroutine exits. May be nil.
+//   - fn:         Work function receiving the job index and the worker's state.
+func runParallelIndexedWorker(ctx context.Context, n int, numWorkers int, newState func() any, closeState func(any), fn func(i int, state any)) {
+	if n == 0 {
+		return
+	}
+	var idx atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Build this goroutine's private state once, and guarantee it is
+			// released when the goroutine exits (normal or via cancellation).
+			var state any
+			if newState != nil {
+				state = newState()
+			}
+			if closeState != nil {
+				defer closeState(state)
+			}
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				i := int(idx.Add(1)) - 1
+				if i >= n {
+					return
+				}
+				fn(i, state)
+			}
+		}()
+	}
+	wg.Wait()
+}

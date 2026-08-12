@@ -290,6 +290,7 @@ func (a *App) DeleteFile(path string) map[string]interface{} {
 		return map[string]interface{}{"success": false, "error": fmt.Sprintf("failed to delete: %v", err)}
 	}
 	thumbnailCache.Delete(path) // Remove from thumbnail cache.
+	deleteThumbCache(path)      // Remove any persisted on-disk thumbnail.
 	log.Printf("[delete] Permanently deleted: %s", path)
 	return map[string]interface{}{"success": true, "message": "Deleted: " + path}
 }
@@ -312,6 +313,15 @@ func (a *App) GetThumbnail(path string) string {
 		return base64.StdEncoding.EncodeToString(cached.([]byte))
 	}
 
+	// Serve from the on-disk thumbnail cache if a valid entry exists. This is
+	// populated during the scan's hash phase, so HEIC files (and any file we
+	// previously thumbnailed) never need to be decoded again after a scan or
+	// an app restart.
+	if disk, ok := loadThumbCache(path); ok {
+		thumbnailCache.Store(path, disk)
+		return base64.StdEncoding.EncodeToString(disk)
+	}
+
 	// HEIC/HEIF fast path: use embedded thumbnail when available.
 	if isHEIC(path) {
 		jpegBytes, err := heicThumbnailJPEG(path)
@@ -319,6 +329,7 @@ func (a *App) GetThumbnail(path string) string {
 			return ""
 		}
 		thumbnailCache.Store(path, jpegBytes)
+		storeThumbCache(path, jpegBytes) // Persist for next time / after restart.
 		return base64.StdEncoding.EncodeToString(jpegBytes)
 	}
 
