@@ -23,11 +23,58 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic" // atomic.Int64 — lock-free counters for the HEIC decode ladder.
+	"time"        // time.Now/time.Since — measure the full-read fallback branch.
 
 	"github.com/Rosca75/heic"
 	"github.com/bep/imagemeta"
 	"golang.org/x/image/draw"
 )
+
+// =============================================================================
+// HEIC decode-ladder instrumentation (perf tracing — Trace 1)
+// =============================================================================
+//
+// decodeHEICFromHeader tries four "rungs" in order until one decodes an image.
+// To find out WHERE the scan spends its HEIC time we count how often each rung
+// succeeds, plus the total time and bytes spent in the expensive full-file
+// os.ReadFile fallback. Everything below is aggregate-only (a handful of atomic
+// counters), so it adds no per-file logging and negligible overhead.
+//
+// These are package-level so every worker goroutine bumps the same counters.
+// atomic.Int64 makes concurrent Add/Load safe without a mutex.
+var (
+	heicLadderThumbHeader   atomic.Int64 // Rung 1: embedded thumbnail from the 192 KB header.
+	heicLadderPrimaryHeader atomic.Int64 // Rung 2: primary image from the header window.
+	heicLadderFullThumb     atomic.Int64 // Rung 3: thumbnail after a full os.ReadFile.
+	heicLadderFullPrimary   atomic.Int64 // Rung 4: primary after a full os.ReadFile.
+	heicLadderFail          atomic.Int64 // No rung succeeded — decode failed entirely.
+	heicLadderFullReadNs    atomic.Int64 // Total nanoseconds spent in the full-read fallback branch.
+	heicLadderFullReadBytes atomic.Int64 // Total bytes read by the full-read fallback branch.
+)
+
+// printAndResetHEICLadder prints one aggregate [perf] line for the HEIC decode
+// ladder, then resets every counter to zero so a subsequent scan in the same
+// app session starts fresh. Called once at the end of Phase 3b.
+func printAndResetHEICLadder() {
+	fmt.Printf("[perf] HEIC ladder: thumbHdr=%d primaryHdr=%d fullThumb=%d fullPrimary=%d fail=%d | fullReadFallback=%.2fs (%.1fMB)\n",
+		heicLadderThumbHeader.Load(),
+		heicLadderPrimaryHeader.Load(),
+		heicLadderFullThumb.Load(),
+		heicLadderFullPrimary.Load(),
+		heicLadderFail.Load(),
+		float64(heicLadderFullReadNs.Load())/1e9,
+		float64(heicLadderFullReadBytes.Load())/(1024*1024),
+	)
+	// Reset all counters (Store(0)) for the next scan.
+	heicLadderThumbHeader.Store(0)
+	heicLadderPrimaryHeader.Store(0)
+	heicLadderFullThumb.Store(0)
+	heicLadderFullPrimary.Store(0)
+	heicLadderFail.Store(0)
+	heicLadderFullReadNs.Store(0)
+	heicLadderFullReadBytes.Store(0)
+}
 
 // heicHeaderReadSize is the byte-range size used by the HEIC fast path.
 // 192 KB comfortably covers the ftyp + meta + iloc + thumbnail tile on
@@ -135,23 +182,43 @@ func heicDecodePrimary(dec *heic.Decoder, r io.Reader) (image.Image, error) {
 // decode. This is the shared decode core for both the UI thumbnail path and the
 // perceptual-hash path, so they always agree on which image is produced.
 func decodeHEICFromHeader(dec *heic.Decoder, path string, header []byte) (image.Image, error) {
-	// Fast path: embedded thumbnail from the header window.
+	// Rung 1 — Fast path: embedded thumbnail from the header window.
 	if img, err := heicDecodeThumb(dec, bytes.NewReader(header)); err == nil {
+		heicLadderThumbHeader.Add(1)
 		return img, nil
 	}
-	// Fallback 1: primary image from the header (files without a thumbnail iref).
+	// Rung 2 — Fallback 1: primary image from the header (no thumbnail iref).
 	if img, err := heicDecodePrimary(dec, bytes.NewReader(header)); err == nil {
+		heicLadderPrimaryHeader.Add(1)
 		return img, nil
 	}
-	// Fallback 2: full file read (thumbnail tile past the header window).
+	// Rungs 3 & 4 — Fallback 2: full file read (thumbnail tile past the header
+	// window). This branch is the expensive one, so we time it and record how
+	// many bytes it reads to quantify the cost of files that miss the header.
+	fullReadStart := time.Now()
 	data, err := os.ReadFile(path)
 	if err != nil {
+		// Still record the time spent attempting the read before giving up.
+		heicLadderFullReadNs.Add(int64(time.Since(fullReadStart)))
+		heicLadderFail.Add(1)
 		return nil, err
 	}
+	heicLadderFullReadBytes.Add(int64(len(data)))
+	// Rung 3: thumbnail from the full file.
 	if img, err := heicDecodeThumb(dec, bytes.NewReader(data)); err == nil {
+		heicLadderFullReadNs.Add(int64(time.Since(fullReadStart)))
+		heicLadderFullThumb.Add(1)
 		return img, nil
 	}
-	return heicDecodePrimary(dec, bytes.NewReader(data))
+	// Rung 4: primary from the full file (last resort).
+	img, err := heicDecodePrimary(dec, bytes.NewReader(data))
+	heicLadderFullReadNs.Add(int64(time.Since(fullReadStart)))
+	if err != nil {
+		heicLadderFail.Add(1)
+	} else {
+		heicLadderFullPrimary.Add(1)
+	}
+	return img, err
 }
 
 // decodeHEICThumbnail decodes the embedded thumbnail from a HEIC file using

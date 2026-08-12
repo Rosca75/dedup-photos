@@ -8,7 +8,7 @@ package main
 
 import (
 	"fmt"
-	"io"     // io.ReadSeeker required by imagemeta.Options.
+	"io" // io.ReadSeeker required by imagemeta.Options.
 	"strings"
 	"time"
 

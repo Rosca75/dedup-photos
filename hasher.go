@@ -364,4 +364,3 @@ func computeDHashFromHeaderBuffer(dec *heic.Decoder, path string, buf []byte, al
 func HammingDistance(a, b uint64) int {
 	return bits.OnesCount64(a ^ b)
 }
-
