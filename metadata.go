@@ -32,6 +32,8 @@ import (
 	"path/filepath" // File path manipulation (extracting filenames).
 	"strings"       // String manipulation.
 	"sync"          // sync.Pool — reusable buffer pool for ExtractMetadataFast.
+	"sync/atomic"   // atomic.Int64 — lock-free metadata-split accumulators (perf Trace 3).
+	"time"          // time.Now/time.Since — measure the read vs. EXIF split (perf Trace 3).
 
 	// Standard image decoders (registered via blank imports in hasher.go,
 	// but we list them here too for clarity about what formats we support).
@@ -141,6 +143,37 @@ var metaBufPool = sync.Pool{
 }
 
 // =============================================================================
+// Metadata-split instrumentation (perf tracing — Trace 3)
+// =============================================================================
+//
+// ExtractMetadataFast does two potentially expensive things per file: a 128 KB
+// io.ReadFull, and EXIF extraction. For HEIC the EXIF step re-opens the file
+// (extractHEICExif), which makes the 128 KB read pure waste for HEIC — this
+// instrumentation measures that so we can quantify it. Aggregate-only: we sum
+// the wall time of each step across all workers and count HEIC vs. other files.
+var (
+	metaRead128kNs atomic.Int64 // Summed worker time in the 128 KB io.ReadFull.
+	metaExifNs     atomic.Int64 // Summed worker time in EXIF extraction.
+	metaHeicCount  atomic.Int64 // HEIC files processed.
+	metaOtherCount atomic.Int64 // Non-HEIC files processed.
+)
+
+// printAndResetMetadataSplit prints one aggregate [perf] line for the metadata
+// phase, then resets the counters so the next scan starts fresh.
+func printAndResetMetadataSplit() {
+	fmt.Printf("[perf] Metadata split: read128k=%.2fs exif=%.2fs | heic=%d other=%d\n",
+		float64(metaRead128kNs.Load())/1e9,
+		float64(metaExifNs.Load())/1e9,
+		metaHeicCount.Load(),
+		metaOtherCount.Load(),
+	)
+	metaRead128kNs.Store(0)
+	metaExifNs.Store(0)
+	metaHeicCount.Store(0)
+	metaOtherCount.Store(0)
+}
+
+// =============================================================================
 // ExtractMetadataFast — Single-open metadata extraction
 // =============================================================================
 
@@ -181,7 +214,10 @@ func ExtractMetadataFast(path string, width, height int, size int64) ImageMetada
 	bufPtr := metaBufPool.Get().(*[]byte)
 	defer metaBufPool.Put(bufPtr)
 	buf := *bufPtr
+	// Perf tracing (Trace 3): time the 128 KB read.
+	readStart := time.Now()
 	n, _ := io.ReadFull(f, buf)
+	metaRead128kNs.Add(int64(time.Since(readStart)))
 	f.Close()
 
 	if n == 0 {
@@ -200,11 +236,20 @@ func ExtractMetadataFast(path string, width, height int, size int64) ImageMetada
 
 	// Step 4: Extract EXIF from the 128 KB buffer (no second file open).
 	// HEIC/HEIF needs the full ISOBMFF container, so it opens the file itself.
+	// Perf tracing (Trace 3): time the EXIF step and bucket HEIC vs. other.
 	ext := strings.ToLower(filepath.Ext(path))
+	exifStart := time.Now()
 	if isHEIC(path) {
 		extractHEICExif(path, &meta)
+		metaExifNs.Add(int64(time.Since(exifStart)))
+		metaHeicCount.Add(1)
 	} else if format, ok := imageFormatForExt(ext); ok {
 		extractExifInto(bytes.NewReader(buf), format, &meta)
+		metaExifNs.Add(int64(time.Since(exifStart)))
+		metaOtherCount.Add(1)
+	} else {
+		// No EXIF extraction attempted, but still count the file as non-HEIC.
+		metaOtherCount.Add(1)
 	}
 
 	// Step 5: Compute quality score.

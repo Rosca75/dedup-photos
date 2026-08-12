@@ -308,6 +308,44 @@ func runExactHashPhase(ctx context.Context, misses []string, fileInfo map[string
 // computePerceptualHashes — Phase 3b: dHash for all cache-miss files (#1, #3)
 // =============================================================================
 
+// =============================================================================
+// Phase 3b split instrumentation (perf tracing — Trace 2)
+// =============================================================================
+//
+// Phase 3b's per-file worker does two costly things: (a) the fingerprint call
+// (computeDHash*), which for HEIC includes a WASM decode, and (b) for HEIC only,
+// storing the decoded thumbnail to the on-disk cache (storeHEICThumbCache).
+// To see how the time splits we sum the wall time of each sub-step across ALL
+// worker goroutines (so the totals exceed wall-clock time — that is intended:
+// comparing summed worker-seconds to wall time reveals parallel efficiency).
+//
+// We also bucket files into three categories so we know which decode path each
+// took. All accumulators are package-level atomics bumped from every goroutine.
+var (
+	phase3bFingerprintNs atomic.Int64 // Summed worker time in the computeDHash* call.
+	phase3bThumbStoreNs  atomic.Int64 // Summed worker time in storeHEICThumbCache (HEIC only).
+	phase3bHeic          atomic.Int64 // Files handled via the HEIC decode path.
+	phase3bJpegThumb     atomic.Int64 // Non-HEIC files served from a retained header buffer.
+	phase3bOther         atomic.Int64 // Non-HEIC files that reused full data or were re-opened.
+)
+
+// printAndResetPhase3bSplit prints one aggregate [perf] line summarising the
+// Phase 3b time split, then resets the counters for the next scan.
+func printAndResetPhase3bSplit() {
+	fmt.Printf("[perf] 3b split: fingerprint=%.2fs thumbstore=%.2fs | heic=%d jpegThumb=%d other=%d\n",
+		float64(phase3bFingerprintNs.Load())/1e9,
+		float64(phase3bThumbStoreNs.Load())/1e9,
+		phase3bHeic.Load(),
+		phase3bJpegThumb.Load(),
+		phase3bOther.Load(),
+	)
+	phase3bFingerprintNs.Store(0)
+	phase3bThumbStoreNs.Store(0)
+	phase3bHeic.Store(0)
+	phase3bJpegThumb.Store(0)
+	phase3bOther.Store(0)
+}
+
 // computePerceptualHashes computes the perceptual hash (dHash or pHash) for
 // every cache-miss file. Files already in fullData reuse their in-memory bytes
 // (no extra I/O). All other files are read as a 128 KB header so that the EXIF
@@ -344,6 +382,13 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 			var dh uint64
 			var w, h int
 
+			// Perf tracing (Trace 2): bucket this file by decode path and time
+			// the fingerprint call. isHEIC takes precedence because HEIC files
+			// always go through the WASM decode path regardless of which branch
+			// below selects them.
+			fileIsHEIC := isHEIC(path)
+
+			fpStart := time.Now()
 			if data, ok := fullData[path]; ok {
 				// Reuse in-memory bytes from the full-read (collision) phase.
 				hitsFullData.Add(1)
@@ -365,6 +410,19 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 				// header-only path reads ~128 KB for EXIF thumbnail + dimensions.
 				reopenCount.Add(1)
 				dh, w, h, _ = computeDHashFromHeader(dec, path, algorithm)
+			}
+			// Accumulate the summed fingerprint time across all workers.
+			phase3bFingerprintNs.Add(int64(time.Since(fpStart)))
+
+			// Category counters: HEIC first, then non-HEIC by branch. jpegThumb
+			// counts non-HEIC files served from a retained header buffer; other
+			// covers non-HEIC full-data reuse and re-opened files.
+			if fileIsHEIC {
+				phase3bHeic.Add(1)
+			} else if _, ok := headerBytes[path]; ok {
+				phase3bJpegThumb.Add(1)
+			} else {
+				phase3bOther.Add(1)
 			}
 
 			hashSlice[i] = dh
@@ -588,6 +646,9 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 		return nil
 	}
 	fmt.Printf("[perf] Perceptual (3b):  %.2fs\n", time.Since(t0).Seconds())
+	// Perf tracing: aggregate summaries for Phase 3b (HEIC ladder + time split).
+	printAndResetHEICLadder()
+	printAndResetPhase3bSplit()
 
 	// Merge dimension maps: full-read dims take precedence over header dims.
 	for path, d := range percDims {

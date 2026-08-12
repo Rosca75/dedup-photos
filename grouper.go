@@ -475,6 +475,8 @@ func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []Du
 	allPaths := collectUniquePaths(exactGroups, percGroups)
 	fmt.Printf("[grouper] Extracting metadata for %d files (parallel)...\n", len(allPaths))
 	metaMap := parallelExtractMetadata(context.Background(), allPaths, hashMap)
+	// Perf tracing (Trace 3): report the read-vs-EXIF split for the metadata phase.
+	printAndResetMetadataSplit()
 
 	// Build DuplicateGroup structs from pre-computed metadata.
 	var groups []DuplicateGroup
