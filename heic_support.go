@@ -293,9 +293,6 @@ func resizeImageToJPEG(img image.Image, maxDim, quality int) []byte {
 // dec is the calling worker's reusable decoder (may be nil to fall back to
 // per-call decoding). Reusing one WASM module instance per worker avoids the
 // dominant per-call instantiation cost across a batch of HEIC files.
-//
-// As a side effect, the decoded thumbnail is persisted to the on-disk thumbnail
-// cache so the UI (GetThumbnail) and app restarts never have to re-decode it.
 func computeDHashHEIC(dec *heic.Decoder, path, algorithm string) (dHash uint64, width, height int, err error) {
 	header, hdrErr := readHEICHeader(path)
 	if hdrErr != nil {
@@ -318,11 +315,11 @@ func computeDHashHEIC(dec *heic.Decoder, path, algorithm string) (dHash uint64, 
 		return 0, width, height, ErrNoThumbnail
 	}
 
-	// Secondary win: persist the decoded thumbnail as JPEG so the UI and app
-	// restarts reuse it instead of decoding again. Best-effort — never fails
-	// the hash on a cache-write error.
-	storeHEICThumbCache(path, img)
-
+	// Note: we intentionally do NOT persist a JPEG thumbnail here. Generating a
+	// thumbnail for every HEIC during the scan (resize + JPEG encode + disk
+	// write for thousands of files, the vast majority of which are never
+	// viewed) was a major hot-path cost. Thumbnails are now produced lazily on
+	// first view in GetThumbnail, which caches them to disk on demand.
 	return computeDHashFromImage(img), width, height, nil
 }
 
