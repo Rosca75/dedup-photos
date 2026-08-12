@@ -323,7 +323,7 @@ func runExactHashPhase(ctx context.Context, misses []string, fileInfo map[string
 // took. All accumulators are package-level atomics bumped from every goroutine.
 var (
 	phase3bFingerprintNs atomic.Int64 // Summed worker time in the computeDHash* call.
-	phase3bThumbStoreNs  atomic.Int64 // Summed worker time in storeHEICThumbCache (HEIC only).
+	phase3bThumbStoreNs  atomic.Int64 // Deprecated: HEIC thumbnails are now generated lazily in GetThumbnail, so this stays 0.
 	phase3bHeic          atomic.Int64 // Files handled via the HEIC decode path.
 	phase3bJpegThumb     atomic.Int64 // Non-HEIC files served from a retained header buffer.
 	phase3bOther         atomic.Int64 // Non-HEIC files that reused full data or were re-opened.

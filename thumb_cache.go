@@ -25,10 +25,8 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
-	"image"
 	"os"
 	"path/filepath"
-	"time" // time.Now/time.Since — measure the HEIC thumb-store cost (perf Trace 2).
 )
 
 // thumbCacheDir returns (and lazily creates) the thumbnail cache directory.
@@ -97,24 +95,6 @@ func storeThumbCache(path string, jpegBytes []byte) {
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		os.Remove(tmp)
-	}
-}
-
-// storeHEICThumbCache JPEG-encodes a decoded HEIC image (max 400px, quality 85 —
-// identical to heicThumbnailJPEG so the UI reuses byte-for-byte the same output)
-// and persists it. Called from the hash phase after a HEIC thumbnail is decoded.
-func storeHEICThumbCache(path string, img image.Image) {
-	if img == nil {
-		return
-	}
-	// Perf tracing (Trace 2): time the encode + write so Phase 3b can report how
-	// much of its wall time is spent persisting HEIC thumbnails vs. decoding.
-	// phase3bThumbStoreNs is a package-level atomic declared in hasher_pipeline.go.
-	start := time.Now()
-	defer func() { phase3bThumbStoreNs.Add(int64(time.Since(start))) }()
-
-	if jpegBytes := resizeImageToJPEG(img, 400, 85); jpegBytes != nil {
-		storeThumbCache(path, jpegBytes)
 	}
 }
 

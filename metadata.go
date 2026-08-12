@@ -202,6 +202,22 @@ func ExtractMetadataFast(path string, width, height int, size int64) ImageMetada
 		}
 	}
 
+	// HEIC/HEIF fast path: skip the 128 KB header read entirely.
+	// For HEIC that read was pure waste — dimensions are already pre-computed
+	// during the hash phase (passed in as width/height), image.DecodeConfig
+	// cannot parse the ISOBMFF container anyway, and extractHEICExif re-opens
+	// the file itself to read EXIF. Reading 128 KB per HEIC (thousands of files,
+	// often over a slow network share) bought us nothing, so we go straight to
+	// EXIF extraction here.
+	if isHEIC(path) {
+		exifStart := time.Now()
+		extractHEICExif(path, &meta)
+		metaExifNs.Add(int64(time.Since(exifStart)))
+		metaHeicCount.Add(1)
+		meta.QualityScore = ComputeQualityScore(&meta)
+		return meta
+	}
+
 	// Step 2: Single file open → read first 128 KB → extract everything.
 	// 128 KB is enough to contain the full EXIF header for virtually all
 	// camera JPEGs.
@@ -235,15 +251,12 @@ func ExtractMetadataFast(path string, width, height int, size int64) ImageMetada
 	}
 
 	// Step 4: Extract EXIF from the 128 KB buffer (no second file open).
-	// HEIC/HEIF needs the full ISOBMFF container, so it opens the file itself.
-	// Perf tracing (Trace 3): time the EXIF step and bucket HEIC vs. other.
+	// HEIC/HEIF was already handled by the fast path above, so only non-HEIC
+	// formats reach this point.
+	// Perf tracing (Trace 3): time the EXIF step.
 	ext := strings.ToLower(filepath.Ext(path))
 	exifStart := time.Now()
-	if isHEIC(path) {
-		extractHEICExif(path, &meta)
-		metaExifNs.Add(int64(time.Since(exifStart)))
-		metaHeicCount.Add(1)
-	} else if format, ok := imageFormatForExt(ext); ok {
+	if format, ok := imageFormatForExt(ext); ok {
 		extractExifInto(bytes.NewReader(buf), format, &meta)
 		metaExifNs.Add(int64(time.Since(exifStart)))
 		metaOtherCount.Add(1)
