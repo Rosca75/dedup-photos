@@ -112,9 +112,9 @@ func buildFileSizeBuckets(paths []string, fileInfo map[string]os.FileInfo) (sing
 //   - partials:      path → 64 KB partial xxHash value.
 //   - partialGroups: partial hash → list of paths (for collision detection).
 //   - headerBytes:   path → 64 KB header buffer (only for paths whose partial
-//                    hash is unique across the batch; buffers for collision
-//                    candidates are dropped since those files are re-read in
-//                    full during the collision phase).
+//     hash is unique across the batch; buffers for collision
+//     candidates are dropped since those files are re-read in
+//     full during the collision phase).
 func runPartialHashPhase(ctx context.Context, sameSizePaths []string, numWorkers int) (
 	partials map[string]uint64,
 	partialGroups map[uint64][]string,

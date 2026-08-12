@@ -41,7 +41,6 @@ import (
 //	.bmp         — Uncompressed bitmap, legacy format.
 //	.webp        — Modern format by Google, good compression.
 //	.gif         — Supports animation, limited to 256 colors.
-//
 var supportedExtensions = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,

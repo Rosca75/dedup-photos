@@ -83,8 +83,8 @@ func runParallel(ctx context.Context, paths []string, numWorkers int, fn func(st
 //   - n:          Number of jobs (fn is called with i in [0, n)).
 //   - numWorkers: Degree of parallelism.
 //   - fn:         Work function receiving the job index. MUST be safe to call
-//                 concurrently. Writes to shared slices at index i are safe
-//                 as long as each i is written by only one goroutine.
+//     concurrently. Writes to shared slices at index i are safe
+//     as long as each i is written by only one goroutine.
 func runParallelIndexed(ctx context.Context, n int, numWorkers int, fn func(i int)) {
 	if n == 0 {
 		return
@@ -130,7 +130,7 @@ func runParallelIndexed(ctx context.Context, n int, numWorkers int, fn func(i in
 //   - n:          Number of jobs (fn is called with i in [0, n)).
 //   - numWorkers: Degree of parallelism.
 //   - newState:   Builds a worker's private state (called once per goroutine).
-//                 May be nil, in which case state is always nil.
+//     May be nil, in which case state is always nil.
 //   - closeState: Releases a worker's state when the goroutine exits. May be nil.
 //   - fn:         Work function receiving the job index and the worker's state.
 func runParallelIndexedWorker(ctx context.Context, n int, numWorkers int, newState func() any, closeState func(any), fn func(i int, state any)) {
