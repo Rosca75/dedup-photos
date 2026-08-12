@@ -74,39 +74,103 @@ func readHEICHeader(path string) ([]byte, error) {
 	return buf[:n], nil
 }
 
-// decodeHEICThumbnail decodes the embedded thumbnail from a HEIC file using
-// the fast path: read first ~192 KB, hand to the WASM decoder. Falls back to
-// a full file read on failure.
-func decodeHEICThumbnail(path string) (image.Image, error) {
-	// Fast path: read only the header + thumbnail tile region.
-	header, err := readHEICHeader(path)
-	if err != nil {
-		return nil, err
+// heicDecoderWorker holds a per-goroutine reusable HEIC decoder for the
+// perceptual-hash phase. The underlying WASM module instance is expensive to
+// create, so we build it lazily on the first HEIC file a worker encounters —
+// corpora with no HEIC files never instantiate one. It is NOT concurrency-safe:
+// exactly one heicDecoderWorker per worker goroutine.
+type heicDecoderWorker struct {
+	dec    *heic.Decoder // Reusable decoder; nil until first use (or on failure).
+	inited bool          // Whether we've already attempted to create dec.
+}
+
+// decoder returns this worker's reusable decoder, creating it on first use.
+// Returns nil if creation failed, in which case callers fall back to the
+// package-level per-call decode functions (correct, just slower).
+func (w *heicDecoderWorker) decoder() *heic.Decoder {
+	if w == nil {
+		return nil
 	}
-	if img, thumbErr := heic.DecodeThumbnail(bytes.NewReader(header)); thumbErr == nil {
+	if !w.inited {
+		w.inited = true
+		d, err := heic.NewDecoder()
+		if err != nil {
+			// Log once per worker; the scan continues via package-level decode.
+			log.Printf("[heic] NewDecoder failed, using per-call decode: %v", err)
+			return nil
+		}
+		w.dec = d
+	}
+	return w.dec
+}
+
+// close releases the worker's decoder. Safe to call when no decoder was built.
+func (w *heicDecoderWorker) close() {
+	if w != nil && w.dec != nil {
+		_ = w.dec.Close()
+		w.dec = nil
+	}
+}
+
+// heicDecodeThumb decodes an embedded thumbnail from r. When dec is non-nil the
+// reusable decoder is used (fast batch path); otherwise the package-level
+// per-call function is used. Both produce byte-identical output.
+func heicDecodeThumb(dec *heic.Decoder, r io.Reader) (image.Image, error) {
+	if dec != nil {
+		return dec.DecodeThumbnail(r)
+	}
+	return heic.DecodeThumbnail(r)
+}
+
+// heicDecodePrimary decodes the primary image from r, using dec when non-nil.
+func heicDecodePrimary(dec *heic.Decoder, r io.Reader) (image.Image, error) {
+	if dec != nil {
+		return dec.Decode(r)
+	}
+	return heic.Decode(r)
+}
+
+// decodeHEICFromHeader runs the thumb → primary → full-file-read fallback ladder
+// against an already-read header buffer, using dec (when non-nil) for every
+// decode. This is the shared decode core for both the UI thumbnail path and the
+// perceptual-hash path, so they always agree on which image is produced.
+func decodeHEICFromHeader(dec *heic.Decoder, path string, header []byte) (image.Image, error) {
+	// Fast path: embedded thumbnail from the header window.
+	if img, err := heicDecodeThumb(dec, bytes.NewReader(header)); err == nil {
 		return img, nil
 	}
-	// Fallback 1: decode the primary image from the header (for files without
-	// an embedded thumbnail iref).
-	if img, decErr := heic.Decode(bytes.NewReader(header)); decErr == nil {
+	// Fallback 1: primary image from the header (files without a thumbnail iref).
+	if img, err := heicDecodePrimary(dec, bytes.NewReader(header)); err == nil {
 		return img, nil
 	}
-	// Fallback 2: full file read. Rare on typical iPhone HEIC but safe for
-	// unusual files whose thumbnail tile sits past the 192 KB window.
+	// Fallback 2: full file read (thumbnail tile past the header window).
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	if img, thumbErr := heic.DecodeThumbnail(bytes.NewReader(data)); thumbErr == nil {
+	if img, err := heicDecodeThumb(dec, bytes.NewReader(data)); err == nil {
 		return img, nil
 	}
-	return heic.Decode(bytes.NewReader(data))
+	return heicDecodePrimary(dec, bytes.NewReader(data))
+}
+
+// decodeHEICThumbnail decodes the embedded thumbnail from a HEIC file using
+// the fast path: read first ~192 KB, hand to the WASM decoder. Falls back to
+// a full file read on failure. dec may be nil (UI path) to use per-call decode.
+func decodeHEICThumbnail(dec *heic.Decoder, path string) (image.Image, error) {
+	header, err := readHEICHeader(path)
+	if err != nil {
+		return nil, err
+	}
+	return decodeHEICFromHeader(dec, path, header)
 }
 
 // heicThumbnailJPEG returns a JPEG-encoded, max-400px thumbnail for a HEIC
 // file. Uses the byte-range fast path to avoid reading the full 3 MB file.
+// Uses per-call decoding (dec=nil) — this is the interactive UI path, not the
+// batch scan path, so a reusable decoder isn't warranted here.
 func heicThumbnailJPEG(path string) ([]byte, error) {
-	img, err := decodeHEICThumbnail(path)
+	img, err := decodeHEICThumbnail(nil, path)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +222,14 @@ func resizeImageToJPEG(img image.Image, maxDim, quality int) []byte {
 // computeDHashHEIC computes a dHash and image dimensions for a HEIC file.
 // Uses the byte-range fast path: one 192 KB read covers the ISOBMFF header
 // (for dimensions via imagemeta) and the thumbnail tile (decoded via WASM).
-func computeDHashHEIC(path, algorithm string) (dHash uint64, width, height int, err error) {
+//
+// dec is the calling worker's reusable decoder (may be nil to fall back to
+// per-call decoding). Reusing one WASM module instance per worker avoids the
+// dominant per-call instantiation cost across a batch of HEIC files.
+//
+// As a side effect, the decoded thumbnail is persisted to the on-disk thumbnail
+// cache so the UI (GetThumbnail) and app restarts never have to re-decode it.
+func computeDHashHEIC(dec *heic.Decoder, path, algorithm string) (dHash uint64, width, height int, err error) {
 	header, hdrErr := readHEICHeader(path)
 	if hdrErr != nil {
 		return 0, 0, 0, ErrNoThumbnail
@@ -173,26 +244,17 @@ func computeDHashHEIC(path, algorithm string) (dHash uint64, width, height int, 
 		width, height = res.ImageConfig.Width, res.ImageConfig.Height
 	}
 
-	img, thumbErr := heic.DecodeThumbnail(bytes.NewReader(header))
-	if thumbErr != nil {
-		// No embedded thumbnail in the 192 KB window — try primary decode
-		// from the same buffer before falling back to full file read.
-		var decErr error
-		img, decErr = heic.Decode(bytes.NewReader(header))
-		if decErr != nil {
-			data, readErr := os.ReadFile(path)
-			if readErr != nil {
-				return 0, width, height, ErrNoThumbnail
-			}
-			img, decErr = heic.DecodeThumbnail(bytes.NewReader(data))
-			if decErr != nil {
-				img, decErr = heic.Decode(bytes.NewReader(data))
-				if decErr != nil {
-					return 0, width, height, ErrNoThumbnail
-				}
-			}
-		}
+	// Decode via the shared thumb → primary → full-read ladder, reusing the
+	// worker's decoder. Byte-identical to the previous per-call ladder.
+	img, decErr := decodeHEICFromHeader(dec, path, header)
+	if decErr != nil {
+		return 0, width, height, ErrNoThumbnail
 	}
+
+	// Secondary win: persist the decoded thumbnail as JPEG so the UI and app
+	// restarts reuse it instead of decoding again. Best-effort — never fails
+	// the hash on a cache-write error.
+	storeHEICThumbCache(path, img)
 
 	return computeDHashFromImage(img), width, height, nil
 }
