@@ -14,10 +14,13 @@
 //   3. JS calls Go methods asynchronously (they return Promises).
 //   4. Go structs are automatically serialised to/from JavaScript objects.
 //
-// BUILD COMMANDS:
+// BUILD COMMANDS (run from the directory holding wails.json):
 //   wails build          — Production binary for the current OS
 //   wails dev            — Development mode with live reload
 //   go build ./...       — Verify Go compilation only (no Wails window)
+//
+// On Ubuntu 24.04+ append -tags webkit2_41 to the wails commands: Wails links
+// webkit2gtk-4.0 by default and those releases ship only 4.1.
 // =============================================================================
 
 package main

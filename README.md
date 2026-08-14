@@ -39,29 +39,34 @@ This is a runtime dependency — it is not bundled into the binary.
    - **Windows**: download `dedup-photos.exe` — double-click or run from terminal, no install needed.
    - **Linux**: download `dedup-photos-linux`. Make it executable first: `chmod +x dedup-photos-linux`. Ensure [WebKit2GTK is installed](#linux-requirements).
 
-2. Run DedupPhotos, pointing it at the directory you want to scan:
+2. Run DedupPhotos. It opens its own native window — there is no server and no port, and it
+   takes no command-line arguments:
 
    ```sh
-   ./dedup-photos /path/to/photos
+   ./dedup-photos-linux
    ```
 
-3. Open your browser to the address shown in the terminal (default: `http://localhost:8080`) to review duplicates.
+3. Pick the folder to scan with the **Browse** button in the top bar, then press **Scan**.
+   Duplicate groups appear in the main area for review.
 
 ## Build from Source
 
-Requires Go 1.22+, Node.js 20+, and the [Wails CLI](https://wails.io/docs/gettingstarted/installation).
+Requires Go 1.25+, Node.js 20+, and the [Wails CLI](https://wails.io/docs/gettingstarted/installation).
 
 ### Install Wails
+Keep the CLI on the same version as the `wails/v2` module in `go.mod`:
 ```bash
-go install github.com/wailsapp/wails/v2/cmd/wails@latest
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
 ```
 
 ### Linux — additional system dependencies required
 ```bash
-sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev pkg-config
+# Ubuntu 24.04+ ships webkit2gtk 4.1; 22.04 and older ship 4.0.
+sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
 ```
 
 ### Build
+Run from the directory containing `wails.json` — the repository root.
 ```bash
 git clone https://github.com/Rosca75/dedup-photos.git
 cd dedup-photos
@@ -69,9 +74,12 @@ cd dedup-photos
 # Windows
 wails build -platform windows/amd64
 
-# Linux
-wails build -platform linux/amd64
+# Linux (drop -tags webkit2_41 on distros that still ship webkit2gtk-4.0)
+wails build -platform linux/amd64 -tags webkit2_41
 ```
+
+Without `-tags webkit2_41` on Ubuntu 24.04+, the build fails with
+`Package 'webkit2gtk-4.0', required by 'virtual:world', not found`.
 
 Output is placed in `build/bin/`.
 

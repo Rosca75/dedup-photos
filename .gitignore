@@ -1,6 +1,11 @@
 # Binary outputs
 dedup-photos
 dedup-photos.exe
+dedup-photos-linux
+
+# Wails-generated output — both are recreated by every `wails dev` / `wails build`
+build/bin/
+frontend/wailsjs/
 
 # Go build artifacts
 *.o

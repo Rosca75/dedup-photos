@@ -18,16 +18,37 @@ directly in the binary — no browser, no localhost port.
 - **Go code must be heavily commented** — explain every function and non-obvious block
 - Build command: `wails build -platform windows/amd64`
 - Dev mode (live reload): `wails dev`
-- Prerequisites: Go 1.21+, Wails CLI v2 (`go install github.com/wailsapp/wails/v2/cmd/wails@latest`),
-  Node.js 16+ (required by Wails toolchain), WebView2 (pre-installed on Windows 10/11)
+- Prerequisites: Go 1.25+ (`go.mod` declares `go 1.25.0`), Wails CLI v2.13.0
+  (`go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0` — keep the CLI and the
+  `wails/v2` module in `go.mod` on the same version), Node.js 16+ (required by the Wails
+  toolchain), WebView2 (pre-installed on Windows 10/11)
+
+**Both commands must be run from the directory containing `wails.json`.** On the owner's
+Linux box the repo is nested one level down, at
+`~/Documents/dedup-photos/dedup-photos/` — running `wails dev` from the parent fails with
+`ERROR open .../wails.json: no such file or directory`.
+
+**On Linux, add `-tags webkit2_41`** — `wails dev -tags webkit2_41`,
+`wails build -platform linux/amd64 -tags webkit2_41`. Wails links `webkit2gtk-4.0` by
+default, but Ubuntu 24.04 ships only `webkit2gtk-4.1`, so an untagged build dies with
+`Package 'webkit2gtk-4.0', required by 'virtual:world', not found`. The tag activates
+Wails' built-in 4.1 support. `.github/workflows/release.yml` already does this. Note that
+`wails doctor` reports `libwebkit: Not Found` on 24.04 even when 4.1 is correctly
+installed — that warning is expected and does not block a tagged build.
 
 **HEIC/HEIF: fully supported.** `.heic` and `.heif` are first-class scanned formats
 (see `supportedExtensions` in `scanner.go`), decoded via `github.com/Rosca75/heic` — a
 pure-Go library with **no CGo**, so the Windows build stays a single static binary. It has
-two backends and picks one at runtime: a Rust HEVC decoder compiled to WASM (always
-available, works everywhere), or the system `libheif` loaded dynamically via purego when
-present. `initHEIC()` in `heic_support.go` forces the WASM backend when a dynamic libheif
-older than 1.18 is found, because those versions mis-decode iPhone HDR/`tmap` files.
+two backends: a Rust HEVC decoder compiled to WASM (always available, works everywhere),
+or the system `libheif` loaded dynamically via purego when present.
+
+**This app always uses the WASM backend.** `initHEIC()` in `heic_support.go` sets
+`heic.ForceWasmMode` whenever a dynamic libheif is detected, regardless of its version, for
+two independent reasons: libheif rejects the truncated buffer the 192 KB fast path depends
+on (measured 0/8 on `samples/`, versus 8/8 under WASM), and libheif < 1.18 mis-decodes
+iPhone HDR/`tmap` files. `heic.ForceWasmMode` is a package-level global and the hash
+pipeline decodes concurrently, so the backend cannot be chosen per call — it is all or
+nothing. Upgrading the system libheif does not and should not change this.
 
 HEIC has a dedicated fast path, since these files are ~3 MB each and a full decode is
 ~100× slower than the embedded thumbnail. `heic_support.go` reads only the first **192 KB**
@@ -67,7 +88,7 @@ dedup-photos/
 ├── thumb_cache.go       109   Persistent on-disk thumbnail cache (lazy, on first view)
 │
 │  ── Format support ───────────────────────────────────────────────────────────
-├── heic_support.go      336   HEIC/HEIF: 192 KB byte-range fast path, 4-rung decode
+├── heic_support.go      352   HEIC/HEIF: 192 KB byte-range fast path, 4-rung decode
 │                              ladder, per-worker reusable decoder, [perf] counters
 ├── heic_version_linux.go  28  Probe the system libheif version via purego dlopen, so
 ├── heic_version_darwin.go 34  initHEIC() can force WASM below 1.18.
@@ -106,8 +127,10 @@ dedup-photos/
         └── actions.js   183   deleteFile(), reportMismatch(), batch ops
 ```
 
-`frontend/` also exists but holds only Wails-generated `wailsjs` bindings — it is not the
-UI source and is untracked in git. The UI lives in `static/`.
+`frontend/` also exists but holds only Wails-generated `wailsjs` bindings (`runtime/` and
+`go/main/App.js`) — it is not the UI source and is untracked in git. Every `wails dev` and
+`wails build` regenerates it, so it reappears after deletion; that is normal. The UI lives
+in `static/`.
 
 ---
 
@@ -192,7 +215,7 @@ improvement plan.
 | `metadata.go` | 467 | EXIF-driven quality scoring |
 | `cache.go` | 186 | Persistent hash cache |
 | `thumb_cache.go` | 109 | Persistent on-disk thumbnail cache |
-| `heic_support.go` | 336 | HEIC fast path + decode ladder (see §1) |
+| `heic_support.go` | 352 | HEIC fast path + decode ladder (see §1) |
 
 ---
 
@@ -374,9 +397,9 @@ Light professional theme. Do not change values without a deliberate design decis
 4. **No function over 50 lines.** Extract helpers when functions grow.
 5. **No HTTP, no `fetch()`.** All Go ↔ JS communication goes through `window.go.main.App.*` Promises.
 6. **Asset paths have no `/static/` prefix.** Wails embeds `static/` and strips the prefix via `fs.Sub`. A file at `static/css/base.css` loads as `/css/base.css`.
-7. **`static/` is the active frontend directory.** All frontend work happens here. There is no `frontend/` directory.
+7. **`static/` is the active frontend directory.** All frontend work happens here. A `frontend/` directory does exist, but it holds only Wails-generated `wailsjs` bindings — never edit it, and never put UI source there.
 8. **State lives in `state.js` only.** Never store shared state as module-level variables in other files.
 9. **Wails calls live in `api.js` only.** No other module calls `window.go.*` directly.
 10. **Avoid modifying business logic files** (`scanner.go`, `hasher.go`, `metadata.go`, `grouper.go`, `cache.go`) unless the change is explicitly scoped and described in an improvement plan.
 11. **Comment all Go code.** The owner is not a Go expert. Explain every non-obvious construct.
-12. **Test after every change.** Run `wails dev` and verify in the native window.
+12. **Test after every change.** Run `wails dev` (on Linux: `wails dev -tags webkit2_41`) from the directory holding `wails.json`, and verify in the native window.
