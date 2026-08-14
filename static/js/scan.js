@@ -1,7 +1,7 @@
 // scan.js — Scan lifecycle: start, poll, cancel, progress updates.
 
 import { state } from './state.js';
-import { apiScan, apiResults, apiCancel } from './api.js';
+import { apiScan, apiResults, apiProgress, apiCancel } from './api.js';
 import { showToast } from './components.js';
 import { renderResults, toggleAllGroups } from './table.js';
 
@@ -107,14 +107,18 @@ function stopPolling() {
 
 /** Fetch results from the API and update UI or finish scan. */
 function loadResults() {
-  apiResults()
-    .then(data => {
-      if (data.progress) {
-        updateProgress(data.progress.phase || 'Scanning...', data.progress.current || 0, data.progress.total || 0);
+  // While scanning, use the lightweight GetProgress endpoint. Only fetch the
+  // full results (with all duplicate groups) once status transitions to
+  // complete/cancelled — otherwise every 500ms tick would serialise tens of
+  // MB of group data just to read a single progress string.
+  apiProgress()
+    .then(prog => {
+      if (prog.progress) {
+        updateProgress(prog.progress.phase || 'Scanning...', prog.progress.current || 0, prog.progress.total || 0);
       }
-      if (data.status === 'complete' || data.status === 'idle' || data.status === 'cancelled') {
+      if (prog.status === 'complete' || prog.status === 'idle' || prog.status === 'cancelled') {
         stopPolling();
-        renderResults(data);
+        return apiResults().then(renderResults);
       }
     })
     .catch(err => {

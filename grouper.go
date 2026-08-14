@@ -42,7 +42,6 @@ import (
 	"sort"          // For sorting groups and images.
 	"strconv"       // String → int conversion for series detection.
 	"strings"       // String manipulation.
-	"sync"          // sync.Mutex for thread-safe writes to shared maps.
 	"time"          // time.Parse / time.Second for burst time-window detection.
 
 	"github.com/google/uuid" // UUID for unique group IDs.
@@ -315,16 +314,21 @@ func findPerceptualPaths(hashes []ImageHash, exactGrouped map[string]bool, thres
 // using all available CPU cores. It accepts a hashMap of pre-computed dimensions
 // from the hashing phase so that ExtractMetadataFast can skip re-opening files
 // for DecodeConfig (Optimization A — single file open).
+//
+// Workers write into an index-aligned slice; the final map is assembled
+// sequentially, avoiding a mutex on the hot path.
 func parallelExtractMetadata(ctx context.Context, paths []string, hashMap map[string]ImageHash) map[string]ImageMetadata {
-	metaMap := make(map[string]ImageMetadata, len(paths))
-	var mu sync.Mutex
-	runParallel(ctx, paths, runtime.NumCPU(), func(path string) {
+	n := len(paths)
+	metaSlice := make([]ImageMetadata, n)
+	runParallelIndexed(ctx, n, runtime.NumCPU(), func(i int) {
+		path := paths[i]
 		h := hashMap[path]
-		meta := ExtractMetadataFast(path, h.Width, h.Height, h.Size)
-		mu.Lock()
-		metaMap[path] = meta
-		mu.Unlock()
+		metaSlice[i] = ExtractMetadataFast(path, h.Width, h.Height, h.Size)
 	})
+	metaMap := make(map[string]ImageMetadata, n)
+	for i, path := range paths {
+		metaMap[path] = metaSlice[i]
+	}
 	return metaMap
 }
 
@@ -358,8 +362,9 @@ func collectUniquePaths(exactGroups [][]string, percGroups map[string][]string) 
 
 // buildGroup creates a DuplicateGroup for the given paths and matchType.
 // It looks up each path in metaMap (parallel-extracted) rather than calling
-// ExtractMetadata inline, which is the key change that achieves #2's speedup.
-func buildGroup(matchType string, confidence float64, paths []string, metaMap map[string]ImageMetadata) DuplicateGroup {
+// ExtractMetadata inline. hashMap provides the pre-computed XXHash and DHash
+// values so ReportMismatch can use them without re-reading files.
+func buildGroup(matchType string, confidence float64, paths []string, metaMap map[string]ImageMetadata, hashMap map[string]ImageHash) DuplicateGroup {
 	group := DuplicateGroup{
 		ID:         uuid.New().String(),
 		MatchType:  matchType,
@@ -369,6 +374,11 @@ func buildGroup(matchType string, confidence float64, paths []string, metaMap ma
 		meta, ok := metaMap[path]
 		if !ok {
 			meta = ExtractMetadata(path) // Fallback — should not occur in practice.
+		}
+		// Copy pre-computed hash values so ReportMismatch doesn't re-read files.
+		if h, ok := hashMap[path]; ok {
+			meta.XXHash = h.XXHash
+			meta.DHash = h.DHash
 		}
 		group.Images = append(group.Images, meta)
 	}
@@ -465,11 +475,13 @@ func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []Du
 	allPaths := collectUniquePaths(exactGroups, percGroups)
 	fmt.Printf("[grouper] Extracting metadata for %d files (parallel)...\n", len(allPaths))
 	metaMap := parallelExtractMetadata(context.Background(), allPaths, hashMap)
+	// Perf tracing (Trace 3): report the read-vs-EXIF split for the metadata phase.
+	printAndResetMetadataSplit()
 
 	// Build DuplicateGroup structs from pre-computed metadata.
 	var groups []DuplicateGroup
 	for _, paths := range exactGroups {
-		groups = append(groups, buildGroup("exact", 100.0, paths, metaMap))
+		groups = append(groups, buildGroup("exact", 100.0, paths, metaMap, hashMap))
 	}
 	for root, paths := range percGroups {
 		if len(paths) < 2 {
@@ -477,7 +489,7 @@ func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []Du
 		}
 		dist := percMinDist[root]
 		confidence := (1.0 - float64(dist)/64.0) * 100.0
-		groups = append(groups, buildGroup("perceptual", confidence, paths, metaMap))
+		groups = append(groups, buildGroup("perceptual", confidence, paths, metaMap, hashMap))
 	}
 
 	// Pass 3: Detect burst/series groups among perceptual matches.

@@ -30,6 +30,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/image/draw"
+
 	// Wails runtime — aliased to avoid collision with stdlib "runtime" above.
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -49,6 +51,7 @@ func NewApp() *App {
 // The ctx allows calling Wails runtime APIs (e.g. file dialogs, events).
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	initHEIC()
 }
 
 // =============================================================================
@@ -111,23 +114,12 @@ func runScan(ctx context.Context, req ScanRequest) {
 		scanMutex.Unlock()
 	}
 
-	// Phase 1: Walk the primary path.
-	// Use ConcurrentScanDirectory when no dimension or file-size filters are
-	// active (those require opening each file, so the concurrent walker hands
-	// off to ScanDirectoryFiltered which handles that correctly).
+	// Phase 1: Walk the primary path via walkScanRoot, which routes to the
+	// concurrent or filtered walker depending on which filters are active.
 	t0 := time.Now()
 	setPhase("Scanning directory...")
 
-	var paths []string
-	var err error
-	noExtraFilters := req.MinWidth == 0 && req.MaxHeight == 0 && req.MinFileSize == 0 && req.MaxFileSize == 0
-	if len(allowedExts) == 0 && noExtraFilters && req.IncludeSubfolders {
-		// Fast path: concurrent walker (#8) — best for NAS / network shares.
-		paths, err = ConcurrentScanDirectory(req.Path)
-	} else {
-		// Filtered path: sequential walker with per-file dimension / size checks.
-		paths, err = ScanDirectoryFiltered(req.Path, allowedExts, req.MinWidth, req.MaxHeight, req.IncludeSubfolders, req.MinFileSize, req.MaxFileSize)
-	}
+	paths, err := walkScanRoot(req.Path, allowedExts, req)
 	if err != nil {
 		scanMutex.Lock()
 		scanResult.Status = "complete"
@@ -239,11 +231,32 @@ func setScanCancelled() {
 // =============================================================================
 
 // GetResults returns the current scan state (progress or final results).
-// Called by JS every 500ms while scanning.
+// Called by JS once per scan, when it sees status transition to "complete".
+// While scanning, JS uses the much cheaper GetProgress() instead so the
+// 500 ms poller doesn't serialise thousands of duplicate groups on every tick.
 func (a *App) GetResults() ScanResult {
 	scanMutex.Lock()
 	defer scanMutex.Unlock()
 	return scanResult
+}
+
+// ScanProgressUpdate is the lightweight payload returned by GetProgress.
+// It carries only the fields the UI needs during polling — no duplicate groups.
+type ScanProgressUpdate struct {
+	Status   string       `json:"status"`
+	Progress ScanProgress `json:"progress"`
+}
+
+// GetProgress returns only the scan status and progress — no duplicate groups.
+// The frontend polls this every 500 ms during an active scan, avoiding the
+// multi-MB serialisation cost of GetResults() until the scan actually finishes.
+func (a *App) GetProgress() ScanProgressUpdate {
+	scanMutex.Lock()
+	defer scanMutex.Unlock()
+	return ScanProgressUpdate{
+		Status:   scanResult.Status,
+		Progress: scanResult.Progress,
+	}
 }
 
 // CancelScan signals the running scan goroutine to stop early.
@@ -277,6 +290,7 @@ func (a *App) DeleteFile(path string) map[string]interface{} {
 		return map[string]interface{}{"success": false, "error": fmt.Sprintf("failed to delete: %v", err)}
 	}
 	thumbnailCache.Delete(path) // Remove from thumbnail cache.
+	deleteThumbCache(path)      // Remove any persisted on-disk thumbnail.
 	log.Printf("[delete] Permanently deleted: %s", path)
 	return map[string]interface{}{"success": true, "message": "Deleted: " + path}
 }
@@ -299,6 +313,26 @@ func (a *App) GetThumbnail(path string) string {
 		return base64.StdEncoding.EncodeToString(cached.([]byte))
 	}
 
+	// Serve from the on-disk thumbnail cache if a valid entry exists. This is
+	// populated during the scan's hash phase, so HEIC files (and any file we
+	// previously thumbnailed) never need to be decoded again after a scan or
+	// an app restart.
+	if disk, ok := loadThumbCache(path); ok {
+		thumbnailCache.Store(path, disk)
+		return base64.StdEncoding.EncodeToString(disk)
+	}
+
+	// HEIC/HEIF fast path: use embedded thumbnail when available.
+	if isHEIC(path) {
+		jpegBytes, err := heicThumbnailJPEG(path)
+		if err != nil {
+			return ""
+		}
+		thumbnailCache.Store(path, jpegBytes)
+		storeThumbCache(path, jpegBytes) // Persist for next time / after restart.
+		return base64.StdEncoding.EncodeToString(jpegBytes)
+	}
+
 	// Open and decode the image file.
 	f, err := os.Open(path)
 	if err != nil {
@@ -308,8 +342,7 @@ func (a *App) GetThumbnail(path string) string {
 
 	img, _, err := image.Decode(f)
 	if err != nil {
-		// Fallback for RAW formats (DNG, ARW, CR2): byte-scan for
-		// embedded JPEG SOI/EOI markers. Slower but works for many camera formats.
+		// Fallback for RAW formats (DNG, ARW, CR2): scan for embedded JPEG preview.
 		if embedded := extractEmbeddedJPEG(path); embedded != nil {
 			thumbnailCache.Store(path, embedded)
 			return base64.StdEncoding.EncodeToString(embedded)
@@ -338,13 +371,12 @@ func (a *App) GetThumbnail(path string) string {
 		newH = 1
 	}
 
-	// Nearest-neighbour resize (fast, sufficient for thumbnails).
-	thumb := image.NewRGBA(image.Rect(0, 0, newW, newH))
-	for y := 0; y < newH; y++ {
-		for x := 0; x < newW; x++ {
-			thumb.Set(x, y, img.At(b.Min.X+x*srcW/newW, b.Min.Y+y*srcH/newH))
-		}
-	}
+	// Bilinear resize via golang.org/x/image/draw — uses pixel-format-specific
+	// fast paths and avoids the color.Color interface entirely, cutting per-
+	// thumbnail CPU from tens of ms to single digits.
+	dstRect := image.Rect(0, 0, newW, newH)
+	thumb := image.NewRGBA(dstRect)
+	draw.ApproxBiLinear.Scale(thumb, dstRect, img, b, draw.Src, nil)
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, thumb, &jpeg.Options{Quality: 85}); err != nil {
@@ -453,11 +485,12 @@ func (a *App) ReportMismatch(groupID string) string {
 			Camera: img.Camera, QualityScore: img.QualityScore,
 			GPSLat: img.GPSLat, GPSLon: img.GPSLon,
 		}
-		if h, err := ComputeXXHash(img.Path); err == nil {
-			ir.XXHash = fmt.Sprintf("%016x", h)
+		// Use cached hash values from the scan — no file re-reads needed.
+		if img.XXHash != 0 {
+			ir.XXHash = fmt.Sprintf("%016x", img.XXHash)
 		}
-		if h, err := ComputeDHash(img.Path); err == nil {
-			ir.DHash = fmt.Sprintf("%016x", h)
+		if img.DHash != 0 {
+			ir.DHash = fmt.Sprintf("%016x", img.DHash)
 		}
 		rpt.Images = append(rpt.Images, ir)
 	}
