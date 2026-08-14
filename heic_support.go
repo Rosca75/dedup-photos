@@ -83,16 +83,32 @@ func printAndResetHEICLadder() {
 const heicHeaderReadSize = 192 * 1024
 
 // initHEIC configures the heic package at startup.
-// If dynamic libheif is in use but its version is < 1.18, force WASM mode so
-// that HDR / tmap-brand HEIC files (common on iPhone) decode correctly.
+//
+// When a dynamic libheif is present we deliberately do NOT use it, for two
+// independent reasons:
+//
+//  1. Speed. The 192 KB byte-range fast path (decodeHEICFromHeader, rung 1)
+//     hands the decoder a deliberately truncated container. libheif rejects
+//     truncated input outright — measured 0/8 on the samples/ corpus — which
+//     collapses every HEIC onto a full os.ReadFile, the ~100× slower path.
+//     The WASM backend walks the ISOBMFF iloc box and decodes 8/8 from that
+//     same buffer.
+//  2. Correctness. libheif < 1.18 mis-decodes HDR / tmap-brand files, which
+//     are common on iPhone.
+//
+// heic.ForceWasmMode is a package-level global and the hash pipeline decodes
+// concurrently, so the backend cannot be chosen per call — it is all or
+// nothing, and the fast path is what this app is built around.
 func initHEIC() {
 	if heic.Dynamic() != nil {
 		// Dynamic libheif not available; WASM will be used automatically.
 		return
 	}
-	if !heicDynamicVersionAtLeast(1, 18) {
-		heic.ForceWasmMode = true
-		log.Println("[heic] Dynamic libheif < 1.18; using WASM decoder for full compatibility")
+	heic.ForceWasmMode = true
+	if heicDynamicVersionAtLeast(1, 18) {
+		log.Println("[heic] Dynamic libheif >= 1.18 found; using WASM decoder anyway to keep the 192 KB fast path")
+	} else {
+		log.Println("[heic] Dynamic libheif < 1.18 found; using WASM decoder (correctness + 192 KB fast path)")
 	}
 }
 
