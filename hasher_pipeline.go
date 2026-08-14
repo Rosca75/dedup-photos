@@ -369,16 +369,9 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 	// These inform whether the retention cap needs tuning on larger corpora.
 	var hitsFullData, hitsHeaderBuf, reopenCount atomic.Int64
 
-	runParallelIndexedWorker(ctx, n, numWorkers,
-		// Each worker gets its own lazily-created HEIC decoder (built only if
-		// the worker actually encounters a HEIC file).
-		func() any { return &heicDecoderWorker{} },
-		// Release the worker's decoder (if any) when the goroutine exits.
-		func(state any) { state.(*heicDecoderWorker).close() },
-		func(i int, state any) {
+	runParallelIndexed(ctx, n, numWorkers,
+		func(i int) {
 			path := misses[i]
-			// The worker's reusable decoder (nil until first HEIC / on failure).
-			dec := state.(*heicDecoderWorker).decoder()
 			var dh uint64
 			var w, h int
 
@@ -404,12 +397,12 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 			} else if header, ok := headerBytes[path]; ok {
 				// Reuse the 64 KB header read from runPartialHashPhase — no new I/O.
 				hitsHeaderBuf.Add(1)
-				dh, w, h, _ = computeDHashFromHeaderBuffer(dec, path, header, algorithm)
+				dh, w, h, _ = computeDHashFromHeaderBuffer(path, header, algorithm)
 			} else {
 				// Singleton-by-size (never opened before) or retention-capped:
 				// header-only path reads ~128 KB for EXIF thumbnail + dimensions.
 				reopenCount.Add(1)
-				dh, w, h, _ = computeDHashFromHeader(dec, path, algorithm)
+				dh, w, h, _ = computeDHashFromHeader(path, algorithm)
 			}
 			// Accumulate the summed fingerprint time across all workers.
 			phase3bFingerprintNs.Add(int64(time.Since(fpStart)))
