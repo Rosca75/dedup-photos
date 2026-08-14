@@ -82,34 +82,40 @@ func printAndResetHEICLadder() {
 // a full read.
 const heicHeaderReadSize = 192 * 1024
 
-// initHEIC configures the heic package at startup.
+// initHEIC configures the heic package at startup, choosing between the two
+// backends: the system libheif loaded dynamically via purego, or the Rust HEVC
+// decoder compiled to WASM.
 //
-// When a dynamic libheif is present we deliberately do NOT use it, for two
-// independent reasons:
+// The deciding factor is whether the backend can decode the deliberately
+// TRUNCATED 192 KB buffer that the byte-range fast path hands it
+// (decodeHEICFromHeader, rung 1). A backend that rejects truncated containers
+// collapses every HEIC onto a full os.ReadFile, the ~100× slower path.
+// Measured on the samples/ corpus, 96 concurrent thumbnail decodes from a
+// 192 KB header buffer:
 //
-//  1. Speed. The 192 KB byte-range fast path (decodeHEICFromHeader, rung 1)
-//     hands the decoder a deliberately truncated container. libheif rejects
-//     truncated input outright — measured 0/8 on the samples/ corpus — which
-//     collapses every HEIC onto a full os.ReadFile, the ~100× slower path.
-//     The WASM backend walks the ISOBMFF iloc box and decodes 8/8 from that
-//     same buffer.
-//  2. Correctness. libheif < 1.18 mis-decodes HDR / tmap-brand files, which
-//     are common on iPhone.
+//	dynamic libheif 1.17.6 : 0/8 decode — rejects the truncated container
+//	dynamic libheif 1.19.8 : 8/8, 251 ms
+//	WASM                   : 8/8, 964 ms
 //
-// heic.ForceWasmMode is a package-level global and the hash pipeline decodes
-// concurrently, so the backend cannot be chosen per call — it is all or
-// nothing, and the fast path is what this app is built around.
+// So the dynamic backend is strongly preferred once it is new enough — it is
+// ~3.8× faster than WASM here — and unusable below 1.18, where it both rejects
+// the truncated buffer and mis-decodes iPhone HDR / tmap-brand files. Hence the
+// version gate. Do not "simplify" this to always forcing WASM: that was tried,
+// and it costs roughly 4× on the hot path for anyone on a current libheif.
+//
+// Windows ships no dynamic libheif, so that build always lands on WASM.
 func initHEIC() {
 	if heic.Dynamic() != nil {
-		// Dynamic libheif not available; WASM will be used automatically.
+		// Dynamic libheif not available (the normal case on Windows); the heic
+		// package falls back to WASM automatically.
 		return
 	}
-	heic.ForceWasmMode = true
-	if heicDynamicVersionAtLeast(1, 18) {
-		log.Println("[heic] Dynamic libheif >= 1.18 found; using WASM decoder anyway to keep the 192 KB fast path")
-	} else {
-		log.Println("[heic] Dynamic libheif < 1.18 found; using WASM decoder (correctness + 192 KB fast path)")
+	if !heicDynamicVersionAtLeast(1, 18) {
+		heic.ForceWasmMode = true
+		log.Println("[heic] Dynamic libheif < 1.18; using WASM decoder (HDR/tmap correctness + 192 KB fast path)")
+		return
 	}
+	log.Println("[heic] Using dynamic libheif >= 1.18 (faster than WASM, handles the 192 KB fast path)")
 }
 
 // isHEIC reports whether path has a .heic or .heif extension.

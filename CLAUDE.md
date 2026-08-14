@@ -42,13 +42,21 @@ pure-Go library with **no CGo**, so the Windows build stays a single static bina
 two backends: a Rust HEVC decoder compiled to WASM (always available, works everywhere),
 or the system `libheif` loaded dynamically via purego when present.
 
-**This app always uses the WASM backend.** `initHEIC()` in `heic_support.go` sets
-`heic.ForceWasmMode` whenever a dynamic libheif is detected, regardless of its version, for
-two independent reasons: libheif rejects the truncated buffer the 192 KB fast path depends
-on (measured 0/8 on `samples/`, versus 8/8 under WASM), and libheif < 1.18 mis-decodes
-iPhone HDR/`tmap` files. `heic.ForceWasmMode` is a package-level global and the hash
-pipeline decodes concurrently, so the backend cannot be chosen per call — it is all or
-nothing. Upgrading the system libheif does not and should not change this.
+`initHEIC()` in `heic_support.go` picks the backend at startup, and the deciding factor is
+whether it can decode the **truncated** 192 KB buffer the fast path hands it. Measured on
+`samples/`, 96 concurrent thumbnail decodes from a 192 KB header:
+
+| Backend | Result | Time |
+|---|---|---|
+| dynamic libheif 1.17.6 | **0/8** — rejects truncated containers | — |
+| dynamic libheif 1.19.8 | 8/8 | **251 ms** |
+| WASM | 8/8 | 964 ms |
+
+So dynamic libheif is preferred once it is ≥ 1.18 (~3.8× faster here), and forced off below
+that, where it both rejects the truncated buffer and mis-decodes iPhone HDR/`tmap` files.
+Windows ships no dynamic libheif, so that build always uses WASM. `heic.ForceWasmMode` is a
+package-level global and the pipeline decodes concurrently, so the backend is chosen once at
+startup, never per call.
 
 HEIC has a dedicated fast path, since these files are ~3 MB each and a full decode is
 ~100× slower than the embedded thumbnail. `heic_support.go` reads only the first **192 KB**
