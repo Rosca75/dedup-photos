@@ -15,6 +15,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -35,7 +36,7 @@ import (
 // HEIC decode-ladder instrumentation (perf tracing — Trace 1)
 // =============================================================================
 //
-// decodeHEICFromHeader tries four "rungs" in order until one decodes an image.
+// decodeHEICFromHeader tries three "rungs" in order until one decodes an image.
 // To find out WHERE the scan spends its HEIC time we count how often each rung
 // succeeds, plus the total time and bytes spent in the expensive full-file
 // os.ReadFile fallback. Everything below is aggregate-only (a handful of atomic
@@ -46,11 +47,11 @@ import (
 var (
 	heicLadderThumbHeader   atomic.Int64 // Rung 1: embedded thumbnail from the 192 KB header.
 	heicLadderPrimaryHeader atomic.Int64 // Rung 2: primary image from the header window.
-	heicLadderFullThumb     atomic.Int64 // Rung 3: thumbnail after a full os.ReadFile.
-	heicLadderFullPrimary   atomic.Int64 // Rung 4: primary after a full os.ReadFile.
-	heicLadderFail          atomic.Int64 // No rung succeeded — decode failed entirely.
-	heicLadderFullReadNs    atomic.Int64 // Total nanoseconds spent in the full-read fallback branch.
-	heicLadderFullReadBytes atomic.Int64 // Total bytes read by the full-read fallback branch.
+	heicLadderFullThumb     atomic.Int64 // Rung 3: thumbnail after the widened 1 MB read.
+	heicLadderFullPrimary   atomic.Int64 // Retired rung 4 (full primary decode); must stay 0 — see decodeHEICFromHeader.
+	heicLadderFail          atomic.Int64 // No rung succeeded — the file has no embedded thumbnail.
+	heicLadderFullReadNs    atomic.Int64 // Total nanoseconds spent in the widened-retry branch.
+	heicLadderFullReadBytes atomic.Int64 // Total bytes read by the widened-retry branch.
 )
 
 // printAndResetHEICLadder prints one aggregate [perf] line for the HEIC decode
@@ -161,10 +162,16 @@ func readHEICHeader(path string) ([]byte, error) {
 // gain from holding a decoder per worker (measured within noise over 96
 // concurrent decodes) and heic.Decoder is deprecated upstream.
 
-// decodeHEICFromHeader runs the thumb → primary → full-file-read fallback ladder
-// against an already-read header buffer. This is the shared decode core for both
-// the UI thumbnail path and the perceptual-hash path, so they always agree on
-// which image is produced.
+// decodeHEICFromHeader runs the thumbnail → primary → widened-retry ladder
+// against an already-read header buffer. It is the shared decode core for the UI
+// thumbnail path and the perceptual-hash path, so both agree on which image is
+// produced whenever one is produced at all.
+//
+// When no rung succeeds it returns ErrNoThumbnail rather than decoding the full
+// primary image. The two callers then diverge deliberately: the hash path treats
+// that as "skip perceptual matching" (as it already does for JPEG), while
+// heicThumbnailJPEG falls back to a full decode because a user is waiting on
+// that one specific image.
 func decodeHEICFromHeader(path string, header []byte) (image.Image, error) {
 	// Rung 1 — Fast path: embedded thumbnail from the header window.
 	if img, err := heic.DecodeThumbnail(bytes.NewReader(header)); err == nil {
@@ -228,7 +235,30 @@ func decodeHEICThumbnail(path string) (image.Image, error) {
 func heicThumbnailJPEG(path string) ([]byte, error) {
 	img, err := decodeHEICThumbnail(path)
 	if err != nil {
-		return nil, err
+		// The ladder gives up on files with no embedded thumbnail rather than
+		// decoding the full primary image, because in a scan that costs 3-13 s
+		// per file across the whole corpus (see decodeHEICFromHeader).
+		//
+		// Here that reasoning does not apply: this is one file the user is
+		// actively looking at, on demand. Showing nothing at all would be worse
+		// than making them wait, so the interactive path keeps the full decode as
+		// a last resort. GetThumbnail caches the result to disk, so the cost is
+		// paid once per file rather than on every hover.
+		//
+		// Deliberately not counted in the heicLadder* counters: those describe
+		// scan behaviour, and heicLadderFullPrimary staying at zero is the
+		// tripwire for the scan-path decision.
+		if !errors.Is(err, ErrNoThumbnail) {
+			return nil, err
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil, err
+		}
+		img, err = heic.Decode(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
 	}
 	result := resizeImageToJPEG(img, 400, 85)
 	if result == nil {
