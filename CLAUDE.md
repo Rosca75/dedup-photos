@@ -98,7 +98,7 @@ dedup-photos/
 │  ── Scan pipeline ────────────────────────────────────────────────────────────
 ├── scanner.go           385   Filesystem walk; supportedExtensions lives here
 ├── hasher.go            366   Hash algorithms (xxHash exact, dHash/pHash perceptual)
-├── hasher_pipeline.go   671   Parallel hash pipeline with file-size bucketing
+├── hasher_pipeline.go   690   Parallel hash pipeline with file-size bucketing
 ├── parallel.go          168   Shared worker-pool helper used by hasher + grouper
 ├── grouper.go           706   BK-Tree, Union-Find, duplicate grouping
 ├── cache.go             186   Persistent hash cache for fast re-scans
@@ -227,7 +227,7 @@ improvement plan.
 |---|---|---|
 | `scanner.go` | 385 | Filesystem walk; `supportedExtensions` |
 | `hasher.go` | 366 | Hash algorithms — xxHash (exact), dHash/pHash (perceptual) |
-| `hasher_pipeline.go` | 671 | Parallel hash pipeline with file-size bucketing |
+| `hasher_pipeline.go` | 690 | Parallel hash pipeline with file-size bucketing |
 | `grouper.go` | 706 | BK-Tree indexing + Union-Find duplicate grouping |
 | `metadata.go` | 467 | EXIF-driven quality scoring |
 | `cache.go` | 186 | Persistent hash cache |

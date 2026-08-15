@@ -354,10 +354,16 @@ func printAndResetPhase3bSplit() {
 // Also returns image dimensions (width, height) extracted during the same read,
 // so the aspect-ratio bucketer in GroupDuplicates doesn't need to re-open files.
 //
+// reportFn, when non-nil, is called as files complete so the UI progress bar
+// keeps moving. This is by far the longest phase of a scan — on a 1,134-file
+// HEIC corpus over SMB it is ~26 of the ~28 seconds — and without this the bar
+// sat frozen on the message set before Phase 3a for the entire time, which reads
+// as a hung application.
+//
 // Returns:
 //   - dHashes: path → dHash (omitted when 0 — skip perceptual matching).
 //   - dims:    path → [width, height] (omitted when 0×0 — unknown dimensions).
-func computePerceptualHashes(ctx context.Context, misses []string, fullData map[string][]byte, headerBytes map[string][]byte, numWorkers int, algorithm string) (
+func computePerceptualHashes(ctx context.Context, misses []string, fullData map[string][]byte, headerBytes map[string][]byte, numWorkers int, algorithm string, reportFn ProgressCallback, cachedCount int) (
 	dHashes map[string]uint64,
 	dims map[string][2]int,
 ) {
@@ -368,6 +374,15 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 	// Lock-free counters for visibility into the header-buffer reuse ratio.
 	// These inform whether the retention cap needs tuning on larger corpora.
 	var hitsFullData, hitsHeaderBuf, reopenCount atomic.Int64
+
+	// Progress is reported against the whole scan set, not just the misses, so
+	// the bar does not jump backwards after the cache-hit files are counted.
+	// The label is built once here rather than per tick, and matches the wording
+	// HashAllImagesWithProgress already set before Phase 3a so the text does not
+	// change under the user mid-phase.
+	total := n + cachedCount
+	label := fmt.Sprintf("Computing fingerprints... (%d cached, %d to compute)", cachedCount, n)
+	var done atomic.Int32
 
 	runParallelIndexed(ctx, n, numWorkers,
 		func(i int) {
@@ -420,6 +435,17 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 
 			hashSlice[i] = dh
 			dimSlice[i] = [2]int{w, h}
+
+			// Tick the UI. Every 25 files rather than every file: at ~40 files a
+			// second this is a handful of updates a second, which is all a
+			// progress bar can show, and it keeps the mutex in the callback off
+			// the hot path.
+			if reportFn != nil {
+				cur := int(done.Add(1)) + cachedCount
+				if cur%25 == 0 || cur == total {
+					reportFn(label, cur, total)
+				}
+			}
 		})
 
 	dHashes = make(map[string]uint64, n)
@@ -634,7 +660,7 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 
 	// Phase 3b: Perceptual hash for all cache misses (EXIF thumbnail fast-path).
 	t0 = time.Now()
-	dHashes, percDims := computePerceptualHashes(ctx, misses, fullData, headerBytes, numWorkers, algorithm)
+	dHashes, percDims := computePerceptualHashes(ctx, misses, fullData, headerBytes, numWorkers, algorithm, progressFn, len(hits))
 	if ctx.Err() != nil {
 		return nil
 	}
