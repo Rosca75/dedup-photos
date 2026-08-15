@@ -1,13 +1,12 @@
 package main
 
-// HEIC fast path (Plan 2 / Step 1):
+// HEIC fast path (Plan 2 / Step 1, window sized by Plan 4 / Step 3):
 // Instead of reading the whole 3 MB HEIC file to get its embedded thumbnail,
-// we read only the first 192 KB. libheif's WASM decoder walks the ISOBMFF
+// we read only the first 128 KB. libheif's WASM decoder walks the ISOBMFF
 // header, finds the thumbnail item's absolute file offset in the `iloc` box,
 // and reads its bytes directly from the buffer. For iPhone HDR HEICs the
-// header + thumbnail tile all live within the first ~128 KB; 192 KB gives
-// headroom for variations. If decode fails (rare corpus), we fall back to
-// reading the full file.
+// header + thumbnail tile all live within that window. If decode fails (rare
+// corpus), we retry once with a wider byte range.
 //
 // This is Path B from 02-PERFORMANCE-HOT-PATHS.md: no upstream heic library
 // changes, no manual ISOBMFF parsing — we just hand the WASM decoder a
@@ -45,7 +44,7 @@ import (
 // These are package-level so every worker goroutine bumps the same counters.
 // atomic.Int64 makes concurrent Add/Load safe without a mutex.
 var (
-	heicLadderThumbHeader   atomic.Int64 // Rung 1: embedded thumbnail from the 192 KB header.
+	heicLadderThumbHeader   atomic.Int64 // Rung 1: embedded thumbnail from the header window.
 	heicLadderPrimaryHeader atomic.Int64 // Rung 2: primary image from the header window.
 	heicLadderFullThumb     atomic.Int64 // Rung 3: thumbnail after the widened 1 MB read.
 	heicLadderFullPrimary   atomic.Int64 // Retired rung 4 (full primary decode); must stay 0 — see decodeHEICFromHeader.
@@ -78,10 +77,25 @@ func printAndResetHEICLadder() {
 }
 
 // heicHeaderReadSize is the byte-range size used by the HEIC fast path.
-// 192 KB comfortably covers the ftyp + meta + iloc + thumbnail tile on
-// every iPhone HEIC sample tested. If a file needs more, we fall back to
-// a full read.
-const heicHeaderReadSize = 192 * 1024
+// It covers the ftyp + meta + iloc + thumbnail tile on every iPhone HEIC tested.
+// If a file needs more, rung 3 retries once at heicWideRetryReadSize.
+//
+// 128 KB rather than the 192 KB used until Plan 4. On an SMB share with
+// rsize=65536, dropping the third read request is worth far more than the third
+// of the bytes it saves: a cold read of 221 files took 0.94s at 128 KB against
+// 2.27s at 192 KB. End to end on two independent iPhone corpora, two runs each:
+//
+//	1,038 HEIC : hash 30.5-31.1s at 192 KB -> 26.0-27.0s at 128 KB  (-14%)
+//	1,645 HEIC : hash 57.2s      at 192 KB -> 44.7s      at 128 KB  (-22%)
+//
+// The window still reaches the same files: rung-1 hits were 1016/1038 at both
+// sizes on the first corpus, and 1439 vs 1438 on the second — the one file that
+// moved still decodes, via the rung-3 retry. Both corpora produced identical
+// duplicate groups at both sizes.
+//
+// Do not shrink this further: at 96 KB both corpora start missing files (981 of
+// 1038, 289 of 297), and every miss costs a 1 MB re-read.
+const heicHeaderReadSize = 128 * 1024
 
 // heicWideRetryReadSize is the widened window used by rung 3 of the decode
 // ladder, for the rare file whose thumbnail tile sits past the header window.
@@ -95,11 +109,11 @@ const heicWideRetryReadSize = 1024 * 1024
 // decoder compiled to WASM.
 //
 // The deciding factor is whether the backend can decode the deliberately
-// TRUNCATED 192 KB buffer that the byte-range fast path hands it
+// TRUNCATED header buffer that the byte-range fast path hands it
 // (decodeHEICFromHeader, rung 1). A backend that rejects truncated containers
 // collapses every HEIC onto a full os.ReadFile, the ~100× slower path.
 // Measured on the samples/ corpus, 96 concurrent thumbnail decodes from a
-// 192 KB header buffer:
+// truncated header buffer (192 KB at the time of measurement):
 //
 //	dynamic libheif 1.17.6 : 0/8 decode — rejects the truncated container
 //	dynamic libheif 1.19.8 : 8/8, 251 ms
@@ -120,10 +134,10 @@ func initHEIC() {
 	}
 	if !heicDynamicVersionAtLeast(1, 18) {
 		heic.ForceWasmMode = true
-		log.Println("[heic] Dynamic libheif < 1.18; using WASM decoder (HDR/tmap correctness + 192 KB fast path)")
+		log.Println("[heic] Dynamic libheif < 1.18; using WASM decoder (HDR/tmap correctness + byte-range fast path)")
 		return
 	}
-	log.Println("[heic] Using dynamic libheif >= 1.18 (faster than WASM, handles the 192 KB fast path)")
+	log.Println("[heic] Using dynamic libheif >= 1.18 (faster than WASM, handles the byte-range fast path)")
 }
 
 // isHEIC reports whether path has a .heic or .heif extension.
@@ -306,7 +320,7 @@ func resizeImageToJPEG(img image.Image, maxDim, quality int) []byte {
 }
 
 // computeDHashHEIC computes a dHash and image dimensions for a HEIC file.
-// Uses the byte-range fast path: one 192 KB read covers the ISOBMFF header
+// Uses the byte-range fast path: one header read covers the ISOBMFF header
 // (for dimensions via imagemeta) and the thumbnail tile (decoded via WASM).
 func computeDHashHEIC(path, algorithm string) (dHash uint64, width, height int, err error) {
 	header, hdrErr := readHEICHeader(path)

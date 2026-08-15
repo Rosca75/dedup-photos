@@ -303,7 +303,7 @@ func computeDHashFromHeaderBuffer(path string, buf []byte, algorithm string) (dH
 	ext := strings.ToLower(filepath.Ext(path))
 
 	// HEIC/HEIF: defer to the dedicated HEIC fast path — it does its own read
-	// at 192 KB which is larger than our 64 KB partial-hash buffer anyway.
+	// at heicHeaderReadSize, larger than our 64 KB partial-hash buffer anyway.
 	if ext == ".heic" || ext == ".heif" {
 		return computeDHashHEIC(path, algorithm)
 	}

@@ -43,8 +43,8 @@ two backends: a Rust HEVC decoder compiled to WASM (always available, works ever
 or the system `libheif` loaded dynamically via purego when present.
 
 `initHEIC()` in `heic_support.go` picks the backend at startup, and the deciding factor is
-whether it can decode the **truncated** 192 KB buffer the fast path hands it. Measured on
-`samples/`, 96 concurrent thumbnail decodes from a 192 KB header:
+whether it can decode the **truncated** header buffer the fast path hands it. Measured on
+`samples/`, 96 concurrent thumbnail decodes from a truncated header:
 
 | Backend | Result | Time |
 |---|---|---|
@@ -59,7 +59,7 @@ package-level global and the pipeline decodes concurrently, so the backend is ch
 startup, never per call.
 
 HEIC has a dedicated fast path, since these files are ~3 MB each and a full decode is
-~100× slower than the embedded thumbnail. `heic_support.go` reads only the first **192 KB**
+~100× slower than the embedded thumbnail. `heic_support.go` reads only the first **128 KB**
 of the file and runs a **three-rung** ladder (`decodeHEICFromHeader`): embedded thumbnail
 from that header window → primary image from it → thumbnail after a widened 1 MB read.
 Rung 1 hits for essentially every iPhone photo. `printAndResetHEICLadder()` prints a
@@ -105,7 +105,7 @@ dedup-photos/
 ├── thumb_cache.go       109   Persistent on-disk thumbnail cache (lazy, on first view)
 │
 │  ── Format support ───────────────────────────────────────────────────────────
-├── heic_support.go      320   HEIC/HEIF: 192 KB byte-range fast path, 3-rung decode
+├── heic_support.go      364   HEIC/HEIF: 128 KB byte-range fast path, 3-rung decode
 │                              ladder, [perf] counters
 ├── heic_version_linux.go  28  Probe the system libheif version via purego dlopen, so
 ├── heic_version_darwin.go 34  initHEIC() can force WASM below 1.18.
