@@ -82,6 +82,13 @@ func printAndResetHEICLadder() {
 // a full read.
 const heicHeaderReadSize = 192 * 1024
 
+// heicWideRetryReadSize is the widened window used by rung 3 of the decode
+// ladder, for the rare file whose thumbnail tile sits past the header window.
+// Measured on a 1,038-file corpus: 22 files missed the header window and 2 of
+// them were recovered at 1 MB. The rest have no thumbnail item at all, so no
+// window size would help them.
+const heicWideRetryReadSize = 1024 * 1024
+
 // initHEIC configures the heic package at startup, choosing between the two
 // backends: the system libheif loaded dynamically via purego, or the Rust HEVC
 // decoder compiled to WASM.
@@ -124,23 +131,29 @@ func isHEIC(path string) bool {
 	return ext == ".heic" || ext == ".heif"
 }
 
-// readHEICHeader reads up to heicHeaderReadSize bytes from path.
-// Returns the read bytes (may be less than heicHeaderReadSize if the file
-// is shorter) and any I/O error.
-func readHEICHeader(path string) ([]byte, error) {
+// readHEICPrefix reads up to n bytes from the front of path.
+// Returns the bytes actually read (fewer than n if the file is shorter) and any
+// I/O error. The decode ladder uses this twice with different window sizes: the
+// standard heicHeaderReadSize pass, and one widened retry.
+func readHEICPrefix(path string, n int) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	buf := make([]byte, heicHeaderReadSize)
-	n, err := io.ReadFull(f, buf)
+	buf := make([]byte, n)
+	got, err := io.ReadFull(f, buf)
 	// io.ReadFull returns ErrUnexpectedEOF for short files — that's fine,
 	// we just use however many bytes we got.
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		return nil, err
 	}
-	return buf[:n], nil
+	return buf[:got], nil
+}
+
+// readHEICHeader reads the standard byte-range window used by the fast path.
+func readHEICHeader(path string) ([]byte, error) {
+	return readHEICPrefix(path, heicHeaderReadSize)
 }
 
 // Decode through the package-level heic.Decode / heic.DecodeThumbnail: as of
@@ -163,33 +176,39 @@ func decodeHEICFromHeader(path string, header []byte) (image.Image, error) {
 		heicLadderPrimaryHeader.Add(1)
 		return img, nil
 	}
-	// Rungs 3 & 4 — Fallback 2: full file read (thumbnail tile past the header
-	// window). This branch is the expensive one, so we time it and record how
-	// many bytes it reads to quantify the cost of files that miss the header.
+	// Rung 3 — Fallback 2: widen the byte range to 1 MB and retry the thumbnail.
+	// This recovers files whose thumbnail tile sits just past the header window
+	// without paying to read the whole file. Timed and byte-counted because this
+	// branch is the expensive one.
 	fullReadStart := time.Now()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		// Still record the time spent attempting the read before giving up.
-		heicLadderFullReadNs.Add(int64(time.Since(fullReadStart)))
-		heicLadderFail.Add(1)
-		return nil, err
+	if wide, wideErr := readHEICPrefix(path, heicWideRetryReadSize); wideErr == nil {
+		heicLadderFullReadBytes.Add(int64(len(wide)))
+		if img, err := heic.DecodeThumbnail(bytes.NewReader(wide)); err == nil {
+			heicLadderFullReadNs.Add(int64(time.Since(fullReadStart)))
+			heicLadderFullThumb.Add(1)
+			return img, nil
+		}
 	}
-	heicLadderFullReadBytes.Add(int64(len(data)))
-	// Rung 3: thumbnail from the full file.
-	if img, err := heic.DecodeThumbnail(bytes.NewReader(data)); err == nil {
-		heicLadderFullReadNs.Add(int64(time.Since(fullReadStart)))
-		heicLadderFullThumb.Add(1)
-		return img, nil
-	}
-	// Rung 4: primary from the full file (last resort).
-	img, err := heic.Decode(bytes.NewReader(data))
+
+	// No embedded thumbnail anywhere in the file. There used to be a fourth rung
+	// here that read the whole file and decoded the PRIMARY image as a last
+	// resort. Under the WASM decoder (the only backend on Windows) that costs
+	// 3-13 seconds for a single 12 MP iPhone image: measured at 125s of decode
+	// time for the 22 files out of 1,038 that reached it — 2% of the corpus
+	// consuming ~30% of the entire scan, on every scan, because a file with no
+	// thumbnail item never gains one.
+	//
+	// A JPEG with no EXIF thumbnail already returns ErrNoThumbnail from
+	// computeDHashFromHeaderBuffer in hasher.go and is simply skipped for
+	// perceptual matching. This is the same policy applied to the same situation.
+	// The affected files still participate in exact-duplicate detection via
+	// xxHash; they only lose perceptual matching.
+	//
+	// heicLadderFullPrimary is deliberately left in place and is now always zero.
+	// A non-zero value in the [perf] line means this decision was reverted.
 	heicLadderFullReadNs.Add(int64(time.Since(fullReadStart)))
-	if err != nil {
-		heicLadderFail.Add(1)
-	} else {
-		heicLadderFullPrimary.Add(1)
-	}
-	return img, err
+	heicLadderFail.Add(1)
+	return nil, ErrNoThumbnail
 }
 
 // decodeHEICThumbnail decodes the embedded thumbnail from a HEIC file using

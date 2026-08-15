@@ -60,11 +60,20 @@ startup, never per call.
 
 HEIC has a dedicated fast path, since these files are ~3 MB each and a full decode is
 ~100× slower than the embedded thumbnail. `heic_support.go` reads only the first **192 KB**
-of the file and runs a four-rung ladder (`decodeHEICFromHeader`): embedded thumbnail from
-that header window → primary image from it → thumbnail after a full read → primary after a
-full read. Rung 1 hits for essentially every iPhone photo. `printAndResetHEICLadder()`
-prints a `[perf] HEIC ladder:` line at the end of a scan showing how often each rung won —
-if `thumbHdr` ever collapses toward zero, the fast path has broken and scans will crawl.
+of the file and runs a **three-rung** ladder (`decodeHEICFromHeader`): embedded thumbnail
+from that header window → primary image from it → thumbnail after a widened 1 MB read.
+Rung 1 hits for essentially every iPhone photo. `printAndResetHEICLadder()` prints a
+`[perf] HEIC ladder:` line at the end of a scan showing how often each rung won — if
+`thumbHdr` ever collapses toward zero, the fast path has broken and scans will crawl.
+
+**A file with no embedded thumbnail gets `dHash = 0` and is skipped for perceptual
+matching** — it is still exact-matched by xxHash. There used to be a fourth rung that read
+the whole file and decoded the *primary* image, but under the WASM decoder that costs 3–13 s
+per 12 MP image: measured at 125 s of decode time for the 22 files out of 1,038 that reached
+it, i.e. 2% of a corpus consuming ~30% of the scan, on every scan. This matches what
+`computeDHashFromHeaderBuffer` in `hasher.go` already does for a JPEG with no EXIF
+thumbnail. `heicLadderFullPrimary` is kept and is now always zero; a non-zero value in the
+`[perf]` line means that decision was reverted. See `docs/04-SCAN-PERF-AND-LIVE-PHOTOS.md`.
 
 **Genuinely unsupported:** RAW formats have preview extraction only (`raw_preview.go`),
 not full decode.
@@ -91,13 +100,13 @@ dedup-photos/
 ├── hasher.go            366   Hash algorithms (xxHash exact, dHash/pHash perceptual)
 ├── hasher_pipeline.go   671   Parallel hash pipeline with file-size bucketing
 ├── parallel.go          168   Shared worker-pool helper used by hasher + grouper
-├── grouper.go           682   BK-Tree, Union-Find, duplicate grouping
+├── grouper.go           706   BK-Tree, Union-Find, duplicate grouping
 ├── cache.go             186   Persistent hash cache for fast re-scans
 ├── thumb_cache.go       109   Persistent on-disk thumbnail cache (lazy, on first view)
 │
 │  ── Format support ───────────────────────────────────────────────────────────
-├── heic_support.go      352   HEIC/HEIF: 192 KB byte-range fast path, 4-rung decode
-│                              ladder, per-worker reusable decoder, [perf] counters
+├── heic_support.go      320   HEIC/HEIF: 192 KB byte-range fast path, 3-rung decode
+│                              ladder, [perf] counters
 ├── heic_version_linux.go  28  Probe the system libheif version via purego dlopen, so
 ├── heic_version_darwin.go 34  initHEIC() can force WASM below 1.18.
 ├── heic_version_other.go  11  The third is the Windows/BSD stub (always returns true)
@@ -219,11 +228,11 @@ improvement plan.
 | `scanner.go` | 385 | Filesystem walk; `supportedExtensions` |
 | `hasher.go` | 366 | Hash algorithms — xxHash (exact), dHash/pHash (perceptual) |
 | `hasher_pipeline.go` | 671 | Parallel hash pipeline with file-size bucketing |
-| `grouper.go` | 682 | BK-Tree indexing + Union-Find duplicate grouping |
+| `grouper.go` | 706 | BK-Tree indexing + Union-Find duplicate grouping |
 | `metadata.go` | 467 | EXIF-driven quality scoring |
 | `cache.go` | 186 | Persistent hash cache |
 | `thumb_cache.go` | 109 | Persistent on-disk thumbnail cache |
-| `heic_support.go` | 352 | HEIC fast path + decode ladder (see §1) |
+| `heic_support.go` | 320 | HEIC fast path + decode ladder (see §1) |
 
 ---
 
