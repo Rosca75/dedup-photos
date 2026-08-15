@@ -274,6 +274,12 @@ func (a *App) CancelScan() map[string]string {
 // =============================================================================
 
 // DeleteFile permanently removes a file from disk and evicts its thumbnail.
+//
+// If the file is the still half of an iPhone Live Photo, its .MOV half is
+// removed with it — the two files are one photo, so leaving the video behind
+// would orphan it. The pairing is confirmed by ContentIdentifier before anything
+// is touched; see livephoto.go.
+//
 // Returns {"success": true/false, "message"/"error": "..."}.
 func (a *App) DeleteFile(path string) map[string]interface{} {
 	if path == "" {
@@ -286,12 +292,27 @@ func (a *App) DeleteFile(path string) map[string]interface{} {
 	if info.IsDir() {
 		return map[string]interface{}{"success": false, "error": "cannot delete a directory"}
 	}
+
+	// Resolve the Live Photo video BEFORE removing the still: confirming the
+	// pairing requires reading the still's ContentIdentifier, which is only
+	// possible while it is still on disk.
+	livePhotoVideo, hasLivePhotoVideo := livePhotoSibling(path)
+
 	if err := os.Remove(path); err != nil {
 		return map[string]interface{}{"success": false, "error": fmt.Sprintf("failed to delete: %v", err)}
 	}
 	thumbnailCache.Delete(path) // Remove from thumbnail cache.
 	deleteThumbCache(path)      // Remove any persisted on-disk thumbnail.
 	log.Printf("[delete] Permanently deleted: %s", path)
+
+	if hasLivePhotoVideo {
+		if err := os.Remove(livePhotoVideo); err != nil {
+			// The still is already gone, so this is reported but not fatal.
+			log.Printf("[livephoto] Failed to delete Live Photo video %s: %v", livePhotoVideo, err)
+		} else {
+			log.Printf("[livephoto] Deleted Live Photo video alongside its still: %s", livePhotoVideo)
+		}
+	}
 	return map[string]interface{}{"success": true, "message": "Deleted: " + path}
 }
 
@@ -313,10 +334,12 @@ func (a *App) GetThumbnail(path string) string {
 		return base64.StdEncoding.EncodeToString(cached.([]byte))
 	}
 
-	// Serve from the on-disk thumbnail cache if a valid entry exists. This is
-	// populated during the scan's hash phase, so HEIC files (and any file we
-	// previously thumbnailed) never need to be decoded again after a scan or
-	// an app restart.
+	// Serve from the on-disk thumbnail cache if a valid entry exists. HEIC files
+	// are written there during the scan's perceptual-hash phase, which decodes
+	// their thumbnail anyway (see computeDHashHEIC), so they are never decoded
+	// twice — including across app restarts. Other formats land here the first
+	// time they are viewed, via the storeThumbCache call at the end of this
+	// function.
 	if disk, ok := loadThumbCache(path); ok {
 		thumbnailCache.Store(path, disk)
 		return base64.StdEncoding.EncodeToString(disk)
@@ -345,6 +368,7 @@ func (a *App) GetThumbnail(path string) string {
 		// Fallback for RAW formats (DNG, ARW, CR2): scan for embedded JPEG preview.
 		if embedded := extractEmbeddedJPEG(path); embedded != nil {
 			thumbnailCache.Store(path, embedded)
+			storeThumbCache(path, embedded) // Persist for next time / after restart.
 			return base64.StdEncoding.EncodeToString(embedded)
 		}
 		return ""
@@ -384,6 +408,10 @@ func (a *App) GetThumbnail(path string) string {
 	}
 	jpegBytes := buf.Bytes()
 	thumbnailCache.Store(path, jpegBytes)
+	// Persist to disk as well. Reaching this point meant a full image.Decode of
+	// the source — for a 12 MP JPEG that is the expensive part of this function,
+	// and without persisting it we would pay it again after every restart.
+	storeThumbCache(path, jpegBytes)
 	return base64.StdEncoding.EncodeToString(jpegBytes)
 }
 

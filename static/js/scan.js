@@ -1,7 +1,7 @@
 // scan.js — Scan lifecycle: start, poll, cancel, progress updates.
 
 import { state } from './state.js';
-import { apiScan, apiResults, apiProgress, apiCancel } from './api.js';
+import { apiScan, apiResults, apiProgress, apiCancel, clearThumbnailCache } from './api.js';
 import { showToast } from './components.js';
 import { renderResults, toggleAllGroups } from './table.js';
 
@@ -53,6 +53,9 @@ function startScan() {
   // Clear promoted images for a fresh scan.
   state.pendingDeletions.clear();
   state.promotedImages.clear();
+  // Thumbnails are cached by path for the session; drop them so a rescan never
+  // shows a stale image for a file that changed on disk since the last scan.
+  clearThumbnailCache();
 
   setScanningUI(true);
   document.getElementById('groups-container').innerHTML = '';

@@ -31,6 +31,24 @@ export const state = {
   /** Currently selected row path (for highlight in table). */
   selectedRowPath: null,
 
+  /**
+   * Thumbnails already fetched from Go, keyed by absolute file path.
+   * Each value is a base64 JPEG string ('' when the file has no thumbnail).
+   * Fetching one costs a network read plus a HEVC decode on the Go side, so a
+   * path is only ever asked for once per session.
+   */
+  thumbCache: new Map(),
+
+  /**
+   * Thumbnail requests currently in flight, keyed by path → Promise.
+   * Without this, hovering the same row repeatedly before the first response
+   * arrives would issue a fresh request each time.
+   */
+  thumbInflight: new Map(),
+
+  /** setTimeout handle for the pending hover-preview thumbnail request. */
+  hoverTimer: null,
+
   /** Set of group IDs that are currently collapsed in the table. */
   collapsedGroups: new Set(),
 

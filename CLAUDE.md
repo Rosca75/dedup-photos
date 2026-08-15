@@ -43,8 +43,8 @@ two backends: a Rust HEVC decoder compiled to WASM (always available, works ever
 or the system `libheif` loaded dynamically via purego when present.
 
 `initHEIC()` in `heic_support.go` picks the backend at startup, and the deciding factor is
-whether it can decode the **truncated** 192 KB buffer the fast path hands it. Measured on
-`samples/`, 96 concurrent thumbnail decodes from a 192 KB header:
+whether it can decode the **truncated** header buffer the fast path hands it. Measured on
+`samples/`, 96 concurrent thumbnail decodes from a truncated header:
 
 | Backend | Result | Time |
 |---|---|---|
@@ -59,15 +59,42 @@ package-level global and the pipeline decodes concurrently, so the backend is ch
 startup, never per call.
 
 HEIC has a dedicated fast path, since these files are ~3 MB each and a full decode is
-~100× slower than the embedded thumbnail. `heic_support.go` reads only the first **192 KB**
-of the file and runs a four-rung ladder (`decodeHEICFromHeader`): embedded thumbnail from
-that header window → primary image from it → thumbnail after a full read → primary after a
-full read. Rung 1 hits for essentially every iPhone photo. `printAndResetHEICLadder()`
-prints a `[perf] HEIC ladder:` line at the end of a scan showing how often each rung won —
-if `thumbHdr` ever collapses toward zero, the fast path has broken and scans will crawl.
+~100× slower than the embedded thumbnail. `heic_support.go` reads only the first **128 KB**
+of the file and runs a **three-rung** ladder (`decodeHEICFromHeader`): embedded thumbnail
+from that header window → primary image from it → thumbnail after a widened 1 MB read.
+Rung 1 hits for essentially every iPhone photo. `printAndResetHEICLadder()` prints a
+`[perf] HEIC ladder:` line at the end of a scan showing how often each rung won — if
+`thumbHdr` ever collapses toward zero, the fast path has broken and scans will crawl.
+
+**A file with no embedded thumbnail gets `dHash = 0` and is skipped for perceptual
+matching** — it is still exact-matched by xxHash. There used to be a fourth rung that read
+the whole file and decoded the *primary* image, but under the WASM decoder that costs 3–13 s
+per 12 MP image: measured at 125 s of decode time for the 22 files out of 1,038 that reached
+it, i.e. 2% of a corpus consuming ~30% of the scan, on every scan. This matches what
+`computeDHashFromHeaderBuffer` in `hasher.go` already does for a JPEG with no EXIF
+thumbnail. `heicLadderFullPrimary` is kept and is now always zero; a non-zero value in the
+`[perf]` line means that decision was reverted. See `docs/04-SCAN-PERF-AND-LIVE-PHOTOS.md`.
 
 **Genuinely unsupported:** RAW formats have preview extraction only (`raw_preview.go`),
 not full decode.
+
+**Live Photos are one photo, not two files.** An iPhone Live Photo is a `.HEIC` still plus
+a `.MOV` clip sharing an Apple `ContentIdentifier` UUID — tag `0x0011` in the still's Apple
+maker note, key `com.apple.quicktime.content.identifier` in the video's `moov/meta`.
+`DeleteFile` removes both. The video is found by filename (`IMG_1234.HEIC` → `IMG_1234.MOV`)
+and then **confirmed by UUID before anything is deleted**; any mismatch, missing tag or
+unreadable box leaves the video alone and logs why. That guard is not optional — it is the
+only thing standing between a batch delete and removing a file the user never named.
+
+Two constraints worth knowing before touching this. **`bep/imagemeta` cannot supply the
+still's UUID**: it surfaces the tag as `MakerNoteApple` but truncates the value (824 of
+1731 bytes on a test file), and since Apple's value offsets are maker-note-relative the UUID
+falls outside what survives — hence the hand-rolled reader in `tiff_walk.go`. And **MOV
+metadata must never be read during a scan**: `moov` sits at a median 99.8% of the file, so
+reading 699 of them cost ~17 s, as much as an entire optimised scan. Pairing is therefore
+lazy, at delete time only, ~37 ms per deleted file. Measured on 1,038 stills / 699 videos:
+699 stills carry the tag, all 699 videos do, and filename and UUID pairing agreed on every
+one.
 
 ---
 
@@ -82,28 +109,35 @@ dedup-photos/
 │
 │  ── Entry point & Wails surface ─────────────────────────────────────────────
 ├── main.go               84   Wails v2 entry point; //go:embed all:static
-├── app.go               503   App struct — every method bound to the JS frontend
+├── app.go               510   App struct — every method bound to the JS frontend
 ├── types.go              61   Request/response types serialised across the Wails bridge
 ├── state.go              35   Global scan state + undo/redo stacks (mutex-guarded)
 │
 │  ── Scan pipeline ────────────────────────────────────────────────────────────
 ├── scanner.go           385   Filesystem walk; supportedExtensions lives here
 ├── hasher.go            366   Hash algorithms (xxHash exact, dHash/pHash perceptual)
-├── hasher_pipeline.go   671   Parallel hash pipeline with file-size bucketing
+├── hasher_pipeline.go   690   Parallel hash pipeline with file-size bucketing
 ├── parallel.go          168   Shared worker-pool helper used by hasher + grouper
-├── grouper.go           682   BK-Tree, Union-Find, duplicate grouping
+├── grouper.go           706   BK-Tree, Union-Find, duplicate grouping
 ├── cache.go             186   Persistent hash cache for fast re-scans
-├── thumb_cache.go       109   Persistent on-disk thumbnail cache (lazy, on first view)
+├── thumb_cache.go       150   Persistent on-disk thumbnail cache (written during the scan)
 │
 │  ── Format support ───────────────────────────────────────────────────────────
-├── heic_support.go      352   HEIC/HEIF: 192 KB byte-range fast path, 4-rung decode
-│                              ladder, per-worker reusable decoder, [perf] counters
+├── heic_support.go      364   HEIC/HEIF: 128 KB byte-range fast path, 3-rung decode
+│                              ladder, [perf] counters
 ├── heic_version_linux.go  28  Probe the system libheif version via purego dlopen, so
 ├── heic_version_darwin.go 34  initHEIC() can force WASM below 1.18.
 ├── heic_version_other.go  11  The third is the Windows/BSD stub (always returns true)
 ├── raw_preview.go        76   extractEmbeddedJPEG — pull JPEG previews out of RAW files
 ├── exif_extract.go      169   Unified EXIF extraction via bep/imagemeta (all formats)
 ├── metadata.go          467   EXIF-driven quality scoring
+│
+│  ── Live Photo pairing ───────────────────────────────────────────────────────
+├── livephoto.go          91   Pair a .HEIC still with its .MOV half, UUID-verified
+├── livephoto_apple.go   105   Apple:ContentIdentifier from the HEIC maker note
+├── livephoto_quicktime.go 119 Keys:ContentIdentifier from the MOV's moov/meta
+├── tiff_walk.go         120   Minimal TIFF/EXIF IFD reader (raw maker-note bytes)
+├── quicktime_box.go      96   Minimal ISOBMFF / QuickTime box reader
 │
 │  ── Config & docs ────────────────────────────────────────────────────────────
 ├── wails.json                 Wails config (name, output filename, author)
@@ -192,7 +226,7 @@ All public methods on `*App` are automatically callable from JavaScript.
 | `StartScan` | `(req ScanRequest) map[string]string` | Start background scan |
 | `GetResults` | `() ScanResult` | Poll scan progress and results |
 | `CancelScan` | `() map[string]string` | Cancel active scan |
-| `DeleteFile` | `(path string) map[string]interface{}` | Permanently delete a file |
+| `DeleteFile` | `(path string) map[string]interface{}` | Permanently delete a file, plus its Live Photo `.MOV` half |
 | `GetThumbnail` | `(path string) string` | Returns base64 JPEG string |
 | `OpenFolderDialog` | `() (string, error)` | Native OS folder picker |
 | `ReportMismatch` | `(groupID string) string` | Returns JSON diagnostic report string |
@@ -218,12 +252,12 @@ improvement plan.
 |---|---|---|
 | `scanner.go` | 385 | Filesystem walk; `supportedExtensions` |
 | `hasher.go` | 366 | Hash algorithms — xxHash (exact), dHash/pHash (perceptual) |
-| `hasher_pipeline.go` | 671 | Parallel hash pipeline with file-size bucketing |
-| `grouper.go` | 682 | BK-Tree indexing + Union-Find duplicate grouping |
+| `hasher_pipeline.go` | 690 | Parallel hash pipeline with file-size bucketing |
+| `grouper.go` | 706 | BK-Tree indexing + Union-Find duplicate grouping |
 | `metadata.go` | 467 | EXIF-driven quality scoring |
 | `cache.go` | 186 | Persistent hash cache |
-| `thumb_cache.go` | 109 | Persistent on-disk thumbnail cache |
-| `heic_support.go` | 352 | HEIC fast path + decode ladder (see §1) |
+| `thumb_cache.go` | 150 | Persistent on-disk thumbnail cache |
+| `heic_support.go` | 320 | HEIC fast path + decode ladder (see §1) |
 
 ---
 
