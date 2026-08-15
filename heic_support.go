@@ -343,12 +343,25 @@ func computeDHashHEIC(path, algorithm string) (dHash uint64, width, height int, 
 		return 0, width, height, ErrNoThumbnail
 	}
 
-	// Note: we intentionally do NOT persist a JPEG thumbnail here. Generating a
-	// thumbnail for every HEIC during the scan (resize + JPEG encode + disk
-	// write for thousands of files, the vast majority of which are never
-	// viewed) was a major hot-path cost. Thumbnails are now produced lazily on
-	// first view in GetThumbnail, which caches them to disk on demand.
-	return computeDHashFromImage(img), width, height, nil
+	// The decoded thumbnail is in hand here, so persist it for the UI rather than
+	// making GetThumbnail decode the same file again on first view.
+	//
+	// This reverses 4ecc858, which removed thumbnail generation from the scan as
+	// a hot-path cost. That was correct at the time: the scan then had to decode
+	// specially for the thumbnail. It no longer does — the decode happens anyway
+	// for the dHash, so the marginal cost is just the resize, encode and write,
+	// measured at ~2 ms of worker time per file. Decoding on first view instead
+	// costs 55-70 ms interactively, and 3.9-5.7 s for a file with no embedded
+	// thumbnail (heicThumbnailJPEG falls back to a full decode for those).
+	//
+	// resizeImageToJPEG is called with the same 400 px / quality 85 arguments as
+	// heicThumbnailJPEG, so the cached bytes are exactly what GetThumbnail would
+	// have produced.
+	dHash = computeDHashFromImage(img)
+	if jpegBytes := resizeImageToJPEG(img, 400, 85); jpegBytes != nil {
+		storeThumbCache(path, jpegBytes)
+	}
+	return dHash, width, height, nil
 }
 
 // extractHEICExif populates meta with EXIF data from a HEIC file.

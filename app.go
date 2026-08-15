@@ -313,10 +313,12 @@ func (a *App) GetThumbnail(path string) string {
 		return base64.StdEncoding.EncodeToString(cached.([]byte))
 	}
 
-	// Serve from the on-disk thumbnail cache if a valid entry exists. This is
-	// populated during the scan's hash phase, so HEIC files (and any file we
-	// previously thumbnailed) never need to be decoded again after a scan or
-	// an app restart.
+	// Serve from the on-disk thumbnail cache if a valid entry exists. HEIC files
+	// are written there during the scan's perceptual-hash phase, which decodes
+	// their thumbnail anyway (see computeDHashHEIC), so they are never decoded
+	// twice — including across app restarts. Other formats land here the first
+	// time they are viewed, via the storeThumbCache call at the end of this
+	// function.
 	if disk, ok := loadThumbCache(path); ok {
 		thumbnailCache.Store(path, disk)
 		return base64.StdEncoding.EncodeToString(disk)
@@ -345,6 +347,7 @@ func (a *App) GetThumbnail(path string) string {
 		// Fallback for RAW formats (DNG, ARW, CR2): scan for embedded JPEG preview.
 		if embedded := extractEmbeddedJPEG(path); embedded != nil {
 			thumbnailCache.Store(path, embedded)
+			storeThumbCache(path, embedded) // Persist for next time / after restart.
 			return base64.StdEncoding.EncodeToString(embedded)
 		}
 		return ""
@@ -384,6 +387,10 @@ func (a *App) GetThumbnail(path string) string {
 	}
 	jpegBytes := buf.Bytes()
 	thumbnailCache.Store(path, jpegBytes)
+	// Persist to disk as well. Reaching this point meant a full image.Decode of
+	// the source — for a 12 MP JPEG that is the expensive part of this function,
+	// and without persisting it we would pay it again after every restart.
+	storeThumbCache(path, jpegBytes)
 	return base64.StdEncoding.EncodeToString(jpegBytes)
 }
 

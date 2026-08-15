@@ -91,7 +91,7 @@ dedup-photos/
 │
 │  ── Entry point & Wails surface ─────────────────────────────────────────────
 ├── main.go               84   Wails v2 entry point; //go:embed all:static
-├── app.go               503   App struct — every method bound to the JS frontend
+├── app.go               510   App struct — every method bound to the JS frontend
 ├── types.go              61   Request/response types serialised across the Wails bridge
 ├── state.go              35   Global scan state + undo/redo stacks (mutex-guarded)
 │
@@ -102,7 +102,7 @@ dedup-photos/
 ├── parallel.go          168   Shared worker-pool helper used by hasher + grouper
 ├── grouper.go           706   BK-Tree, Union-Find, duplicate grouping
 ├── cache.go             186   Persistent hash cache for fast re-scans
-├── thumb_cache.go       109   Persistent on-disk thumbnail cache (lazy, on first view)
+├── thumb_cache.go       150   Persistent on-disk thumbnail cache (written during the scan)
 │
 │  ── Format support ───────────────────────────────────────────────────────────
 ├── heic_support.go      364   HEIC/HEIF: 128 KB byte-range fast path, 3-rung decode
@@ -231,7 +231,7 @@ improvement plan.
 | `grouper.go` | 706 | BK-Tree indexing + Union-Find duplicate grouping |
 | `metadata.go` | 467 | EXIF-driven quality scoring |
 | `cache.go` | 186 | Persistent hash cache |
-| `thumb_cache.go` | 109 | Persistent on-disk thumbnail cache |
+| `thumb_cache.go` | 150 | Persistent on-disk thumbnail cache |
 | `heic_support.go` | 320 | HEIC fast path + decode ladder (see §1) |
 
 ---

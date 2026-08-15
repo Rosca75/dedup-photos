@@ -3,74 +3,112 @@
 // =============================================================================
 //
 // Decoding a HEIC thumbnail is the single most expensive step of a scan (a WASM
-// HEVC decode). During the perceptual-hash phase we already decode every HEIC
-// thumbnail, so we JPEG-encode it once and persist it here. Afterwards the UI
-// (GetThumbnail) and any app restart can load the ready-made JPEG straight from
-// disk instead of decoding the HEIC again — halving decode work across the
-// scan-then-review workflow.
+// HEVC decode). The perceptual-hash phase already decodes every HEIC thumbnail,
+// so it JPEG-encodes it once and persists it here (see computeDHashHEIC), and
+// the UI then loads the ready-made JPEG instead of decoding again — across app
+// restarts too.
 //
-// Layout: ~/.dedup-photos/thumbs/thumb_<hash>_<size>_<modtime>.jpg
-//   - <hash>    : first 16 hex chars of sha256(absolute path) — filesystem-safe.
-//   - <size>    : source file size in bytes.
-//   - <modtime> : source file modification time (Unix nanoseconds).
+// Layout: ~/.dedup-photos/thumbs/thumb_<hash>.jpg, where <hash> is the first 16
+// hex chars of sha256(absolute path). Exactly ONE file exists per source image
+// and is overwritten in place when the source changes. The source's size and
+// modification time ride in a fixed 16-byte header in front of the JPEG rather
+// than in the filename, so a stale entry is detected on read and replaced on the
+// next write — there is never anything to hunt down and delete.
 //
-// Encoding the size + modtime into the filename gives free cache invalidation:
-// if the source file changes, the computed filename changes and the old entry
-// simply never matches. On write we first delete any prior entry for the same
-// path hash, so at most one thumbnail file exists per source image.
+// The previous scheme put size and modtime in the filename, which made a changed
+// file leave an orphan behind, so every write ran a filepath.Glob over the whole
+// directory to clean up: 275 µs at 317 cached files, growing linearly, and now
+// paid once per HEIC during a scan. pruneLegacyThumbs clears out its leftovers.
 // =============================================================================
 
 package main
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 )
 
-// thumbCacheDir returns (and lazily creates) the thumbnail cache directory.
+// thumbCacheStampSize is the length of the validation header written in front of
+// every cached thumbnail: 8 bytes of source file size, then 8 bytes of source
+// modification time in Unix nanoseconds, both little-endian.
+const thumbCacheStampSize = 16
+
+// Memoised so MkdirAll runs once per process, not on every read and write.
+var (
+	thumbDirOnce sync.Once
+	thumbDirPath string
+)
+
+// thumbCacheDir returns (and on first call creates) the thumbnail cache
+// directory, and clears out entries left by the previous naming scheme.
 func thumbCacheDir() string {
-	home, err := os.UserHomeDir()
+	thumbDirOnce.Do(func() {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "."
+		}
+		thumbDirPath = filepath.Join(home, ".dedup-photos", "thumbs")
+		os.MkdirAll(thumbDirPath, 0755)
+		pruneLegacyThumbs(thumbDirPath)
+	})
+	return thumbDirPath
+}
+
+// pruneLegacyThumbs deletes cache files written by the old
+// thumb_<hash>_<size>_<modtime>.jpg scheme, which can never match a current
+// lookup and would otherwise sit in the directory forever. Best-effort.
+func pruneLegacyThumbs(dir string) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		home = "."
+		return
 	}
-	dir := filepath.Join(home, ".dedup-photos", "thumbs")
-	os.MkdirAll(dir, 0755)
-	return dir
+	for _, e := range entries {
+		name := e.Name()
+		// Current names are thumb_<hash>.jpg — exactly one underscore. Legacy
+		// names carry the size and modtime as two further underscore-separated
+		// fields.
+		if strings.HasPrefix(name, "thumb_") && strings.Count(name, "_") > 1 {
+			os.Remove(filepath.Join(dir, name))
+		}
+	}
 }
 
-// thumbHashPrefix returns the "thumb_<hash>_" filename prefix for a path.
-// All cache entries for the same source path share this prefix regardless of
-// the file's current size/modtime, so we can find and delete stale entries.
-func thumbHashPrefix(path string) string {
+// thumbNameFor builds the cache filename for a source path. It depends only on
+// the path, so a changed source file reuses (and overwrites) the same entry.
+func thumbNameFor(path string) string {
 	h := sha256.Sum256([]byte(path))
-	return fmt.Sprintf("thumb_%x_", h[:8])
+	return fmt.Sprintf("thumb_%x.jpg", h[:8])
 }
 
-// thumbNameFor builds the full cache filename for a path + its file info.
-func thumbNameFor(path string, info os.FileInfo) string {
-	return fmt.Sprintf("%s%d_%d.jpg", thumbHashPrefix(path), info.Size(), info.ModTime().UnixNano())
-}
-
-// loadThumbCache returns the cached JPEG thumbnail bytes for path, if a valid
-// (matching size + modtime) entry exists on disk.
+// loadThumbCache returns the cached JPEG thumbnail bytes for path, if an entry
+// exists whose stamp still matches the source file's size and modification time.
 func loadThumbCache(path string) ([]byte, bool) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, false
 	}
-	name := filepath.Join(thumbCacheDir(), thumbNameFor(path, info))
-	data, err := os.ReadFile(name)
-	if err != nil || len(data) == 0 {
+	data, err := os.ReadFile(filepath.Join(thumbCacheDir(), thumbNameFor(path)))
+	if err != nil || len(data) <= thumbCacheStampSize {
 		return nil, false
 	}
-	return data, true
+	// Stale entry: the source file changed since this thumbnail was written.
+	// Leave it in place — the next storeThumbCache overwrites it.
+	size := int64(binary.LittleEndian.Uint64(data[0:8]))
+	modTime := int64(binary.LittleEndian.Uint64(data[8:16]))
+	if size != info.Size() || modTime != info.ModTime().UnixNano() {
+		return nil, false
+	}
+	return data[thumbCacheStampSize:], true
 }
 
-// storeThumbCache writes JPEG bytes to the cache for path, first removing any
-// stale entry for the same source path. Best-effort: errors are ignored so a
-// cache-write failure never breaks a scan or a thumbnail request.
+// storeThumbCache writes JPEG bytes to the cache for path, stamped with the
+// source file's current size and modification time. Best-effort: errors are
+// ignored so a cache-write failure never breaks a scan or a thumbnail request.
 func storeThumbCache(path string, jpegBytes []byte) {
 	info, err := os.Stat(path)
 	if err != nil || len(jpegBytes) == 0 {
@@ -78,32 +116,35 @@ func storeThumbCache(path string, jpegBytes []byte) {
 	}
 	dir := thumbCacheDir()
 
-	// Remove any prior entry for this path (different size/modtime) so the
-	// cache holds at most one thumbnail per source file.
-	if matches, _ := filepath.Glob(filepath.Join(dir, thumbHashPrefix(path)+"*.jpg")); matches != nil {
-		for _, m := range matches {
-			os.Remove(m)
-		}
-	}
+	buf := make([]byte, thumbCacheStampSize+len(jpegBytes))
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(info.Size()))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(info.ModTime().UnixNano()))
+	copy(buf[thumbCacheStampSize:], jpegBytes)
 
-	// Write atomically: temp file then rename, so a concurrent reader never
-	// sees a half-written JPEG.
-	final := filepath.Join(dir, thumbNameFor(path, info))
-	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, jpegBytes, 0644); err != nil {
+	// Write to a unique temp file and rename over the target, so a concurrent
+	// reader never sees a half-written entry. CreateTemp rather than a fixed
+	// "<name>.tmp" so two goroutines storing the same path cannot collide.
+	tmp, err := os.CreateTemp(dir, "thumb-*.tmp")
+	if err != nil {
 		return
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		os.Remove(tmp)
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(buf); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, filepath.Join(dir, thumbNameFor(path))); err != nil {
+		os.Remove(tmpName)
 	}
 }
 
-// deleteThumbCache removes all cache entries for a source path. Called when the
-// user deletes a file so its stale thumbnail doesn't linger on disk.
+// deleteThumbCache removes the cache entry for a source path. Called when the
+// user deletes a file so its thumbnail doesn't linger on disk.
 func deleteThumbCache(path string) {
-	if matches, _ := filepath.Glob(filepath.Join(thumbCacheDir(), thumbHashPrefix(path)+"*.jpg")); matches != nil {
-		for _, m := range matches {
-			os.Remove(m)
-		}
-	}
+	os.Remove(filepath.Join(thumbCacheDir(), thumbNameFor(path)))
 }
