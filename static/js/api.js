@@ -9,6 +9,8 @@
 // The Go structs are automatically serialised to/from JS objects using
 // the json: struct tags defined in server.go.
 
+import { state } from './state.js';
+
 /** Helper: return the Wails App binding. */
 const GoApp = () => window.go.main.App;
 
@@ -73,6 +75,52 @@ export function apiOpenFolderDialog() {
  */
 export function apiGetThumbnail(path) {
   return GoApp().GetThumbnail(path || '');
+}
+
+/**
+ * Same as apiGetThumbnail, but never asks Go for the same path twice.
+ *
+ * A thumbnail costs Go a network read plus a HEVC decode — tens of milliseconds
+ * on a local disk, and seconds for a HEIC with no embedded thumbnail. Both the
+ * hover preview and the left-hand preview panel request thumbnails for the same
+ * images repeatedly as the user moves around the results, so results are held in
+ * state.thumbCache and concurrent requests for one path share a single Promise.
+ *
+ * Returns a Promise<string>, empty when no thumbnail could be produced. Failures
+ * are cached too: a file Go cannot decode will not decode on the next hover
+ * either, and retrying would re-pay the full cost every time.
+ * @param {string} path - Absolute file path.
+ */
+export function apiGetThumbnailCached(path) {
+  if (!path) return Promise.resolve('');
+
+  const cached = state.thumbCache.get(path);
+  if (cached !== undefined) return Promise.resolve(cached);
+
+  const inflight = state.thumbInflight.get(path);
+  if (inflight) return inflight;
+
+  const request = GoApp().GetThumbnail(path)
+    .then(b64 => {
+      state.thumbCache.set(path, b64 || '');
+      state.thumbInflight.delete(path);
+      return b64 || '';
+    })
+    .catch(() => {
+      // Do not cache transport-level failures — unlike a file Go cannot decode,
+      // these can succeed on a retry.
+      state.thumbInflight.delete(path);
+      return '';
+    });
+
+  state.thumbInflight.set(path, request);
+  return request;
+}
+
+/** Forget every cached thumbnail. Called when a new scan starts. */
+export function clearThumbnailCache() {
+  state.thumbCache.clear();
+  state.thumbInflight.clear();
 }
 
 /**

@@ -2,7 +2,7 @@
 
 import { state } from './state.js';
 import { formatBytes, formatDate, formatGPS, qualityColor } from './helpers.js';
-import { apiGetThumbnail } from './api.js';
+import { apiGetThumbnailCached } from './api.js';
 
 /** Initialize the preview panel with a placeholder. */
 export function initPreview() {
@@ -22,7 +22,7 @@ export function showPreview(img) {
   thumbImg.className = 'preview-thumb';
   thumbImg.onerror = function () { this.style.display = 'none'; };
   container.appendChild(thumbImg);
-  apiGetThumbnail(img.path || '').then(b64 => { if (b64) thumbImg.src = 'data:image/jpeg;base64,' + b64; });
+  apiGetThumbnailCached(img.path || '').then(b64 => { if (b64) thumbImg.src = 'data:image/jpeg;base64,' + b64; });
 
   // Info section.
   const info = document.createElement('div');
