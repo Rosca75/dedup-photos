@@ -274,6 +274,12 @@ func (a *App) CancelScan() map[string]string {
 // =============================================================================
 
 // DeleteFile permanently removes a file from disk and evicts its thumbnail.
+//
+// If the file is the still half of an iPhone Live Photo, its .MOV half is
+// removed with it — the two files are one photo, so leaving the video behind
+// would orphan it. The pairing is confirmed by ContentIdentifier before anything
+// is touched; see livephoto.go.
+//
 // Returns {"success": true/false, "message"/"error": "..."}.
 func (a *App) DeleteFile(path string) map[string]interface{} {
 	if path == "" {
@@ -286,12 +292,27 @@ func (a *App) DeleteFile(path string) map[string]interface{} {
 	if info.IsDir() {
 		return map[string]interface{}{"success": false, "error": "cannot delete a directory"}
 	}
+
+	// Resolve the Live Photo video BEFORE removing the still: confirming the
+	// pairing requires reading the still's ContentIdentifier, which is only
+	// possible while it is still on disk.
+	livePhotoVideo, hasLivePhotoVideo := livePhotoSibling(path)
+
 	if err := os.Remove(path); err != nil {
 		return map[string]interface{}{"success": false, "error": fmt.Sprintf("failed to delete: %v", err)}
 	}
 	thumbnailCache.Delete(path) // Remove from thumbnail cache.
 	deleteThumbCache(path)      // Remove any persisted on-disk thumbnail.
 	log.Printf("[delete] Permanently deleted: %s", path)
+
+	if hasLivePhotoVideo {
+		if err := os.Remove(livePhotoVideo); err != nil {
+			// The still is already gone, so this is reported but not fatal.
+			log.Printf("[livephoto] Failed to delete Live Photo video %s: %v", livePhotoVideo, err)
+		} else {
+			log.Printf("[livephoto] Deleted Live Photo video alongside its still: %s", livePhotoVideo)
+		}
+	}
 	return map[string]interface{}{"success": true, "message": "Deleted: " + path}
 }
 

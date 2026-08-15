@@ -78,6 +78,24 @@ thumbnail. `heicLadderFullPrimary` is kept and is now always zero; a non-zero va
 **Genuinely unsupported:** RAW formats have preview extraction only (`raw_preview.go`),
 not full decode.
 
+**Live Photos are one photo, not two files.** An iPhone Live Photo is a `.HEIC` still plus
+a `.MOV` clip sharing an Apple `ContentIdentifier` UUID — tag `0x0011` in the still's Apple
+maker note, key `com.apple.quicktime.content.identifier` in the video's `moov/meta`.
+`DeleteFile` removes both. The video is found by filename (`IMG_1234.HEIC` → `IMG_1234.MOV`)
+and then **confirmed by UUID before anything is deleted**; any mismatch, missing tag or
+unreadable box leaves the video alone and logs why. That guard is not optional — it is the
+only thing standing between a batch delete and removing a file the user never named.
+
+Two constraints worth knowing before touching this. **`bep/imagemeta` cannot supply the
+still's UUID**: it surfaces the tag as `MakerNoteApple` but truncates the value (824 of
+1731 bytes on a test file), and since Apple's value offsets are maker-note-relative the UUID
+falls outside what survives — hence the hand-rolled reader in `tiff_walk.go`. And **MOV
+metadata must never be read during a scan**: `moov` sits at a median 99.8% of the file, so
+reading 699 of them cost ~17 s, as much as an entire optimised scan. Pairing is therefore
+lazy, at delete time only, ~37 ms per deleted file. Measured on 1,038 stills / 699 videos:
+699 stills carry the tag, all 699 videos do, and filename and UUID pairing agreed on every
+one.
+
 ---
 
 ## 2. Repository Structure
@@ -113,6 +131,13 @@ dedup-photos/
 ├── raw_preview.go        76   extractEmbeddedJPEG — pull JPEG previews out of RAW files
 ├── exif_extract.go      169   Unified EXIF extraction via bep/imagemeta (all formats)
 ├── metadata.go          467   EXIF-driven quality scoring
+│
+│  ── Live Photo pairing ───────────────────────────────────────────────────────
+├── livephoto.go          91   Pair a .HEIC still with its .MOV half, UUID-verified
+├── livephoto_apple.go   105   Apple:ContentIdentifier from the HEIC maker note
+├── livephoto_quicktime.go 119 Keys:ContentIdentifier from the MOV's moov/meta
+├── tiff_walk.go         120   Minimal TIFF/EXIF IFD reader (raw maker-note bytes)
+├── quicktime_box.go      96   Minimal ISOBMFF / QuickTime box reader
 │
 │  ── Config & docs ────────────────────────────────────────────────────────────
 ├── wails.json                 Wails config (name, output filename, author)
@@ -201,7 +226,7 @@ All public methods on `*App` are automatically callable from JavaScript.
 | `StartScan` | `(req ScanRequest) map[string]string` | Start background scan |
 | `GetResults` | `() ScanResult` | Poll scan progress and results |
 | `CancelScan` | `() map[string]string` | Cancel active scan |
-| `DeleteFile` | `(path string) map[string]interface{}` | Permanently delete a file |
+| `DeleteFile` | `(path string) map[string]interface{}` | Permanently delete a file, plus its Live Photo `.MOV` half |
 | `GetThumbnail` | `(path string) string` | Returns base64 JPEG string |
 | `OpenFolderDialog` | `() (string, error)` | Native OS folder picker |
 | `ReportMismatch` | `(groupID string) string` | Returns JSON diagnostic report string |
