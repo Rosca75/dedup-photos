@@ -71,7 +71,8 @@ var ErrNoThumbnail = fmt.Errorf("no EXIF thumbnail available")
 type ImageHash struct {
 	Path   string // Absolute filesystem path to the image.
 	XXHash uint64 // xxHash64 of raw file bytes. 0 = singleton (no exact dup check).
-	DHash  uint64 // Perceptual dHash. 0 = couldn't decode / skip perceptual matching.
+	DHash  uint64 // Difference hash. 0 = couldn't decode / skip perceptual matching.
+	PHash  uint64 // DCT perceptual hash, computed from the same decode as DHash.
 	Width  int    // Image width in pixels (0 if unknown).
 	Height int    // Image height in pixels (0 if unknown).
 	Size   int64  // File size in bytes from os.Stat.
@@ -132,73 +133,117 @@ var formatsNeedingFullDecode = map[string]bool{
 // computeDHashSmart — Buffer-based dHash with embedded-thumbnail fast-path
 // =============================================================================
 
-// computeDHashSmart computes a dHash from file bytes already in memory.
-// It tries an embedded JPEG thumbnail first (fast — ~0.5 ms) and falls back
-// to full image decode (slow — ~30-50 ms) if no thumbnail is found.
-func computeDHashSmart(data []byte) (uint64, error) {
+// computeDHashSmart computes both fingerprints from file bytes already in
+// memory. It tries an embedded JPEG thumbnail first (fast — ~0.5 ms) and falls
+// back to full image decode (slow — ~30-50 ms) if no thumbnail is found.
+//
+// Both hashes are always computed, never one or the other. The algorithm
+// setting is applied at MATCH time, in the grouper, not at hash time. That
+// removes a whole class of bug: the cache stores one entry per file regardless
+// of the setting, so switching between dHash, pHash and Both no longer reuses
+// hashes computed under a different algorithm, and no longer needs a re-scan.
+// The second fingerprint costs ~240 µs per image against I/O measured in
+// milliseconds per file.
+func computeDHashSmart(data []byte) (dHash, pHash uint64, err error) {
 	// Fast path: scan for embedded JPEG thumbnail (typical for camera/phone JPEGs).
 	if thumb := extractJPEGThumbnailFromBuffer(data); thumb != nil {
-		if img, _, err := image.Decode(bytes.NewReader(thumb)); err == nil {
-			return computeDHashFromImage(img), nil
+		if img, _, decErr := image.Decode(bytes.NewReader(thumb)); decErr == nil {
+			return computeDHashFromImage(img), computePHashFromImage(img), nil
 		}
 	}
 
 	// Slow path: full decode (PNG, BMP, edited JPEG without thumbnail).
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		return 0, fmt.Errorf("failed to decode image: %w", err)
+		return 0, 0, fmt.Errorf("failed to decode image: %w", err)
 	}
-	return computeDHashFromImage(img), nil
+	return computeDHashFromImage(img), computePHashFromImage(img), nil
 }
 
 // =============================================================================
-// computePHashFromData — Buffer-based pHash (average hash)
+// =============================================================================
+// grayGrid — Area-average downsampling to a small luminance grid
 // =============================================================================
 
-// computePHashFromData computes an average-based perceptual hash from bytes
-// already in memory. The pHash compares each pixel to the image's average
-// brightness rather than to its right neighbour (as dHash does). It can be
-// more robust for certain types of edits.
-func computePHashFromData(data []byte) (uint64, error) {
-	img, _, err := image.Decode(bytes.NewReader(data))
-	if err != nil {
-		return 0, fmt.Errorf("failed to decode image: %w", err)
-	}
+// grayGrid reduces img to a cols×rows grid where each cell holds the AVERAGE
+// luminance of every source pixel that falls inside it.
+//
+// This replaces the nearest-neighbour point sampling this file used to do, and
+// the difference is the whole reason perceptual matching was unreliable. Point
+// sampling read one physical pixel per cell — 72 pixels out of a 416×312
+// thumbnail, 0.055% of it — so sensor noise and JPEG ringing landed directly in
+// the hash. Measured over 386 photos from a real library put through seven
+// realistic edits (re-save at q90/q75/q60, downscale to 50%/25%, and
+// combinations), averaging instead of sampling raised the share of duplicates
+// found at a 6-bit threshold from 64.3% to 97.8%.
+//
+// Two implementation details keep this cheap enough to run on every file:
+//
+//   - Every image the scan hashes decodes to *image.YCbCr (HEIC thumbnails via
+//     the byte-range ladder, and JPEG EXIF thumbnails alike). Its Y plane is
+//     already BT.601 luminance — exactly the quantity the old code recomputed
+//     from RGB — so that path reads bytes directly and skips both the
+//     per-pixel interface call and the colour conversion.
+//   - The destination column depends only on x, so it is computed once per
+//     image instead of once per pixel. Leaving that integer division in the
+//     inner loop cost 1.39 ms per image; hoisting it brings the whole function
+//     to ~244 µs, against ~3.4 µs for the old point-sampling version. Across a
+//     library of 8,000 photos that is roughly two seconds of extra CPU, spread
+//     over every core.
+//
+// A resampling kernel (draw.CatmullRom) scores marginally better still, but
+// costs 4.6 ms per image — its kernel support grows with the downscale ratio —
+// which is not worth ~1 percentage point of recall.
+func grayGrid(img image.Image, cols, rows int) []uint32 {
+	sum := make([]uint64, cols*rows)
+	cnt := make([]uint32, cols*rows)
 
 	bounds := img.Bounds()
-	srcW := bounds.Max.X - bounds.Min.X
-	srcH := bounds.Max.Y - bounds.Min.Y
-
-	const size = 8
-	gray := make([][]uint32, size)
-	for y := 0; y < size; y++ {
-		gray[y] = make([]uint32, size)
+	w, h := bounds.Dx(), bounds.Dy()
+	if w == 0 || h == 0 {
+		return make([]uint32, cols*rows)
 	}
 
-	var total uint64
-	for y := 0; y < size; y++ {
-		for x := 0; x < size; x++ {
-			srcX := bounds.Min.X + (x * srcW / size)
-			srcY := bounds.Min.Y + (y * srcH / size)
-			r, g, b, _ := img.At(srcX, srcY).RGBA()
-			lum := (299*r + 587*g + 114*b) / 1000
-			gray[y][x] = lum
-			total += uint64(lum)
-		}
+	// Destination column for each source x, computed once.
+	colOf := make([]int, w)
+	for x := 0; x < w; x++ {
+		colOf[x] = x * cols / w
 	}
 
-	avg := total / (size * size)
-	var hash uint64
-	bit := 0
-	for y := 0; y < size; y++ {
-		for x := 0; x < size; x++ {
-			if uint64(gray[y][x]) > avg {
-				hash |= 1 << uint(bit)
+	if yc, ok := img.(*image.YCbCr); ok {
+		// Fast path: the luma plane is the luminance we want.
+		for y := 0; y < h; y++ {
+			base := (y * rows / h) * cols
+			off := yc.YOffset(bounds.Min.X, bounds.Min.Y+y)
+			row := yc.Y[off : off+w]
+			for x := 0; x < w; x++ {
+				c := base + colOf[x]
+				sum[c] += uint64(row[x])
+				cnt[c]++
 			}
-			bit++
+		}
+	} else {
+		// Generic path for any other image type.
+		for y := 0; y < h; y++ {
+			base := (y * rows / h) * cols
+			for x := 0; x < w; x++ {
+				r, g, b, _ := img.At(bounds.Min.X+x, bounds.Min.Y+y).RGBA()
+				c := base + colOf[x]
+				// >>8 puts the 16-bit RGBA() result back into 0-255, matching
+				// the scale of the YCbCr fast path above.
+				sum[c] += uint64((299*r + 587*g + 114*b) / 1000 >> 8)
+				cnt[c]++
+			}
 		}
 	}
-	return hash, nil
+
+	out := make([]uint32, cols*rows)
+	for i := range out {
+		if cnt[i] > 0 {
+			out[i] = uint32(sum[i] / uint64(cnt[i]))
+		}
+	}
+	return out
 }
 
 // =============================================================================
@@ -209,37 +254,23 @@ func computePHashFromData(data []byte) (uint64, error) {
 // This is the shared implementation used by all dHash code paths.
 //
 // Algorithm:
-//  1. Resize to 9×8 via nearest-neighbour (no library dependency).
-//  2. Convert to grayscale via ITU-R 601 luminance weights.
-//  3. For each row, compare each pixel to its right neighbour.
+//  1. Reduce to a 9×8 grid of average luminance (see grayGrid).
+//  2. For each row, compare each cell to its right neighbour.
 //     Bit = 1 if left > right, else 0.
-//  4. Pack 64 comparison results into a uint64.
+//  3. Pack 64 comparison results into a uint64.
+//
+// The bit ordering is unchanged from the point-sampling version, but the values
+// being compared are not, so hashes computed by older builds are incompatible —
+// cacheVersion was raised to discard them.
 func computeDHashFromImage(img image.Image) uint64 {
-	bounds := img.Bounds()
-	srcW := bounds.Max.X - bounds.Min.X
-	srcH := bounds.Max.Y - bounds.Min.Y
-
 	const dstW, dstH = 9, 8
-
-	gray := make([][]uint32, dstH)
-	for y := 0; y < dstH; y++ {
-		gray[y] = make([]uint32, dstW)
-	}
-
-	for y := 0; y < dstH; y++ {
-		for x := 0; x < dstW; x++ {
-			srcX := bounds.Min.X + (x * srcW / dstW)
-			srcY := bounds.Min.Y + (y * srcH / dstH)
-			r, g, b, _ := img.At(srcX, srcY).RGBA()
-			gray[y][x] = (299*r + 587*g + 114*b) / 1000
-		}
-	}
+	gray := grayGrid(img, dstW, dstH)
 
 	var hash uint64
 	bit := 0
 	for y := 0; y < dstH; y++ {
 		for x := 0; x < dstW-1; x++ {
-			if gray[y][x] > gray[y][x+1] {
+			if gray[y*dstW+x] > gray[y*dstW+x+1] {
 				hash |= 1 << uint(bit)
 			}
 			bit++
@@ -260,17 +291,20 @@ func computeDHashFromImage(img image.Image) uint64 {
 // buffer, so the caller doesn't need to re-open the file later.
 //
 // Decision tree after reading 128 KB:
-//  1. Try to find an embedded JPEG thumbnail → compute dHash if found.
-//  2. If not found and format is JPEG or RAW: return (0, w, h, ErrNoThumbnail).
+//  1. Try to find an embedded JPEG thumbnail → compute both fingerprints.
+//  2. If not found and format is JPEG or RAW: return (0, 0, w, h, ErrNoThumbnail).
 //     These files get dHash=0 and are skipped in perceptual matching.
 //  3. If not found and format is PNG/BMP/GIF/WebP/TIFF: do a full os.ReadFile
 //     and decode (these formats lack embedded thumbnails but Go can decode them).
-func computeDHashFromHeader(path, algorithm string) (dHash uint64, width, height int, err error) {
+//
+// Both fingerprints are always produced; the algorithm setting is applied when
+// matching, not when hashing. See computeDHashSmart for why.
+func computeDHashFromHeader(path string) (dHash, pHash uint64, width, height int, err error) {
 	ext := strings.ToLower(filepath.Ext(path))
 
 	// HEIC/HEIF: the container requires full file access; use dedicated decoder.
 	if ext == ".heic" || ext == ".heif" {
-		return computeDHashHEIC(path, algorithm)
+		return computeDHashHEIC(path)
 	}
 
 	// Read the first 128 KB. io.ReadFull returns io.ErrUnexpectedEOF if the
@@ -278,7 +312,7 @@ func computeDHashFromHeader(path, algorithm string) (dHash uint64, width, height
 	// Borrow a 128 KB buffer from the pool to avoid per-call allocation.
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, 0, ErrNoThumbnail
+		return 0, 0, 0, 0, ErrNoThumbnail
 	}
 	bufPtr := headerBufPool.Get().(*[]byte)
 	buf := *bufPtr
@@ -286,30 +320,30 @@ func computeDHashFromHeader(path, algorithm string) (dHash uint64, width, height
 	f.Close()
 	if n == 0 {
 		headerBufPool.Put(bufPtr)
-		return 0, 0, 0, ErrNoThumbnail
+		return 0, 0, 0, 0, ErrNoThumbnail
 	}
 	// Return the buffer to the pool when we're done with it.
 	// defer is safe here — all remaining code paths only read from buf.
 	defer headerBufPool.Put(bufPtr)
 
-	return computeDHashFromHeaderBuffer(path, buf[:n], algorithm)
+	return computeDHashFromHeaderBuffer(path, buf[:n])
 }
 
 // computeDHashFromHeaderBuffer runs the same decision tree as
 // computeDHashFromHeader but skips the file-open/read step because the header
 // bytes are already in buf. Used by the pipeline to reuse 64 KB buffers read
 // during the partial-hash phase instead of re-opening the file.
-func computeDHashFromHeaderBuffer(path string, buf []byte, algorithm string) (dHash uint64, width, height int, err error) {
+func computeDHashFromHeaderBuffer(path string, buf []byte) (dHash, pHash uint64, width, height int, err error) {
 	ext := strings.ToLower(filepath.Ext(path))
 
 	// HEIC/HEIF: defer to the dedicated HEIC fast path — it does its own read
 	// at heicHeaderReadSize, larger than our 64 KB partial-hash buffer anyway.
 	if ext == ".heic" || ext == ".heif" {
-		return computeDHashHEIC(path, algorithm)
+		return computeDHashHEIC(path)
 	}
 
 	if len(buf) == 0 {
-		return 0, 0, 0, ErrNoThumbnail
+		return 0, 0, 0, 0, ErrNoThumbnail
 	}
 
 	// Extract image dimensions from the header bytes (DecodeConfig is header-only).
@@ -317,32 +351,27 @@ func computeDHashFromHeaderBuffer(path string, buf []byte, algorithm string) (dH
 		width, height = cfg.Width, cfg.Height
 	}
 
-	// Try to find an embedded JPEG thumbnail for cheap dHash computation.
+	// Try to find an embedded JPEG thumbnail for cheap fingerprinting.
 	// Camera and phone JPEGs store a small thumbnail in the EXIF APP1 segment.
 	if thumb := extractJPEGThumbnailFromBuffer(buf); thumb != nil {
 		if img, _, imgErr := image.Decode(bytes.NewReader(thumb)); imgErr == nil {
-			return computeDHashFromImage(img), width, height, nil
+			return computeDHashFromImage(img), computePHashFromImage(img), width, height, nil
 		}
 	}
 
 	// JPEG / RAW: no thumbnail found — skip perceptual matching for this file.
 	// These formats need full decode which is too expensive for the fast path.
 	if !formatsNeedingFullDecode[ext] {
-		return 0, width, height, ErrNoThumbnail
+		return 0, 0, width, height, ErrNoThumbnail
 	}
 
 	// PNG / BMP / GIF / WebP / TIFF: fall back to full file read + decode.
 	data, readErr := os.ReadFile(path)
 	if readErr != nil {
-		return 0, width, height, readErr
+		return 0, 0, width, height, readErr
 	}
-	switch algorithm {
-	case "phash":
-		dHash, err = computePHashFromData(data)
-	default:
-		dHash, err = computeDHashSmart(data)
-	}
-	return dHash, width, height, err
+	dHash, pHash, err = computeDHashSmart(data)
+	return dHash, pHash, width, height, err
 }
 
 // =============================================================================

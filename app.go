@@ -62,8 +62,15 @@ func (a *App) startup(ctx context.Context) {
 // It returns immediately with {"status":"scanning"}; the actual work runs in
 // a goroutine. The JS side polls GetResults() every 500ms for progress.
 func (a *App) StartScan(req ScanRequest) map[string]string {
+	// req.Threshold is a PERCENTAGE of the hash width, matching the "%" the UI
+	// prints next to the slider. It is converted to a bit count exactly once,
+	// at the GroupDuplicates call below. Do not pass this value to anything
+	// that expects a Hamming distance without converting it first.
 	if req.Threshold <= 0 {
-		req.Threshold = 10
+		req.Threshold = defaultThresholdPercent
+	}
+	if req.Threshold > maxThresholdPercent {
+		req.Threshold = maxThresholdPercent
 	}
 	if req.Algorithm == "" {
 		req.Algorithm = "dhash"
@@ -96,7 +103,8 @@ func (a *App) StartScan(req ScanRequest) map[string]string {
 // the performance improvement from each optimisation is easy to observe.
 func runScan(ctx context.Context, req ScanRequest) {
 	scanStart := time.Now()
-	log.Printf("[scan] Start: %s threshold=%d alg=%s", req.Path, req.Threshold, req.Algorithm)
+	resetScanDiagnostics()
+	log.Printf("[scan] Start: %s threshold=%d%% alg=%s", req.Path, req.Threshold, req.Algorithm)
 
 	// Build the extension filter map.
 	allowedExts := make(map[string]bool)
@@ -167,7 +175,7 @@ func runScan(ctx context.Context, req ScanRequest) {
 	// The pipeline prints its own [perf] lines for each sub-phase.
 	t0 = time.Now()
 	allPaths := append([]string{req.Path}, req.ExtraPaths...)
-	hashes := HashAllImagesWithProgress(ctx, paths, runtime.NumCPU(), req.Algorithm,
+	hashes := HashAllImagesWithProgress(ctx, paths, runtime.NumCPU(),
 		func(phase string, cur, total int) {
 			scanMutex.Lock()
 			scanResult.Progress.Phase = phase
@@ -183,9 +191,17 @@ func runScan(ctx context.Context, req ScanRequest) {
 	log.Printf("[perf] Hash phase total: %.2fs", time.Since(t0).Seconds())
 
 	// Phase 3: Group duplicates (parallel metadata + aspect-ratio BK-Trees).
+	//
+	// This is the one place the slider's percentage becomes a Hamming distance.
+	// It used to be passed straight through, so a slider reading "25%" asked for
+	// a radius of 25 bits — 39% of a 64-bit hash, well past the point where
+	// unrelated photos start linking up.
 	t0 = time.Now()
 	setPhase("Grouping duplicates...")
-	groups := GroupDuplicates(hashes, req.Threshold, req.IncludeSeries)
+	thresholdBits := hammingThresholdBits(req.Threshold)
+	log.Printf("[scan] Threshold: %d%% of hash = %d bits of %d",
+		req.Threshold, thresholdBits, perceptualHashBits)
+	groups := GroupDuplicates(hashes, thresholdBits, req.Algorithm, req.IncludeSeries)
 	log.Printf("[perf] Grouping:         %.2fs  (%d groups)", time.Since(t0).Seconds(), len(groups))
 
 	// Phase 4: Compute wasted bytes (all images except the first in each group).
@@ -198,16 +214,29 @@ func runScan(ctx context.Context, req ScanRequest) {
 		}
 	}
 
+	// Report what the scan could NOT cover, so "no duplicates" is never confused
+	// with "never compared".
+	unreadableCount, skippedPerceptual, unreadableSample := snapshotScanDiagnostics()
+	if skippedPerceptual > 0 {
+		log.Printf("[scan] %d of %d files had no perceptual hash (exact-matched only, %.1f%%)",
+			skippedPerceptual, totalFiles, 100*float64(skippedPerceptual)/float64(totalFiles))
+	}
+	if unreadableCount > 0 {
+		log.Printf("[scan] %d files could not be read; first few: %v", unreadableCount, unreadableSample)
+	}
+
 	dur := time.Since(scanStart)
 	scanMutex.Lock()
 	scanResult = ScanResult{
 		Status:   "complete",
 		Progress: ScanProgress{Current: totalFiles, Total: totalFiles, Phase: "Complete"},
 		Stats: ScanStats{
-			TotalFiles:      totalFiles,
-			DuplicateGroups: len(groups),
-			WastedBytes:     wastedBytes,
-			DurationMs:      dur.Milliseconds(),
+			TotalFiles:        totalFiles,
+			DuplicateGroups:   len(groups),
+			WastedBytes:       wastedBytes,
+			DurationMs:        dur.Milliseconds(),
+			SkippedPerceptual: skippedPerceptual,
+			Unreadable:        unreadableCount,
 		},
 		Groups: groups,
 	}
@@ -487,6 +516,8 @@ func (a *App) ReportMismatch(groupID string) string {
 		QualityScore int     `json:"quality_score"`
 		XXHash       string  `json:"xxhash"`
 		DHash        string  `json:"dhash"`
+		PHash        string  `json:"phash"`
+		AspectBucket string  `json:"aspect_bucket"`
 		GPSLat       float64 `json:"gps_lat"`
 		GPSLon       float64 `json:"gps_lon"`
 	}
@@ -520,6 +551,12 @@ func (a *App) ReportMismatch(groupID string) string {
 		if img.DHash != 0 {
 			ir.DHash = fmt.Sprintf("%016x", img.DHash)
 		}
+		if img.PHash != 0 {
+			ir.PHash = fmt.Sprintf("%016x", img.PHash)
+		}
+		// The aspect ratio no longer partitions the search, but it is the first
+		// thing worth checking when a group looks wrong, so the report carries it.
+		ir.AspectBucket = aspectBucket(img.Width, img.Height)
 		rpt.Images = append(rpt.Images, ir)
 	}
 

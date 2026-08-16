@@ -31,8 +31,11 @@
       <div class="topbar-field">
         <label for="scan-threshold">Threshold difference</label>
         <div class="range-group">
-          <input type="range" id="scan-threshold" min="0" max="100" value="10">
-          <span class="range-value" id="threshold-value">10%</span>
+          <!-- Capped at 18%: past ~22% of the hash, transitive grouping fuses
+               the whole library into one result. The label shows the resolved
+               bit count so the percentage is never ambiguous. -->
+          <input type="range" id="scan-threshold" min="1" max="18" value="10">
+          <span class="range-value" id="threshold-value">10% · 6 bits</span>
         </div>
       </div>
       <div class="topbar-field">
@@ -109,6 +112,11 @@
         <div class="stat"><span class="stat-label">Duplicate groups</span><span class="stat-value" id="stat-groups">--</span></div>
         <div class="stat"><span class="stat-label">Space savings</span><span class="stat-value" id="stat-savings">--</span></div>
         <div class="stat"><span class="stat-label">Duration</span><span class="stat-value" id="stat-duration">--</span></div>
+        <!-- Only shown when non-zero: files the scan could not fully compare. -->
+        <div class="stat" id="stat-skipped-wrap" style="display:none">
+          <span class="stat-label">Not compared</span>
+          <span class="stat-value stat-warn" id="stat-skipped">--</span>
+        </div>
       </div>
     </div>
     <!-- Progress bar (visible during scan) -->

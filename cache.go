@@ -20,6 +20,16 @@
 //   v1 — initial release (xxHash + dHash)
 //   v2 — added Width + Height fields to CachedEntry (enables aspect-ratio
 //         pre-grouping without re-opening files on rescan)
+//   v3 — dHash switched from nearest-neighbour point sampling to an area
+//         average (see grayGrid in hasher.go). The bit layout is unchanged but
+//         the values are not, so v2 hashes would silently compare against v3
+//         ones and produce nonsense distances. Bumping the version discards
+//         them and forces one full re-hash.
+//   v4 — added PHash. Both fingerprints are now stored for every file, which
+//         is what makes the cache independent of the algorithm setting:
+//         switching between dHash, pHash and Both reuses the same entries
+//         instead of silently serving hashes computed under the other
+//         algorithm, and needs no re-scan.
 // =============================================================================
 
 package main
@@ -53,14 +63,17 @@ type CachedEntry struct {
 	Size    int64  // File size in bytes (from os.FileInfo).
 	ModTime int64  // Modification time as Unix nanoseconds.
 	XXHash  uint64 // xxHash64 of the raw file bytes.
-	DHash   uint64 // Perceptual dHash of the image content.
+	DHash   uint64 // Difference hash of the image content.
+	PHash   uint64 // DCT perceptual hash. Added in v4.
 	Width   int    // Image width in pixels (0 if unknown). Added in v2.
 	Height  int    // Image height in pixels (0 if unknown). Added in v2.
 }
 
-// cacheVersion is incremented when the cache format changes.
+// cacheVersion is incremented when the cache format changes, OR when the
+// meaning of a stored value changes — a v2 dHash and a v3 dHash are both
+// uint64s but are not comparable.
 // Old caches with a different version are discarded and rebuilt.
-const cacheVersion = 2
+const cacheVersion = 4
 
 // cachePath returns the path to the cache file for a given scan path.
 // Format: ~/.dedup-photos/cache_<first-16-hex-chars-of-sha256>.gob
@@ -147,31 +160,32 @@ func SaveCache(cache *HashCache, scanPath string) error {
 // =============================================================================
 
 // LookupAll checks if a cached entry exists and is still valid.
-// Returns (xxHash, dHash, width, height, true) on a cache hit.
-// Returns (0, 0, 0, 0, false) on a miss or stale entry.
+// Returns (xxHash, dHash, pHash, width, height, true) on a cache hit.
+// Returns zeros and false on a miss or stale entry.
 //
 // Width/Height are 0 if the entry was written before v2 or if dimensions
 // couldn't be determined at hash time; callers must handle the zero case.
-func (c *HashCache) LookupAll(path string, info os.FileInfo) (uint64, uint64, int, int, bool) {
+func (c *HashCache) LookupAll(path string, info os.FileInfo) (uint64, uint64, uint64, int, int, bool) {
 	entry, ok := c.Entries[path]
 	if !ok {
-		return 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, false
 	}
 	// Invalidate the entry if the file was modified since caching.
 	if entry.Size != info.Size() || entry.ModTime != info.ModTime().UnixNano() {
-		return 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, false
 	}
-	return entry.XXHash, entry.DHash, entry.Width, entry.Height, true
+	return entry.XXHash, entry.DHash, entry.PHash, entry.Width, entry.Height, true
 }
 
 // StoreAll adds or updates a cache entry, including image dimensions.
 // Call this instead of Store whenever width/height are known.
-func (c *HashCache) StoreAll(path string, info os.FileInfo, xxHash, dHash uint64, width, height int) {
+func (c *HashCache) StoreAll(path string, info os.FileInfo, xxHash, dHash, pHash uint64, width, height int) {
 	c.Entries[path] = &CachedEntry{
 		Size:    info.Size(),
 		ModTime: info.ModTime().UnixNano(),
 		XXHash:  xxHash,
 		DHash:   dHash,
+		PHash:   pHash,
 		Width:   width,
 		Height:  height,
 	}

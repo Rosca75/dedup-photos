@@ -73,7 +73,8 @@ type ImageMetadata struct {
 	Blurring     float64 `json:"blurring"`      // Blur detection score (0=sharp).
 	IsBest       bool    `json:"is_best"`       // True if this is the recommended "keep" image.
 	XXHash       uint64  `json:"xxhash"`        // xxHash64 of raw file bytes (from scan).
-	DHash        uint64  `json:"dhash"`         // Perceptual dHash of image content (from scan).
+	DHash        uint64  `json:"dhash"`         // Difference hash of image content (from scan).
+	PHash        uint64  `json:"phash"`         // DCT perceptual hash of image content (from scan).
 }
 
 // =============================================================================
