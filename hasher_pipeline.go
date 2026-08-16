@@ -387,11 +387,13 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 	dHashes map[string]uint64,
 	pHashes map[string]uint64,
 	dims map[string][2]int,
+	exifs map[string]ScanExif,
 ) {
 	n := len(misses)
 	hashSlice := make([]uint64, n)
 	pHashSlice := make([]uint64, n)
 	dimSlice := make([][2]int, n)
+	exifSlice := make([]ScanExif, n)
 
 	// Lock-free counters for visibility into the header-buffer reuse ratio.
 	// These inform whether the retention cap needs tuning on larger corpora.
@@ -411,6 +413,7 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 			path := misses[i]
 			var dh, ph uint64
 			var w, h int
+			var ex ScanExif
 
 			// Perf tracing (Trace 2): bucket this file by decode path and time
 			// the fingerprint call. isHEIC takes precedence because HEIC files
@@ -425,16 +428,20 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 				if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 					w, h = cfg.Width, cfg.Height
 				}
+				// The complete file is already in memory here, so this is the
+				// cheapest EXIF of all three branches — and the most reliable,
+				// since nothing is truncated.
+				ex = parseScanExifBuffer(path, data)
 				dh, ph, _ = computeDHashSmart(data)
 			} else if header, ok := headerBytes[path]; ok {
 				// Reuse the 64 KB header read from runPartialHashPhase — no new I/O.
 				hitsHeaderBuf.Add(1)
-				dh, ph, w, h, _ = computeDHashFromHeaderBuffer(path, header)
+				dh, ph, w, h, ex, _ = computeDHashFromHeaderBuffer(path, header)
 			} else {
 				// Singleton-by-size (never opened before) or retention-capped:
 				// header-only path reads ~128 KB for EXIF thumbnail + dimensions.
 				reopenCount.Add(1)
-				dh, ph, w, h, _ = computeDHashFromHeader(path)
+				dh, ph, w, h, ex, _ = computeDHashFromHeader(path)
 			}
 			// Accumulate the summed fingerprint time across all workers.
 			phase3bFingerprintNs.Add(int64(time.Since(fpStart)))
@@ -453,6 +460,7 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 			hashSlice[i] = dh
 			pHashSlice[i] = ph
 			dimSlice[i] = [2]int{w, h}
+			exifSlice[i] = ex
 
 			// Tick the UI. Every 25 files rather than every file: at ~40 files a
 			// second this is a handful of updates a second, which is all a
@@ -469,8 +477,18 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 	dHashes = make(map[string]uint64, n)
 	pHashes = make(map[string]uint64, n)
 	dims = make(map[string][2]int, n)
+	exifs = make(map[string]ScanExif, n)
 	noHash := 0
+	exifOK := 0
 	for i, path := range misses {
+		// Keyed on OK rather than stored unconditionally: a zero-value ScanExif
+		// in the map would be indistinguishable from a real one for a file with
+		// no EXIF, and the metadata phase decides whether to fall back on
+		// exactly that distinction.
+		if exifSlice[i].OK {
+			exifs[path] = exifSlice[i]
+			exifOK++
+		}
 		if hashSlice[i] != 0 {
 			dHashes[path] = hashSlice[i]
 			pHashes[path] = pHashSlice[i]
@@ -488,6 +506,14 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 	recordNoPerceptualHash(noHash)
 	fmt.Printf("[perf] dHash reuse:       fullData=%d headerBuf=%d reopen=%d\n",
 		hitsFullData.Load(), hitsHeaderBuf.Load(), reopenCount.Load())
+	// EXIF captured here is EXIF the metadata phase will not have to re-read.
+	// If this ratio collapses, the header window has stopped covering the EXIF
+	// item and the grouping speedup is silently gone — the metadata phase would
+	// still be correct, just slow again.
+	if n > 0 {
+		fmt.Printf("[perf] EXIF from header: %d/%d files (%.1f%%)\n",
+			exifOK, n, 100*float64(exifOK)/float64(n))
+	}
 	return
 }
 
@@ -558,11 +584,16 @@ func presplitByCache(paths []string, fileInfo map[string]os.FileInfo, cache *Has
 		if !ok {
 			continue // File disappeared between stat and hash phase.
 		}
-		xxh, dh, ph, w, h, hit := cache.LookupAll(path, info)
+		entry, hit := cache.LookupAll(path, info)
 		if hit {
 			hits = append(hits, ImageHash{
-				Path: path, XXHash: xxh, DHash: dh, PHash: ph,
-				Width: w, Height: h, Size: info.Size(),
+				Path: path, XXHash: entry.XXHash, DHash: entry.DHash, PHash: entry.PHash,
+				Width: entry.Width, Height: entry.Height, Size: info.Size(),
+				// Carried straight through. On a warm re-scan this is the only
+				// source of EXIF — the hash phase never runs for these files —
+				// which is what makes a cached re-scan skip the metadata I/O
+				// entirely rather than only a first scan.
+				Exif: entry.Exif,
 			})
 		} else {
 			misses = append(misses, path)
@@ -572,8 +603,9 @@ func presplitByCache(paths []string, fileInfo map[string]os.FileInfo, cache *Has
 }
 
 // buildFinalResults assembles the final []ImageHash in input-path order,
-// merging cache hits with the newly computed hashes and dimensions.
-func buildFinalResults(paths []string, hits []ImageHash, xxHashes, dHashes, pHashes map[string]uint64, dims map[string][2]int, fileInfo map[string]os.FileInfo) []ImageHash {
+// merging cache hits with the newly computed hashes, dimensions and EXIF.
+// Cache hits already carry their EXIF from presplitByCache.
+func buildFinalResults(paths []string, hits []ImageHash, xxHashes, dHashes, pHashes map[string]uint64, dims map[string][2]int, exifs map[string]ScanExif, fileInfo map[string]os.FileInfo) []ImageHash {
 	hitSet := make(map[string]ImageHash, len(hits))
 	for _, h := range hits {
 		hitSet[h.Path] = h
@@ -598,13 +630,17 @@ func buildFinalResults(paths []string, hits []ImageHash, xxHashes, dHashes, pHas
 			result.Width = d[0]
 			result.Height = d[1]
 		}
+		// Absent key → zero ScanExif with OK=false, which is exactly the
+		// "not captured, go read the file" signal the metadata phase expects.
+		result.Exif = exifs[path]
 		results = append(results, result)
 	}
 	return results
 }
 
 // saveUpdatedCache writes all computed results back into the cache and
-// persists it to disk. Width and Height are now stored per entry (v2).
+// persists it to disk. Width and Height are stored per entry (v2), and the
+// EXIF captured during the hash phase since v5.
 func saveUpdatedCache(cache *HashCache, results []ImageHash, fileInfo map[string]os.FileInfo, scanPaths []string) {
 	if len(scanPaths) == 0 || scanPaths[0] == "" {
 		return
@@ -618,7 +654,7 @@ func saveUpdatedCache(cache *HashCache, results []ImageHash, fileInfo map[string
 		if !ok {
 			continue
 		}
-		cache.StoreAll(r.Path, info, r.XXHash, r.DHash, r.PHash, r.Width, r.Height)
+		cache.StoreAll(r.Path, info, r.XXHash, r.DHash, r.PHash, r.Width, r.Height, r.Exif)
 	}
 	if err := SaveCache(cache, scanPaths[0]); err != nil {
 		fmt.Printf("[hasher] Warning: failed to save cache: %v\n", err)
@@ -692,7 +728,7 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 
 	// Phase 3b: Perceptual hash for all cache misses (EXIF thumbnail fast-path).
 	t0 = time.Now()
-	dHashes, pHashes, percDims := computePerceptualHashes(ctx, misses, fullData, headerBytes, numWorkers, progressFn, len(hits))
+	dHashes, pHashes, percDims, exifs := computePerceptualHashes(ctx, misses, fullData, headerBytes, numWorkers, progressFn, len(hits))
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -709,7 +745,7 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 	}
 
 	// Assemble the final results slice.
-	allResults := buildFinalResults(paths, hits, xxHashes, dHashes, pHashes, exactDims, fileInfo)
+	allResults := buildFinalResults(paths, hits, xxHashes, dHashes, pHashes, exactDims, exifs, fileInfo)
 
 	// Phase 4: Persist updated cache (now includes Width/Height per entry).
 	t0 = time.Now()

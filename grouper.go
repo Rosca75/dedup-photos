@@ -560,9 +560,13 @@ func findPerceptualPaths(hashes []ImageHash, exactGrouped map[string]bool, thres
 // =============================================================================
 
 // parallelExtractMetadata runs ExtractMetadataFast for every path concurrently
-// using all available CPU cores. It accepts a hashMap of pre-computed dimensions
-// from the hashing phase so that ExtractMetadataFast can skip re-opening files
-// for DecodeConfig (Optimization A — single file open).
+// using all available CPU cores. It accepts a hashMap carrying what the hash
+// phase already worked out for each file — dimensions (Optimization A: no
+// re-open for DecodeConfig) and, since plan 05, the parsed EXIF as well.
+//
+// With both present this phase does no file I/O at all for the common case,
+// which is what took it from ~99% of grouping time down to noise. Files whose
+// EXIF was not captured fall back to reading inside ExtractMetadataFast.
 //
 // Workers write into an index-aligned slice; the final map is assembled
 // sequentially, avoiding a mutex on the hot path.
@@ -572,7 +576,7 @@ func parallelExtractMetadata(ctx context.Context, paths []string, hashMap map[st
 	runParallelIndexed(ctx, n, runtime.NumCPU(), func(i int) {
 		path := paths[i]
 		h := hashMap[path]
-		metaSlice[i] = ExtractMetadataFast(path, h.Width, h.Height, h.Size)
+		metaSlice[i] = ExtractMetadataFast(path, h.Width, h.Height, h.Size, h.Exif)
 	})
 	metaMap := make(map[string]ImageMetadata, n)
 	for i, path := range paths {

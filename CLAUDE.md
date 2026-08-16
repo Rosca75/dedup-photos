@@ -133,7 +133,9 @@ dedup-photos/
 ├── heic_version_other.go  11  The third is the Windows/BSD stub (always returns true)
 ├── raw_preview.go        76   extractEmbeddedJPEG — pull JPEG previews out of RAW files
 ├── exif_extract.go      169   Unified EXIF extraction via bep/imagemeta (all formats)
-├── metadata.go          467   EXIF-driven quality scoring
+├── scan_exif.go         155   ScanExif — EXIF parsed from the hash phase's header
+│                              buffer and carried to the metadata phase
+├── metadata.go          516   EXIF-driven quality scoring
 │
 │  ── Live Photo pairing ───────────────────────────────────────────────────────
 ├── livephoto.go          91   Pair a .HEIC still with its .MOV half, UUID-verified
@@ -532,7 +534,39 @@ the exact-match lane broke. Chunking, streaming and ReadAt windows do NOT fix it
 could not cover. Roughly 16-19% of a real HEIC library has no usable embedded
 thumbnail and is exact-matched only; the UI must keep saying so.
 
-### 9.6 Do not reintroduce aspect-ratio bucketing
+### 9.6 EXIF is parsed from bytes already in memory, never from a new file open
+
+The hash phase reads the first 128 KB of every file. `computeDHashHEIC` and
+`computeDHashFromHeaderBuffer` parse EXIF out of *that* buffer and carry the
+result through `ImageHash.Exif` and the v5 cache to the metadata phase, which
+then does no I/O at all for those files. Measured on a 346-image corpus over
+SMB, metadata extraction went **1,101 ms → 0 ms** at the default threshold and
+**4,050 ms → 0 ms** at 18%, with byte-identical group output.
+
+The rule that keeps this safe is *no new file opens during the hash phase*.
+Plan 04 Step 1 removed exactly such opens — extracting EXIF for the whole
+library cost 17.9 s of a 28 s scan to serve the ~5% of files that reach a
+result. Parsing bytes already in memory is a different thing entirely: 0.15 ms
+per file. **Do not "simplify" this by opening files during hashing.**
+
+Two invariants hold it together, both covered by tests:
+
+- **`ScanExif.OK` gates the fast path.** EXIF absence is not an error, so
+  without an explicit "this was really read" flag a file whose EXIF fell outside
+  the window would serve blank metadata, zeroing its `QualityScore` and moving
+  the "best image" marker — i.e. changing which file the user is offered to
+  delete. Measured recoverability is 99.23% over 4,265 real iPhone HEICs, and
+  the 0.77% that miss come back all-or-nothing, never partial. The fallback is
+  not dead code.
+- **`QualityScore` is never cached.** It stays computed at group time from the
+  cached inputs, so a change to the scoring rules takes effect without a cache
+  wipe.
+
+`cacheVersion` must be bumped whenever these stored fields change: a v4 entry
+decodes into a v5 struct happily, leaving `Exif` zeroed with `OK=false`, which
+is not corrupt but silently returns the whole cost.
+
+### 9.7 Do not reintroduce aspect-ratio bucketing
 
 `aspectBucket` no longer partitions the BK-Tree. It was documented as cutting
 search scope by ~90%; measured on a real phone library, **99.1% of images landed

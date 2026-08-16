@@ -14,7 +14,7 @@ rule 10 requires before touching `grouper.go`, `hasher.go`, `heic_support.go` or
 
 ## Measured baseline
 
-Profiled against `smb://bogota.local/photo/Portable/10. iPhone 15 PwC/bkp2026`:
+Profiled against an SMB-mounted iPhone photo library (referred to below as **corpus A**):
 **1,134 scannable images (1,038 HEIC, 96 JPG/PNG), 743 `.MOV` skipped by extension, 7.6 GB.**
 Harness was a standalone binary built from copies of the repo's own sources, HEIC backend forced
 to WASM via `heic.ForceWasmMode` so it matches Windows (which has no dynamic libheif).
