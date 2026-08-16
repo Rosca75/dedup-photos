@@ -157,21 +157,32 @@ var (
 	metaExifNs     atomic.Int64 // Summed worker time in EXIF extraction.
 	metaHeicCount  atomic.Int64 // HEIC files processed.
 	metaOtherCount atomic.Int64 // Non-HEIC files processed.
+	metaPrefilled  atomic.Int64 // Files served from hash-phase EXIF — zero I/O.
+	metaFallback   atomic.Int64 // Files that still had to open and read (see below).
 )
 
 // printAndResetMetadataSplit prints one aggregate [perf] line for the metadata
 // phase, then resets the counters so the next scan starts fresh.
+//
+// prefilled vs fallback is the health check for plan 05: prefilled files cost
+// no I/O at all, fallback files cost the full ~253 ms open-and-seek. If
+// fallback climbs, either the cache was invalidated or the header window has
+// stopped covering the EXIF item — both leave results correct but slow.
 func printAndResetMetadataSplit() {
-	fmt.Printf("[perf] Metadata split: read128k=%.2fs exif=%.2fs | heic=%d other=%d\n",
+	fmt.Printf("[perf] Metadata split: read128k=%.2fs exif=%.2fs | heic=%d other=%d prefilled=%d fallback=%d\n",
 		float64(metaRead128kNs.Load())/1e9,
 		float64(metaExifNs.Load())/1e9,
 		metaHeicCount.Load(),
 		metaOtherCount.Load(),
+		metaPrefilled.Load(),
+		metaFallback.Load(),
 	)
 	metaRead128kNs.Store(0)
 	metaExifNs.Store(0)
 	metaHeicCount.Store(0)
 	metaOtherCount.Store(0)
+	metaPrefilled.Store(0)
+	metaFallback.Store(0)
 }
 
 // =============================================================================
@@ -187,7 +198,10 @@ func printAndResetMetadataSplit() {
 //   - width:  Pre-computed image width (0 if unknown → will try DecodeConfig).
 //   - height: Pre-computed image height (0 if unknown).
 //   - size:   Pre-computed file size in bytes (0 → will call os.Stat).
-func ExtractMetadataFast(path string, width, height int, size int64) ImageMetadata {
+//   - exif:   EXIF already parsed during the hash phase. When exif.OK is true
+//     this function performs NO I/O at all. When it is false the file is read
+//     exactly as before — see the fallback note below.
+func ExtractMetadataFast(path string, width, height int, size int64, exif ScanExif) ImageMetadata {
 	meta := ImageMetadata{
 		Path:     path,
 		Filename: filepath.Base(path),
@@ -202,6 +216,40 @@ func ExtractMetadataFast(path string, width, height int, size int64) ImageMetada
 			meta.Size = info.Size()
 		}
 	}
+
+	// Step 1b: EXIF carried forward from the hash phase (plan 05).
+	//
+	// The hash phase already read this file's first 128 KB and parsed the EXIF
+	// out of that buffer, so there is nothing left to read: no open, no seek,
+	// no decode. This is the entire optimisation — the metadata phase used to
+	// spend ~253 ms per file here, and it is now the dominant path.
+	//
+	// The fallback below is NOT dead code and must not be removed. It covers
+	// the ~0.8% of HEICs whose EXIF item sits past the header window, cache
+	// entries written before v5, and any format whose EXIF failed to parse.
+	// Serving those files an empty ImageMetadata instead would zero their
+	// QualityScore, which decides which image in a group is marked "best" —
+	// i.e. which file the user is offered to delete. Silently wrong there is
+	// far worse than slow.
+	// The dimensions guard is not incidental. When width/height are unknown the
+	// old path recovered them with image.DecodeConfig over its own 128 KB read,
+	// whereas the buffer the hash phase parsed EXIF from may have been only the
+	// 64 KB partial-hash buffer. So for a non-HEIC file whose dimensions need
+	// more than 64 KB, the fallback can still recover what this shortcut cannot,
+	// and taking the shortcut anyway would leave Width/Height at 0 — zeroing the
+	// resolution component of QualityScore and potentially moving the "best
+	// image" marker onto a different file.
+	//
+	// HEIC is exempt because its fallback, extractHEICExif, never sets
+	// dimensions either: there is nothing to lose by short-circuiting it.
+	dimsKnown := meta.Width > 0 && meta.Height > 0
+	if exif.OK && (dimsKnown || isHEIC(path)) {
+		exif.applyTo(&meta)
+		metaPrefilled.Add(1)
+		meta.QualityScore = ComputeQualityScore(&meta)
+		return meta
+	}
+	metaFallback.Add(1)
 
 	// HEIC/HEIF fast path: skip the 128 KB header read entirely.
 	// For HEIC that read was pure waste — dimensions are already pre-computed

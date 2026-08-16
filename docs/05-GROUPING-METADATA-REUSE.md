@@ -16,9 +16,9 @@ or `cache.go`.
 
 ## Measured baseline
 
-From the verification runs on PR #18, against
-`smb://bogota.local/photo/Portable/8. iPhone 12 PwC/bkp2022` — **3,542 images, 2,939 with a
-perceptual fingerprint**, hash cache warm so the hash phase is not in the way:
+From the verification runs on PR #18, against an SMB-mounted iPhone photo library
+(**corpus B** — 2022 backup) — **3,542 images, 2,939 with a perceptual fingerprint**,
+hash cache warm so the hash phase is not in the way:
 
 ```
 [perf]    BK-tree search: 189 ms, cluster refinement: 0 ms
@@ -184,8 +184,12 @@ that trade is acceptable before implementing, since it is a visible UI change.
 
 ## Validation
 
-Run against `bkp2022` (3,542 images) and `bkp2024` (1,177 images), warm hash cache, and
-compare against the numbers at the top of this document.
+Run against a real SMB-mounted corpus with a warm hash cache and compare against the numbers
+at the top of this document. Prefer a SMALL corpus (a few hundred images): the network round
+trip is what makes the metadata cost visible, and scanning a full library takes tens of
+minutes for no extra signal.
+
+Corpus paths belong in the environment, never in a committed file — this repository is public.
 
 **Must hold:**
 
@@ -218,3 +222,56 @@ against the fast path.
   plan 04 Step 3 on decode-ladder evidence. If Step 1 shows EXIF sits beyond it, widening the
   window trades hash-phase I/O for metadata-phase I/O and needs measuring on both sides
   before it is done.
+
+---
+
+## Outcome
+
+Executed. Step 1 passed its gate, Step 2 shipped, Step 3 was not needed.
+
+**Step 1 — is HEIC EXIF inside the 128 KB window?** Measured over **4,265 real iPhone
+HEICs**: **99.23% fully recoverable** (4,232). Per-field agreement was uniform across
+DateTimeOriginal, Make+Model, GPS, LensModel, ISO and FocalLength. No file produced a partial
+or wrong value — the 33 misses are clean all-or-nothing, which is what makes `ScanExif.OK` a
+reliable fallback signal rather than a guess. Of those 33, 2 recover at 256 KB, 14 at 512 KB,
+15 at 1 MB and 2 never do; widening the window was therefore not worth its hash-phase cost.
+
+**Step 2b cost check** — the plan required the in-memory parse to be sub-millisecond.
+Isolated benchmark, same buffer, per file: `CONFIG` alone (today) **0.0144 ms**,
+`CONFIG|EXIF` **0.164 ms**. Marginal cost **0.150 ms/file**. The shipped code instead reuses
+`extractExifInto` unchanged with a `bytes.Reader` (0.192 ms) — the extra 0.03 ms buys
+guaranteed field parity with the fallback path, which is the property the acceptance test
+depends on.
+
+**Validation**, on a 346-image corpus (135 HEIC + 211 JPEG) over SMB:
+
+| Requirement | Result |
+|---|---|
+| 1. Metadata extraction ↓ ≥5× | 1,101 ms → **0 ms** at 10%; 4,050 ms → **0 ms** at 18% |
+| 2. BK-tree / refinement unchanged | 12→4 ms, 6→7 ms; refinement 0 ms throughout |
+| 3. Group output byte-identical | **identical** at both thresholds |
+| 4. SkippedPerceptual / Unreadable | 0 / 0, unchanged |
+| 5. Cold scan no slower | 22.79 s → 19.95 s |
+
+`prefilled=38 fallback=0` and `prefilled=101 fallback=0`; `EXIF from header: 346/346 (100%)`.
+
+**Deviations from the plan as written:**
+
+- **2a's field list.** `Orientation` does not exist in `ImageMetadata` and nothing reads one.
+  `ComputeQualityScore` *does* read `Lens` (5 pts) and `Description` (10 pts), so caching the
+  literal list would have shifted quality scores and moved the "best image" marker — failing
+  this document's own Validation item 3. Cached set is `DateTaken`, `Camera`, `GPSLat`,
+  `GPSLon`, `Lens`, `ISO`, `FocalLength`, `Description`.
+- **`LookupAll` returns `*CachedEntry`** rather than gaining a seventh positional return.
+- **A dimensions guard was added to 2c.** The old non-HEIC path recovered missing dimensions
+  with `DecodeConfig` over its own 128 KB read, while the hash phase may hold only the 64 KB
+  partial-hash buffer. Short-circuiting a file with unknown dimensions would zero the
+  resolution component of `QualityScore`. HEIC is exempt — its fallback never set dimensions
+  either.
+
+**Step 3 (skip metadata for exact groups) was not implemented.** It was conditional on Steps
+1–2 falling short; metadata extraction is now 0 ms, so there is nothing left to subtract, and
+it would have cost blank camera/date columns in the UI for no gain.
+
+The invariants this introduced are recorded in CLAUDE.md §9.6, and guarded by
+`exif_parity_test.go` and `exif_fallback_test.go`.

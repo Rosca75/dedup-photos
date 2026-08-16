@@ -77,6 +77,11 @@ type ImageHash struct {
 	Height int    // Image height in pixels (0 if unknown).
 	Size   int64  // File size in bytes from os.Stat.
 	Error  error  // Non-nil if this file failed to hash.
+
+	// Exif is the EXIF parsed from the header buffer during the hash phase, or
+	// restored from the cache. Exif.OK false means it was not captured for this
+	// file and the metadata phase must read it from disk — see scan_exif.go.
+	Exif ScanExif
 }
 
 // ProgressCallback is called periodically to report scan progress.
@@ -299,7 +304,7 @@ func computeDHashFromImage(img image.Image) uint64 {
 //
 // Both fingerprints are always produced; the algorithm setting is applied when
 // matching, not when hashing. See computeDHashSmart for why.
-func computeDHashFromHeader(path string) (dHash, pHash uint64, width, height int, err error) {
+func computeDHashFromHeader(path string) (dHash, pHash uint64, width, height int, exif ScanExif, err error) {
 	ext := strings.ToLower(filepath.Ext(path))
 
 	// HEIC/HEIF: the container requires full file access; use dedicated decoder.
@@ -312,7 +317,7 @@ func computeDHashFromHeader(path string) (dHash, pHash uint64, width, height int
 	// Borrow a 128 KB buffer from the pool to avoid per-call allocation.
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, 0, 0, ErrNoThumbnail
+		return 0, 0, 0, 0, ScanExif{}, ErrNoThumbnail
 	}
 	bufPtr := headerBufPool.Get().(*[]byte)
 	buf := *bufPtr
@@ -320,7 +325,7 @@ func computeDHashFromHeader(path string) (dHash, pHash uint64, width, height int
 	f.Close()
 	if n == 0 {
 		headerBufPool.Put(bufPtr)
-		return 0, 0, 0, 0, ErrNoThumbnail
+		return 0, 0, 0, 0, ScanExif{}, ErrNoThumbnail
 	}
 	// Return the buffer to the pool when we're done with it.
 	// defer is safe here — all remaining code paths only read from buf.
@@ -333,7 +338,7 @@ func computeDHashFromHeader(path string) (dHash, pHash uint64, width, height int
 // computeDHashFromHeader but skips the file-open/read step because the header
 // bytes are already in buf. Used by the pipeline to reuse 64 KB buffers read
 // during the partial-hash phase instead of re-opening the file.
-func computeDHashFromHeaderBuffer(path string, buf []byte) (dHash, pHash uint64, width, height int, err error) {
+func computeDHashFromHeaderBuffer(path string, buf []byte) (dHash, pHash uint64, width, height int, exif ScanExif, err error) {
 	ext := strings.ToLower(filepath.Ext(path))
 
 	// HEIC/HEIF: defer to the dedicated HEIC fast path — it does its own read
@@ -343,7 +348,7 @@ func computeDHashFromHeaderBuffer(path string, buf []byte) (dHash, pHash uint64,
 	}
 
 	if len(buf) == 0 {
-		return 0, 0, 0, 0, ErrNoThumbnail
+		return 0, 0, 0, 0, ScanExif{}, ErrNoThumbnail
 	}
 
 	// Extract image dimensions from the header bytes (DecodeConfig is header-only).
@@ -351,27 +356,44 @@ func computeDHashFromHeaderBuffer(path string, buf []byte) (dHash, pHash uint64,
 		width, height = cfg.Width, cfg.Height
 	}
 
+	// Parse EXIF from the same bytes, before any of the decode branches below —
+	// every one of them can return early, and the EXIF is equally valid on all
+	// of them. For a JPEG the EXIF APP1 segment sits at the very front of the
+	// file, so even the 64 KB partial-hash buffer the pipeline passes here
+	// normally covers it.
+	//
+	// This is what removes the metadata phase's 128 KB re-read for non-HEIC
+	// files: that read was measured at ~76 ms per file over SMB, and it was
+	// reading bytes this function was already holding.
+	exif = parseScanExifBuffer(path, buf)
+
 	// Try to find an embedded JPEG thumbnail for cheap fingerprinting.
 	// Camera and phone JPEGs store a small thumbnail in the EXIF APP1 segment.
 	if thumb := extractJPEGThumbnailFromBuffer(buf); thumb != nil {
 		if img, _, imgErr := image.Decode(bytes.NewReader(thumb)); imgErr == nil {
-			return computeDHashFromImage(img), computePHashFromImage(img), width, height, nil
+			return computeDHashFromImage(img), computePHashFromImage(img), width, height, exif, nil
 		}
 	}
 
 	// JPEG / RAW: no thumbnail found — skip perceptual matching for this file.
 	// These formats need full decode which is too expensive for the fast path.
 	if !formatsNeedingFullDecode[ext] {
-		return 0, 0, width, height, ErrNoThumbnail
+		return 0, 0, width, height, exif, ErrNoThumbnail
 	}
 
 	// PNG / BMP / GIF / WebP / TIFF: fall back to full file read + decode.
 	data, readErr := os.ReadFile(path)
 	if readErr != nil {
-		return 0, 0, width, height, readErr
+		return 0, 0, width, height, exif, readErr
+	}
+	// The whole file is in hand now, so retry EXIF against it if the header
+	// window came up short — this is the one branch that already paid for a
+	// full read, so there is nothing to save by not using it.
+	if !exif.OK {
+		exif = parseScanExifBuffer(path, data)
 	}
 	dHash, pHash, err = computeDHashSmart(data)
-	return dHash, pHash, width, height, err
+	return dHash, pHash, width, height, exif, err
 }
 
 // =============================================================================

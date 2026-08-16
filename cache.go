@@ -30,6 +30,14 @@
 //         switching between dHash, pHash and Both reuses the same entries
 //         instead of silently serving hashes computed under the other
 //         algorithm, and needs no re-scan.
+//   v5 — added Exif (see scan_exif.go). The hash phase now parses EXIF out of
+//         the header buffer it already holds and stores it here, so the
+//         metadata phase no longer re-opens every grouped file. The bump is
+//         mandatory rather than cosmetic: a v4 entry decodes into a v5 struct
+//         perfectly happily, leaving Exif zeroed with OK=false. That is not
+//         corrupt, but it would make every file look like a fallback case and
+//         quietly give back the entire speedup. Discarding v4 costs one
+//         re-hash; not discarding it costs the optimisation.
 // =============================================================================
 
 package main
@@ -67,13 +75,26 @@ type CachedEntry struct {
 	PHash   uint64 // DCT perceptual hash. Added in v4.
 	Width   int    // Image width in pixels (0 if unknown). Added in v2.
 	Height  int    // Image height in pixels (0 if unknown). Added in v2.
+
+	// Exif holds the EXIF fields parsed during the hash phase. Added in v5.
+	// Check Exif.OK before using it — a false OK means "not captured", not
+	// "this file has no EXIF", and the caller must re-read the file.
+	//
+	// Roughly 100 bytes per entry, so ~1 MB for a 10,000-image library. That is
+	// the whole reason this is a parsed struct rather than the raw header
+	// buffer it came from: retaining 128 KB per file would be ~1 GB.
+	//
+	// Note what is NOT here: QualityScore. It stays computed at group time from
+	// these inputs, so a change to the scoring rules takes effect immediately
+	// instead of needing a cache wipe.
+	Exif ScanExif
 }
 
 // cacheVersion is incremented when the cache format changes, OR when the
 // meaning of a stored value changes — a v2 dHash and a v3 dHash are both
 // uint64s but are not comparable.
 // Old caches with a different version are discarded and rebuilt.
-const cacheVersion = 4
+const cacheVersion = 5
 
 // cachePath returns the path to the cache file for a given scan path.
 // Format: ~/.dedup-photos/cache_<first-16-hex-chars-of-sha256>.gob
@@ -159,27 +180,32 @@ func SaveCache(cache *HashCache, scanPath string) error {
 // LookupAll / StoreAll — Full cache API including image dimensions (v2)
 // =============================================================================
 
-// LookupAll checks if a cached entry exists and is still valid.
-// Returns (xxHash, dHash, pHash, width, height, true) on a cache hit.
-// Returns zeros and false on a miss or stale entry.
+// LookupAll checks if a cached entry exists and is still valid, returning the
+// whole entry so callers read fields by name.
+//
+// It returns the entry rather than a list of values because v5 added EXIF: the
+// positional form was already six return values, and a seventh would have made
+// the call site unreadable at exactly the point where mixing two of them up
+// would be silent.
 //
 // Width/Height are 0 if the entry was written before v2 or if dimensions
 // couldn't be determined at hash time; callers must handle the zero case.
-func (c *HashCache) LookupAll(path string, info os.FileInfo) (uint64, uint64, uint64, int, int, bool) {
+// Likewise Exif.OK may be false on a valid entry — see CachedEntry.Exif.
+func (c *HashCache) LookupAll(path string, info os.FileInfo) (*CachedEntry, bool) {
 	entry, ok := c.Entries[path]
 	if !ok {
-		return 0, 0, 0, 0, 0, false
+		return nil, false
 	}
 	// Invalidate the entry if the file was modified since caching.
 	if entry.Size != info.Size() || entry.ModTime != info.ModTime().UnixNano() {
-		return 0, 0, 0, 0, 0, false
+		return nil, false
 	}
-	return entry.XXHash, entry.DHash, entry.PHash, entry.Width, entry.Height, true
+	return entry, true
 }
 
-// StoreAll adds or updates a cache entry, including image dimensions.
-// Call this instead of Store whenever width/height are known.
-func (c *HashCache) StoreAll(path string, info os.FileInfo, xxHash, dHash, pHash uint64, width, height int) {
+// StoreAll adds or updates a cache entry, including image dimensions and the
+// EXIF captured during the hash phase.
+func (c *HashCache) StoreAll(path string, info os.FileInfo, xxHash, dHash, pHash uint64, width, height int, exif ScanExif) {
 	c.Entries[path] = &CachedEntry{
 		Size:    info.Size(),
 		ModTime: info.ModTime().UnixNano(),
@@ -188,6 +214,7 @@ func (c *HashCache) StoreAll(path string, info os.FileInfo, xxHash, dHash, pHash
 		PHash:   pHash,
 		Width:   width,
 		Height:  height,
+		Exif:    exif,
 	}
 }
 
