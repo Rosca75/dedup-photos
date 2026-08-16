@@ -8,10 +8,9 @@
 //   Pass 1 (Exact):      Files sharing the same xxHash are byte-identical.
 //                        XXHash = 0 (singletons) are skipped — they cannot
 //                        have exact duplicates.
-//   Pass 2 (Perceptual): A BK-Tree finds images with similar dHash values.
-//                        NEW (#4): one BK-Tree per aspect-ratio bucket, which
-//                        reduces search scope by ~90% (10 buckets instead of
-//                        one tree with 5 700 nodes).
+//   Pass 2 (Perceptual): A BK-Tree finds images with similar fingerprints,
+//                        then refinePerceptualGroups splits the transitive
+//                        Union-Find chains into clusters that hold together.
 //   Pass 3 (Series):     Relabels high-confidence perceptual groups whose
 //                        filenames are sequential (burst / rafale mode).
 //
@@ -19,8 +18,9 @@
 // ─────────────────────────────────
 // #2  parallelExtractMetadata: all ExtractMetadata calls run concurrently
 //     via runParallel (from parallel.go).  Single-threaded was ~8 ms/file.
-// #4  aspectBucket + per-bucket BK-Trees: groups images by quantised aspect
-//     ratio before inserting into BK-Trees, so each tree is ~90% smaller.
+// #4  aspectBucket + per-bucket BK-Trees: REVERTED — measured at 99.1% of a
+//     real library in one bucket, so it pruned nothing while making crops
+//     unmatchable. See aspectBucket.
 //
 // DATA STRUCTURES
 // ───────────────
@@ -46,6 +46,126 @@ import (
 
 	"github.com/google/uuid" // UUID for unique group IDs.
 )
+
+// =============================================================================
+// Threshold units
+// =============================================================================
+//
+// The UI slider is a PERCENTAGE of the hash width; the BK-Tree and the
+// confidence figure work in BITS. Keeping the two apart matters: the slider
+// value used to be handed to BKTree.Search unconverted, so "25%" requested a
+// radius of 25 bits — 39% of the hash, where two unrelated photos (32 bits
+// apart on average) routinely link. Measured on a 6,596-image library that
+// setting put 99.4% of every photo into a single group.
+
+// perceptualHashBits is the width of the dHash produced by
+// computeDHashFromImage. Confidence and threshold conversion both derive from
+// it rather than repeating the literal 64.
+const perceptualHashBits = 64
+
+// defaultThresholdPercent is used when the request carries no threshold.
+// At 10% (6 bits) a real-library measurement found 97.8% of duplicates while
+// the largest group stayed at 0.6% of the library.
+const defaultThresholdPercent = 10
+
+// maxThresholdPercent caps the slider below the point where Union-Find starts
+// fusing the whole library. On the measured library the giant component appears
+// at 14 bits (~22%); 18% is 11 bits, comfortably short of it.
+const maxThresholdPercent = 18
+
+// hammingThresholdBits converts a slider percentage into a Hamming distance.
+// Call this exactly once, at the boundary between request and grouper.
+func hammingThresholdBits(percent int) int {
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > maxThresholdPercent {
+		percent = maxThresholdPercent
+	}
+	return percent * perceptualHashBits / 100
+}
+
+// =============================================================================
+// Algorithm selection — applied at MATCH time, not at hash time
+// =============================================================================
+//
+// Every file carries both a dHash and a pHash, computed from the same decode.
+// The setting therefore only decides how two files are COMPARED, which is what
+// makes it meaningful at last:
+//
+//   - "dhash" — difference hash only, the historical behaviour.
+//   - "phash" — DCT perceptual hash only. Previously this selected an average
+//     hash, and only for formats almost nobody in this corpus uses; on HEIC and
+//     thumbnail-bearing JPEG it was silently ignored, so all three settings
+//     produced byte-identical hashes.
+//   - "both"  — the two fingerprints must AGREE. This was never implemented at
+//     all: "both" fell through a switch's default case straight to dHash.
+//
+// "both" is the only setting that is genuinely stronger than the others. The
+// two hashes measure different things — neighbouring-pixel gradients versus
+// low-frequency DCT energy — so requiring both to fall inside the threshold
+// suppresses the chance pairings that let Union-Find chain unrelated photos
+// together, at the cost of a little recall.
+type matchMode int
+
+const (
+	matchDHash matchMode = iota
+	matchPHash
+	matchBoth
+)
+
+// parseMatchMode maps the request's algorithm string onto a match mode.
+// Unknown values fall back to dHash, which is the historical default.
+func parseMatchMode(algorithm string) matchMode {
+	switch strings.ToLower(strings.TrimSpace(algorithm)) {
+	case "phash":
+		return matchPHash
+	case "both":
+		return matchBoth
+	default:
+		return matchDHash
+	}
+}
+
+// indexHash returns the fingerprint used to BUILD the BK-Tree — the structure
+// that generates candidates. "both" indexes on dHash and then verifies pHash,
+// so the tree only ever needs one hash.
+func (m matchMode) indexHash(h ImageHash) uint64 {
+	if m == matchPHash {
+		return h.PHash
+	}
+	return h.DHash
+}
+
+// distance returns the effective distance between two images under this mode.
+// For "both" it is the WORSE of the two fingerprints, so a pair only counts as
+// close when neither hash disagrees.
+func (m matchMode) distance(a, b ImageHash) int {
+	switch m {
+	case matchPHash:
+		return HammingDistance(a.PHash, b.PHash)
+	case matchBoth:
+		d := HammingDistance(a.DHash, b.DHash)
+		if p := HammingDistance(a.PHash, b.PHash); p > d {
+			return p
+		}
+		return d
+	default:
+		return HammingDistance(a.DHash, b.DHash)
+	}
+}
+
+// usable reports whether an image has the fingerprints this mode needs.
+func (m matchMode) usable(h ImageHash) bool {
+	switch m {
+	case matchPHash:
+		return h.PHash != 0
+	case matchBoth:
+		return h.DHash != 0 && h.PHash != 0
+	default:
+		return h.DHash != 0
+	}
+}
 
 // =============================================================================
 // BK-Tree types
@@ -170,18 +290,21 @@ func (uf *UnionFind) Union(x, y string) {
 // aspectBucket — Aspect-ratio quantisation for BK-Tree bucketing (#4)
 // =============================================================================
 
-// aspectBucket returns a string key that groups images with similar aspect
-// ratios together (within 5% tolerance). Building one BK-Tree per bucket
-// instead of one global tree reduces each tree's size by ~90%, making the
-// O(n^α) search significantly cheaper.
+// aspectBucket returns a string key grouping images with similar aspect ratios
+// (within 5% tolerance), in landscape form and rounded to the nearest 0.05.
 //
-// The ratio is always expressed in landscape form (≥ 1.0), then rounded to
-// the nearest 0.05. For example, 4:3 (1.333) and 16:9 (1.778) end up in
-// different buckets; near-identical crops of the same photo end up together.
+// NO LONGER USED FOR BK-TREE PARTITIONING. It was introduced as optimisation #4
+// on the claim that per-bucket trees cut search scope by ~90%. Measured on the
+// libraries this tool is actually pointed at, that claim does not hold: 99.1% of
+// a 1,746-image phone library landed in a single bucket (ratio 1.35), so the
+// partition pruned nothing at all while still costing a hard false negative —
+// any crop that shifts the aspect ratio by more than 5% could never be compared
+// against its own original, no matter how the threshold was set.
 //
-// Width = 0 or Height = 0 means unknown dimensions → "unknown" bucket, which
-// compares all unknown-dimension images against each other (safe: no false
-// negatives).
+// A BK-Tree already prunes by the triangle inequality, so the partition was
+// redundant on the workload that matters and harmful on the one case (crops)
+// where perceptual matching earns its keep. It is kept here because
+// ReportMismatch still reports the bucket as a diagnostic.
 func aspectBucket(width, height int) string {
 	if width == 0 || height == 0 {
 		return "unknown"
@@ -234,68 +357,194 @@ func findExactPaths(hashes []ImageHash) (groups [][]string, exactGrouped map[str
 
 // searchBKBucket builds a BK-Tree from bucketHashes, searches it for every
 // hash within the threshold, and merges matches using the shared UnionFind.
-// Called once per aspect bucket in findPerceptualPaths.
-func searchBKBucket(bucketHashes []ImageHash, threshold int, uf *UnionFind, minDist map[string]int) {
+//
+// This produces CANDIDATES only. Union-Find is transitive, so the sets it
+// returns can be long chains in which neighbouring links are close but the ends
+// are unrelated. refinePerceptualGroups breaks those apart afterwards.
+func searchBKBucket(bucketHashes []ImageHash, threshold int, mode matchMode, uf *UnionFind, byPath map[string]ImageHash) {
 	tree := NewBKTree()
 	for _, h := range bucketHashes {
-		tree.Insert(h.DHash, h.Path)
+		tree.Insert(mode.indexHash(h), h.Path)
 	}
 	for _, h := range bucketHashes {
-		for _, result := range tree.Search(h.DHash, threshold) {
+		for _, result := range tree.Search(mode.indexHash(h), threshold) {
 			if result.Path == h.Path {
 				continue
 			}
+			// Under "both", the tree only proves the indexed hash is close.
+			// The second fingerprint has to agree before the pair is linked.
+			if mode == matchBoth && mode.distance(h, byPath[result.Path]) > threshold {
+				continue
+			}
 			uf.Union(h.Path, result.Path)
-			root := uf.Find(h.Path)
-			if existing, ok := minDist[root]; !ok || result.Distance < existing {
-				minDist[root] = result.Distance
+		}
+	}
+}
+
+// =============================================================================
+// Group refinement — break transitive chains into coherent clusters
+// =============================================================================
+
+// perceptualGroup is one refined cluster: a set of paths plus the distance
+// between its two FURTHEST-APART members.
+//
+// MaxDist, not the minimum, is what confidence is derived from. The old code
+// recorded the closest pair anywhere in the set, which meant a group reported
+// perfect confidence the moment it swallowed one identical pair — the
+// 1,730-image group produced by a 25-bit threshold reported 100% while 93.7%
+// of its own internal pairs were further apart than the threshold that built it.
+type perceptualGroup struct {
+	Paths   []string
+	MaxDist int
+}
+
+// refinePerceptualGroups turns raw Union-Find candidate sets into clusters
+// where every member is within `threshold` of a shared leader.
+//
+// Union-Find alone cannot do this. Similarity is transitive under it, so A~B
+// and B~C group A with C even when A and C are nothing alike; once the
+// threshold is loose enough that chance links appear, a single giant component
+// swallows the library in one step. Bounding each cluster to a radius around a
+// leader removes the chaining without needing the threshold to be perfect.
+func refinePerceptualGroups(raw map[string][]string, hashMap map[string]ImageHash, threshold int, mode matchMode) []perceptualGroup {
+	var out []perceptualGroup
+	for _, paths := range raw {
+		if len(paths) < 2 {
+			continue
+		}
+		out = append(out, splitChainedGroup(paths, hashMap, threshold, mode)...)
+	}
+	// Sort for deterministic output regardless of Go's map iteration order.
+	sort.Slice(out, func(i, j int) bool {
+		if len(out[i].Paths) != len(out[j].Paths) {
+			return len(out[i].Paths) > len(out[j].Paths)
+		}
+		return out[i].Paths[0] < out[j].Paths[0]
+	})
+	return out
+}
+
+// leaderScanLimit caps the O(n²) highest-degree leader search. Above it the
+// first remaining path is used instead, which keeps a pathologically large
+// candidate set (the symptom this whole change exists to fix) from turning the
+// refinement into an O(n³) stall.
+const leaderScanLimit = 256
+
+// splitChainedGroup repeatedly carves the densest cluster out of a candidate
+// set until nothing with 2+ members remains.
+//
+// Each pass picks a leader, claims every remaining path within `threshold` of
+// it, and emits that as one group. Choosing the highest-degree path as leader
+// makes the first cluster form around the densest core rather than around an
+// arbitrary outlier.
+func splitChainedGroup(paths []string, hashMap map[string]ImageHash, threshold int, mode matchMode) []perceptualGroup {
+	remaining := append([]string(nil), paths...)
+	sort.Strings(remaining) // deterministic leader choice on ties
+
+	var out []perceptualGroup
+	for len(remaining) >= 2 {
+		leader := pickLeader(remaining, hashMap, threshold, mode)
+		leaderHash := hashMap[leader]
+
+		var members, rest []string
+		for _, p := range remaining {
+			if p == leader || mode.distance(leaderHash, hashMap[p]) <= threshold {
+				members = append(members, p)
+			} else {
+				rest = append(rest, p)
+			}
+		}
+
+		if len(members) >= 2 {
+			out = append(out, perceptualGroup{
+				Paths:   members,
+				MaxDist: maxPairDistance(members, hashMap, mode),
+			})
+		}
+
+		// The leader always joins members, so rest always shrinks. This guard
+		// is belt-and-braces against a future edit reintroducing a stall.
+		if len(rest) >= len(remaining) {
+			break
+		}
+		remaining = rest
+	}
+	return out
+}
+
+// pickLeader returns the path with the most neighbours within threshold, or the
+// first path when the set is too large to scan affordably.
+func pickLeader(paths []string, hashMap map[string]ImageHash, threshold int, mode matchMode) string {
+	if len(paths) > leaderScanLimit {
+		return paths[0]
+	}
+	best, bestDegree := paths[0], -1
+	for _, p := range paths {
+		ph := hashMap[p]
+		degree := 0
+		for _, q := range paths {
+			if p == q {
+				continue
+			}
+			if mode.distance(ph, hashMap[q]) <= threshold {
+				degree++
+			}
+		}
+		if degree > bestDegree {
+			best, bestDegree = p, degree
+		}
+	}
+	return best
+}
+
+// maxPairDistance returns the distance between the two furthest-apart members
+// of a group — the group's diameter.
+func maxPairDistance(paths []string, hashMap map[string]ImageHash, mode matchMode) int {
+	worst := 0
+	for i := 0; i < len(paths); i++ {
+		hi := hashMap[paths[i]]
+		for j := i + 1; j < len(paths); j++ {
+			if d := mode.distance(hi, hashMap[paths[j]]); d > worst {
+				worst = d
 			}
 		}
 	}
+	return worst
 }
 
 // =============================================================================
 // findPerceptualPaths — Pass 2: aspect-ratio-bucketed BK-Tree search (#4)
 // =============================================================================
 
-// findPerceptualPaths detects perceptual duplicates using one BK-Tree per
-// aspect-ratio bucket (#4). Images in different buckets are never compared,
-// reducing each BK-Tree to ~1/10 the size of a single global tree.
+// findPerceptualPaths detects perceptual duplicate CANDIDATES with a BK-Tree
+// over every eligible image.
 //
 // Uses Union-Find to collect transitive similarity chains (A~B, B~C → {A,B,C}).
+// Those chains are candidates, not results: refinePerceptualGroups splits them
+// into clusters whose members are all mutually close before anything is
+// reported to the user.
 //
-// Returns:
-//   - groups:  map from Union-Find root → list of duplicate paths.
-//   - minDist: map from root → minimum Hamming distance in that group
-//     (used to compute confidence: (1 - dist/64) × 100%).
-func findPerceptualPaths(hashes []ImageHash, exactGrouped map[string]bool, threshold int) (
+// Returns groups: map from Union-Find root → list of candidate paths.
+func findPerceptualPaths(hashes []ImageHash, exactGrouped map[string]bool, threshold int, mode matchMode) (
 	groups map[string][]string,
-	minDist map[string]int,
 ) {
 	// Collect valid hashes: no errors, not already exact-grouped, non-zero dHash.
 	var valid []ImageHash
+	byPath := make(map[string]ImageHash, len(hashes))
 	for _, h := range hashes {
-		if h.Error != nil || exactGrouped[h.Path] || h.DHash == 0 {
+		if h.Error != nil || exactGrouped[h.Path] || !mode.usable(h) {
 			continue
 		}
 		valid = append(valid, h)
-	}
-
-	// Group valid hashes into aspect-ratio buckets.
-	// Images with different ratios are extremely unlikely to be perceptual dups.
-	aspectBuckets := make(map[string][]ImageHash)
-	for _, h := range valid {
-		b := aspectBucket(h.Width, h.Height)
-		aspectBuckets[b] = append(aspectBuckets[b], h)
+		byPath[h.Path] = h
 	}
 
 	uf := NewUnionFind()
-	minDist = make(map[string]int)
 
-	// Build and search one BK-Tree per aspect bucket.
-	for _, bucketHashes := range aspectBuckets {
-		searchBKBucket(bucketHashes, threshold, uf, minDist)
-	}
+	// One BK-Tree over every candidate. See aspectBucket for why the per-ratio
+	// partition was removed: it pruned nothing on real libraries and silently
+	// excluded crops from ever matching their originals.
+	searchBKBucket(valid, threshold, mode, uf, byPath)
 
 	// Collect Union-Find groups.
 	groups = make(map[string][]string)
@@ -379,6 +628,7 @@ func buildGroup(matchType string, confidence float64, paths []string, metaMap ma
 		if h, ok := hashMap[path]; ok {
 			meta.XXHash = h.XXHash
 			meta.DHash = h.DHash
+			meta.PHash = h.PHash
 		}
 		group.Images = append(group.Images, meta)
 	}
@@ -411,14 +661,22 @@ func detectSeriesGroups(groups []DuplicateGroup) {
 // GroupDuplicates takes the slice of ImageHash values produced by the hash
 // pipeline and returns a sorted list of duplicate groups.
 //
-// The restructured flow vs. the original:
-//  1. findExactPaths    — O(n) grouping by xxHash.
-//  2. findPerceptualPaths — aspect-ratio bucketed BK-Trees (#4).
-//  3. collectUniquePaths + parallelExtractMetadata — all file opens run
+// threshold is a HAMMING DISTANCE IN BITS, not the slider's percentage. Convert
+// with hammingThresholdBits before calling — passing a percentage straight
+// through is the bug that put 99.4% of a 6,596-image library into one group.
+//
+// Flow:
+//  1. findExactPaths — O(n) grouping by xxHash.
+//  2. findPerceptualPaths — aspect-ratio bucketed BK-Trees (#4), producing
+//     transitive Union-Find candidate sets.
+//  3. refinePerceptualGroups — split those chains into clusters whose members
+//     are all within threshold of a shared leader, and record each cluster's
+//     diameter for the confidence figure.
+//  4. collectUniquePaths + parallelExtractMetadata — all file opens run
 //     concurrently instead of single-threaded (#2).
-//  4. buildGroup — look up pre-computed metadata from the map.
-//  5. detectSeriesGroups — relabel burst sequences.
-func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []DuplicateGroup {
+//  5. buildGroup — look up pre-computed metadata from the map.
+//  6. detectSeriesGroups — relabel burst sequences.
+func GroupDuplicates(hashes []ImageHash, threshold int, algorithm string, includeSeries bool) []DuplicateGroup {
 	// Build a quick lookup from path → ImageHash for pre-computed dimensions.
 	// This lets parallelExtractMetadata skip re-opening files for dimensions
 	// (Optimization A — single file open).
@@ -432,73 +690,78 @@ func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []Du
 	exactGroups, exactGrouped := findExactPaths(hashes)
 	fmt.Printf("[grouper] Pass 1: %d exact duplicate groups.\n", len(exactGroups))
 
-	// Pass 2: Perceptual duplicates using aspect-ratio-bucketed BK-Trees.
+	// Pass 2: Perceptual duplicate CANDIDATES using aspect-ratio-bucketed
+	// BK-Trees, then refinement into clusters that actually hold together.
 	fmt.Println("[grouper] Pass 2: Perceptual matching (aspect-ratio BK-Trees)...")
-	percGroups, percMinDist := findPerceptualPaths(hashes, exactGrouped, threshold)
-	percCount := 0
-	for _, paths := range percGroups {
+	mode := parseMatchMode(algorithm)
+	tSearch := time.Now()
+	candidates := findPerceptualPaths(hashes, exactGrouped, threshold, mode)
+	searchMs := time.Since(tSearch).Milliseconds()
+	candidateCount, largestCandidate := 0, 0
+	for _, paths := range candidates {
 		if len(paths) >= 2 {
-			percCount++
+			candidateCount++
+		}
+		if len(paths) > largestCandidate {
+			largestCandidate = len(paths)
 		}
 	}
-	fmt.Printf("[grouper] Pass 2: %d perceptual duplicate groups.\n", percCount)
+
+	tRefine := time.Now()
+	percGroups := refinePerceptualGroups(candidates, hashMap, threshold, mode)
+	refineMs := time.Since(tRefine).Milliseconds()
+	largestRefined := 0
+	for _, g := range percGroups {
+		if len(g.Paths) > largestRefined {
+			largestRefined = len(g.Paths)
+		}
+	}
+	fmt.Printf("[grouper] Pass 2: %d candidate sets (largest %d) -> %d refined groups (largest %d).\n",
+		candidateCount, largestCandidate, len(percGroups), largestRefined)
+	fmt.Printf("[perf]    BK-tree search: %dms, cluster refinement: %dms\n", searchMs, refineMs)
 
 	// Optimization B: Lightweight pre-filter to remove filename-sequential
 	// groups BEFORE metadata extraction when the user doesn't want series.
 	// This avoids opening thousands of burst files on slow drives.
 	//
-	// We use threshold/2 as the distance cutoff (instead of the old hard-coded 3)
-	// to catch more burst groups. For the default threshold of 10, this means
-	// distance ≤ 5 → confidence ≥ 92%. Most burst shots have distance 2-5 and
-	// sequential filenames, so this catches the vast majority.
+	// The cutoff is half the scan threshold: burst frames sit very close
+	// together, so a group that is both tight and sequentially named is almost
+	// always a burst. It now tests the group's DIAMETER rather than its closest
+	// pair, so a loose group can no longer sneak through on one tight pair.
 	if !includeSeries {
-		preFilterCount := 0
 		preFilterThreshold := threshold / 2
-		for root, paths := range percGroups {
-			if len(paths) < 2 {
+		kept := percGroups[:0]
+		preFilterCount := 0
+		for _, g := range percGroups {
+			if g.MaxDist <= preFilterThreshold && isFilenameSeriesFromPaths(g.Paths) {
+				preFilterCount++
 				continue
 			}
-			// Check groups with distance ≤ half the scan threshold
-			// (confidence ≥ ~85-92% depending on the threshold value).
-			if dist, ok := percMinDist[root]; ok && dist <= preFilterThreshold {
-				if isFilenameSeriesFromPaths(paths) {
-					delete(percGroups, root)
-					preFilterCount++
-				}
-			}
+			kept = append(kept, g)
 		}
-		fmt.Printf("[grouper] Pre-filtered %d series groups (dist ≤ %d). Remaining perceptual: %d\n", preFilterCount, preFilterThreshold, len(percGroups))
+		percGroups = kept
+		fmt.Printf("[grouper] Pre-filtered %d series groups (diameter <= %d). Remaining perceptual: %d\n",
+			preFilterCount, preFilterThreshold, len(percGroups))
 	}
 
-	// Drop perceptual "groups" that contain a single image before we collect the
-	// paths to extract metadata for.
-	//
-	// findPerceptualPaths returns one map entry per image, not per duplicate
-	// group: an image that matched nothing still gets its own Union-Find root and
-	// therefore its own one-element entry. Those singletons are discarded later,
-	// by the len(paths) < 2 test in the group-building loop below — but that is
-	// far too late, because collectUniquePaths + parallelExtractMetadata have
-	// already opened and parsed EXIF for every one of them.
-	//
-	// Measured on a 1,134-file iPhone corpus over SMB: 1,005 perceptual entries of
-	// which 981 (97.6%) were singletons, so the metadata phase opened 1,052 files
-	// to build metadata for the 71 that actually appear in a result. Filtering
-	// here cut that phase from 17.9s to 0.6s, and a re-scan with a fully valid
-	// hash cache from 16.4s to 0.8s — the cache could not help because this work
-	// happens after it.
-	realGroups := make(map[string][]string, len(percGroups))
-	for root, paths := range percGroups {
-		if len(paths) >= 2 {
-			realGroups[root] = paths
-		}
-	}
-	percGroups = realGroups
+	// Note on singletons: refinePerceptualGroups only emits clusters of 2+, so
+	// the one-element Union-Find roots that used to reach the metadata phase are
+	// already gone by here. That filtering matters — measured on a 1,134-file
+	// iPhone corpus over SMB, 981 of 1,005 perceptual entries (97.6%) were
+	// singletons, and dropping them before metadata extraction cut that phase
+	// from 17.9s to 0.6s.
 
 	// Parallel metadata extraction for all duplicate files (#2).
 	// Uses ExtractMetadataFast with pre-computed dimensions (Optimization A).
-	allPaths := collectUniquePaths(exactGroups, percGroups)
+	percPaths := make(map[string][]string, len(percGroups))
+	for i, g := range percGroups {
+		percPaths[strconv.Itoa(i)] = g.Paths
+	}
+	allPaths := collectUniquePaths(exactGroups, percPaths)
 	fmt.Printf("[grouper] Extracting metadata for %d files (parallel)...\n", len(allPaths))
+	tMeta := time.Now()
 	metaMap := parallelExtractMetadata(context.Background(), allPaths, hashMap)
+	fmt.Printf("[perf]    Metadata extraction: %dms for %d files\n", time.Since(tMeta).Milliseconds(), len(allPaths))
 	// Perf tracing (Trace 3): report the read-vs-EXIF split for the metadata phase.
 	printAndResetMetadataSplit()
 
@@ -507,13 +770,11 @@ func GroupDuplicates(hashes []ImageHash, threshold int, includeSeries bool) []Du
 	for _, paths := range exactGroups {
 		groups = append(groups, buildGroup("exact", 100.0, paths, metaMap, hashMap))
 	}
-	for root, paths := range percGroups {
-		if len(paths) < 2 {
-			continue
-		}
-		dist := percMinDist[root]
-		confidence := (1.0 - float64(dist)/64.0) * 100.0
-		groups = append(groups, buildGroup("perceptual", confidence, paths, metaMap, hashMap))
+	for _, g := range percGroups {
+		// Confidence comes from the group's WORST pair, so the number describes
+		// the whole group rather than its luckiest coincidence.
+		confidence := (1.0 - float64(g.MaxDist)/float64(perceptualHashBits)) * 100.0
+		groups = append(groups, buildGroup("perceptual", confidence, g.Paths, metaMap, hashMap))
 	}
 
 	// Pass 3: Detect burst/series groups among perceptual matches.

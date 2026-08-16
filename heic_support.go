@@ -322,10 +322,10 @@ func resizeImageToJPEG(img image.Image, maxDim, quality int) []byte {
 // computeDHashHEIC computes a dHash and image dimensions for a HEIC file.
 // Uses the byte-range fast path: one header read covers the ISOBMFF header
 // (for dimensions via imagemeta) and the thumbnail tile (decoded via WASM).
-func computeDHashHEIC(path, algorithm string) (dHash uint64, width, height int, err error) {
+func computeDHashHEIC(path string) (dHash, pHash uint64, width, height int, err error) {
 	header, hdrErr := readHEICHeader(path)
 	if hdrErr != nil {
-		return 0, 0, 0, ErrNoThumbnail
+		return 0, 0, 0, 0, ErrNoThumbnail
 	}
 
 	// Extract dimensions from the same buffer — no extra I/O.
@@ -340,7 +340,7 @@ func computeDHashHEIC(path, algorithm string) (dHash uint64, width, height int, 
 	// Decode via the shared thumb → primary → full-read ladder.
 	img, decErr := decodeHEICFromHeader(path, header)
 	if decErr != nil {
-		return 0, width, height, ErrNoThumbnail
+		return 0, 0, width, height, ErrNoThumbnail
 	}
 
 	// The decoded thumbnail is in hand here, so persist it for the UI rather than
@@ -357,11 +357,14 @@ func computeDHashHEIC(path, algorithm string) (dHash uint64, width, height int, 
 	// resizeImageToJPEG is called with the same 400 px / quality 85 arguments as
 	// heicThumbnailJPEG, so the cached bytes are exactly what GetThumbnail would
 	// have produced.
+	// Both fingerprints come from the one decode — the expensive part is the
+	// HEVC decode above, not the hashing.
 	dHash = computeDHashFromImage(img)
+	pHash = computePHashFromImage(img)
 	if jpegBytes := resizeImageToJPEG(img, 400, 85); jpegBytes != nil {
 		storeThumbCache(path, jpegBytes)
 	}
-	return dHash, width, height, nil
+	return dHash, pHash, width, height, nil
 }
 
 // extractHEICExif populates meta with EXIF data from a HEIC file.

@@ -44,11 +44,17 @@ type ScanProgress struct {
 }
 
 // ScanStats contains summary statistics for a completed scan.
+//
+// SkippedPerceptual and Unreadable exist so the UI can admit what the scan did
+// NOT cover. Without them a file that was never compared looks exactly like a
+// file with no duplicates.
 type ScanStats struct {
-	TotalFiles      int   `json:"total_files"`      // Image files found.
-	DuplicateGroups int   `json:"duplicate_groups"` // Duplicate groups detected.
-	WastedBytes     int64 `json:"wasted_bytes"`     // Bytes that could be freed.
-	DurationMs      int64 `json:"duration_ms"`      // Scan duration in milliseconds.
+	TotalFiles        int   `json:"total_files"`        // Image files found.
+	DuplicateGroups   int   `json:"duplicate_groups"`   // Duplicate groups detected.
+	WastedBytes       int64 `json:"wasted_bytes"`       // Bytes that could be freed.
+	DurationMs        int64 `json:"duration_ms"`        // Scan duration in milliseconds.
+	SkippedPerceptual int   `json:"skipped_perceptual"` // Files with no perceptual hash (exact-matched only).
+	Unreadable        int   `json:"unreadable"`         // Files that could not be read at all.
 }
 
 // ScanResult is the full response returned by GetResults().

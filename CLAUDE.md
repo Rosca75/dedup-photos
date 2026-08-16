@@ -115,10 +115,13 @@ dedup-photos/
 │
 │  ── Scan pipeline ────────────────────────────────────────────────────────────
 ├── scanner.go           385   Filesystem walk; supportedExtensions lives here
-├── hasher.go            366   Hash algorithms (xxHash exact, dHash/pHash perceptual)
+├── hasher.go            ~400  Hash algorithms; grayGrid area-average downsampling
+├── phash.go             ~110  DCT perceptual hash (the real one)
+├── resilient_io.go      ~150  Concurrency-adaptive reads for flaky filesystems
+├── scan_diagnostics.go  ~75   Counts of what the scan could NOT do
 ├── hasher_pipeline.go   690   Parallel hash pipeline with file-size bucketing
 ├── parallel.go          168   Shared worker-pool helper used by hasher + grouper
-├── grouper.go           706   BK-Tree, Union-Find, duplicate grouping
+├── grouper.go           ~800  BK-Tree, Union-Find, cluster refinement, match modes
 ├── cache.go             186   Persistent hash cache for fast re-scans
 ├── thumb_cache.go       150   Persistent on-disk thumbnail cache (written during the scan)
 │
@@ -251,9 +254,9 @@ improvement plan.
 | File | Lines | Purpose |
 |---|---|---|
 | `scanner.go` | 385 | Filesystem walk; `supportedExtensions` |
-| `hasher.go` | 366 | Hash algorithms — xxHash (exact), dHash/pHash (perceptual) |
+| `hasher.go` | ~400 | xxHash (exact), dHash (perceptual), `grayGrid` downsampler |
 | `hasher_pipeline.go` | 690 | Parallel hash pipeline with file-size bucketing |
-| `grouper.go` | 706 | BK-Tree indexing + Union-Find duplicate grouping |
+| `grouper.go` | ~800 | BK-Tree, Union-Find, cluster refinement, threshold units |
 | `metadata.go` | 467 | EXIF-driven quality scoring |
 | `cache.go` | 186 | Persistent hash cache |
 | `thumb_cache.go` | 150 | Persistent on-disk thumbnail cache |
@@ -346,7 +349,8 @@ Progress bar appears below the input row during an active scan. Single-row heigh
 
 ### Zone C — Settings Pane (~260px, hidden by default)
 
-Toggled by the Settings button. Contains: algorithm selector (dHash/pHash/both), threshold,
+Toggled by the Settings button. Contains: algorithm selector (dHash/pHash/both — all three
+are now genuinely distinct, see §9), threshold (capped at 18%, see §9),
 extensions filter, min/max dimension inputs. Settings are read at scan start — no live-apply.
 
 CSS Grid column collapses to `0px` when hidden, expands to `260px` when open:
@@ -445,3 +449,93 @@ Light professional theme. Do not change values without a deliberate design decis
 10. **Avoid modifying business logic files** (`scanner.go`, `hasher.go`, `metadata.go`, `grouper.go`, `cache.go`) unless the change is explicitly scoped and described in an improvement plan.
 11. **Comment all Go code.** The owner is not a Go expert. Explain every non-obvious construct.
 12. **Test after every change.** Run `wails dev` (on Linux: `wails dev -tags webkit2_41`) from the directory holding `wails.json`, and verify in the native window.
+
+---
+
+## 9. Matching Invariants — Do Not Break These Again
+
+Each of these encodes a bug that shipped, was measured on the owner's real
+8,159-image library, and was fixed. The measurements are in `docs/`.
+
+### 9.1 The threshold slider is a PERCENTAGE; the grouper works in BITS
+
+`ScanRequest.Threshold` is 0-100 and means "percent of the hash width".
+`GroupDuplicates` takes a **Hamming distance in bits**. `hammingThresholdBits()`
+is the only place that converts, and it is called once, in `runScan`.
+
+Passing the percentage through unconverted is what produced the original
+1,730-image group: a slider reading "25%" requested a radius of 25 bits — 39% of
+a 64-bit hash, where two unrelated photos (32 bits apart on average) routinely
+link. Measured effect at that setting: **99.4% of a 6,596-image library in a
+single group.**
+
+The slider is capped at `maxThresholdPercent` (18% = 11 bits) because the giant
+component appears at 14 bits on real data.
+
+### 9.2 Downsample by AVERAGING, never by point sampling
+
+`grayGrid` averages every source pixel into its destination cell. The previous
+code read one pixel per cell — 72 pixels out of a 416x312 thumbnail, 0.055% of
+it — so noise and JPEG ringing landed straight in the hash.
+
+Measured over 386 real photos put through seven realistic edits, share of
+duplicates found at a 6-bit threshold: **64.3% before, 97.8% after.**
+
+Use a box average, not a resampling kernel. `draw.CatmullRom` scores about one
+point better and costs **4.6 ms per image against 244 µs** — its kernel support
+grows with the downscale ratio. Two details keep the box filter cheap: read the
+Y plane directly for `*image.YCbCr` (every image the scan hashes is one), and
+hoist the column-index division out of the pixel loop (1.39 ms -> 244 µs).
+
+### 9.3 Union-Find output is CANDIDATES, not results
+
+Similarity is transitive under Union-Find, so A~B and B~C group A with C even
+when they are unrelated. `refinePerceptualGroups` splits each candidate set into
+clusters whose members are all within threshold of a shared leader.
+
+Confidence comes from `MaxDist` — the group's **diameter**. Deriving it from the
+closest pair is what let a 1,730-image group report 100% confidence while 93.7%
+of its own internal pairs exceeded the threshold that built it.
+
+### 9.4 Both fingerprints are always computed; the algorithm applies at MATCH time
+
+Every file carries a `DHash` and a `PHash` from the same decode. The algorithm
+setting is interpreted by `matchMode` in the grouper, never by the hasher.
+
+This is not a style preference. When the setting was applied at hash time it was
+ignored on every path that mattered — the JPEG-thumbnail fast path and
+`computeDHashHEIC` both called `computeDHashFromImage` outright — so on a HEIC
+library **all three menu options produced byte-identical hashes**. `"both"` was
+not implemented at all; it fell through a `switch` default to dHash. And the
+cache stored one untagged hash, so switching settings silently reused the other
+algorithm's values.
+
+`"both"` means the two fingerprints must AGREE (the distance is the worse of the
+two). That is the only setting stronger than the others, because the two hashes
+fail differently.
+
+### 9.5 A failed read must never look like "no duplicates"
+
+`runAdaptiveIO` (`resilient_io.go`) runs at full concurrency, then falls back to
+serial reads if the filesystem rejects concurrent work. Anything still failing is
+reported through `scan_diagnostics.go`, never dropped.
+
+On the owner's GVFS/SMB mount, whole-file reads fail with EINVAL as soon as more
+than one is in flight — successes land at almost exactly files/workers. The old
+code swallowed those errors with a bare `return`, so **65 of 70 exact-duplicate
+candidates were discarded and byte-identical files were never reported at all.**
+Bounded reads (64 KB, 128 KB, 512 KB prefixes) are unaffected, which is why only
+the exact-match lane broke. Chunking, streaming and ReadAt windows do NOT fix it
+— only lowering concurrency does.
+
+`ScanStats.SkippedPerceptual` and `ScanStats.Unreadable` surface what the scan
+could not cover. Roughly 16-19% of a real HEIC library has no usable embedded
+thumbnail and is exact-matched only; the UI must keep saying so.
+
+### 9.6 Do not reintroduce aspect-ratio bucketing
+
+`aspectBucket` no longer partitions the BK-Tree. It was documented as cutting
+search scope by ~90%; measured on a real phone library, **99.1% of images landed
+in one bucket**, so it pruned nothing while making any crop that shifts the
+aspect ratio by >5% permanently unmatchable against its own original. The
+function survives only as a diagnostic in `ReportMismatch`.

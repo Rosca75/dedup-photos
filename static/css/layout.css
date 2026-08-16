@@ -163,6 +163,11 @@
   font-weight: var(--font-weight-semi);
   color: var(--primary);
 }
+/* Files the scan could not fully compare — surfaced rather than hidden. */
+.stat-value.stat-warn {
+  color: var(--warning);
+  cursor: help;
+}
 
 /* Batch action buttons */
 .batch-actions {

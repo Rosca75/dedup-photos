@@ -229,11 +229,23 @@ func runCollisionHashPhase(ctx context.Context, partialGroups map[uint64][]strin
 	dataSlice := make([][]byte, n)
 	dimSlice := make([][2]int, n)
 
-	runParallelIndexed(ctx, n, numWorkers, func(i int) {
-		path := needFull[i]
+	// Index lookup so the work function can write into the slices by position.
+	indexOf := make(map[string]int, n)
+	for i, p := range needFull {
+		indexOf[p] = i
+	}
+
+	// This read used to be a plain runParallelIndexed whose error path was a
+	// bare `return`, which meant a file that failed to read was indistinguishable
+	// from a file with no duplicates. On a GVFS/SMB mount that swallowed 65 of
+	// 70 candidates and exact-duplicate detection reported nothing at all.
+	// runAdaptiveIO keeps full concurrency where it works and falls back to
+	// serial reads where it does not — see resilient_io.go.
+	unreadable := runAdaptiveIO(ctx, needFull, numWorkers, "exact-hash full reads", func(path string) error {
+		i := indexOf[path]
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return
+			return err
 		}
 		hashSlice[i] = xxhash.Sum64(data)
 
@@ -244,19 +256,24 @@ func runCollisionHashPhase(ctx context.Context, partialGroups map[uint64][]strin
 		}
 		dataSlice[i] = data // Kept for Phase 3b dHash reuse.
 		dimSlice[i] = [2]int{w, ht}
+		return nil
 	})
+	if len(unreadable) > 0 {
+		recordUnreadable(unreadable)
+	}
 
 	fullHashes = make(map[string]uint64, n)
 	fullData = make(map[string][]byte, n)
 	dims = make(map[string][2]int, n)
 	for i, path := range needFull {
 		if dataSlice[i] == nil {
-			continue // Read failed.
+			continue // Genuinely unreadable — already counted above.
 		}
 		fullHashes[path] = hashSlice[i]
 		fullData[path] = dataSlice[i]
 		dims[path] = dimSlice[i]
 	}
+	fmt.Printf("[perf] Exact-hash phase: %d of %d candidates fully hashed\n", len(fullHashes), n)
 	return
 }
 
@@ -363,12 +380,17 @@ func printAndResetPhase3bSplit() {
 // Returns:
 //   - dHashes: path → dHash (omitted when 0 — skip perceptual matching).
 //   - dims:    path → [width, height] (omitted when 0×0 — unknown dimensions).
-func computePerceptualHashes(ctx context.Context, misses []string, fullData map[string][]byte, headerBytes map[string][]byte, numWorkers int, algorithm string, reportFn ProgressCallback, cachedCount int) (
+//
+// Both fingerprints are computed for every file; the algorithm setting is
+// applied by the grouper at match time, so this phase no longer takes one.
+func computePerceptualHashes(ctx context.Context, misses []string, fullData map[string][]byte, headerBytes map[string][]byte, numWorkers int, reportFn ProgressCallback, cachedCount int) (
 	dHashes map[string]uint64,
+	pHashes map[string]uint64,
 	dims map[string][2]int,
 ) {
 	n := len(misses)
 	hashSlice := make([]uint64, n)
+	pHashSlice := make([]uint64, n)
 	dimSlice := make([][2]int, n)
 
 	// Lock-free counters for visibility into the header-buffer reuse ratio.
@@ -387,7 +409,7 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 	runParallelIndexed(ctx, n, numWorkers,
 		func(i int) {
 			path := misses[i]
-			var dh uint64
+			var dh, ph uint64
 			var w, h int
 
 			// Perf tracing (Trace 2): bucket this file by decode path and time
@@ -403,21 +425,16 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 				if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 					w, h = cfg.Width, cfg.Height
 				}
-				switch algorithm {
-				case "phash":
-					dh, _ = computePHashFromData(data)
-				default:
-					dh, _ = computeDHashSmart(data)
-				}
+				dh, ph, _ = computeDHashSmart(data)
 			} else if header, ok := headerBytes[path]; ok {
 				// Reuse the 64 KB header read from runPartialHashPhase — no new I/O.
 				hitsHeaderBuf.Add(1)
-				dh, w, h, _ = computeDHashFromHeaderBuffer(path, header, algorithm)
+				dh, ph, w, h, _ = computeDHashFromHeaderBuffer(path, header)
 			} else {
 				// Singleton-by-size (never opened before) or retention-capped:
 				// header-only path reads ~128 KB for EXIF thumbnail + dimensions.
 				reopenCount.Add(1)
-				dh, w, h, _ = computeDHashFromHeader(path, algorithm)
+				dh, ph, w, h, _ = computeDHashFromHeader(path)
 			}
 			// Accumulate the summed fingerprint time across all workers.
 			phase3bFingerprintNs.Add(int64(time.Since(fpStart)))
@@ -434,6 +451,7 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 			}
 
 			hashSlice[i] = dh
+			pHashSlice[i] = ph
 			dimSlice[i] = [2]int{w, h}
 
 			// Tick the UI. Every 25 files rather than every file: at ~40 files a
@@ -449,15 +467,25 @@ func computePerceptualHashes(ctx context.Context, misses []string, fullData map[
 		})
 
 	dHashes = make(map[string]uint64, n)
+	pHashes = make(map[string]uint64, n)
 	dims = make(map[string][2]int, n)
+	noHash := 0
 	for i, path := range misses {
 		if hashSlice[i] != 0 {
 			dHashes[path] = hashSlice[i]
+			pHashes[path] = pHashSlice[i]
+		} else {
+			// dHash = 0 means this file will be skipped for perceptual matching
+			// entirely. It is still exact-matched, but the user needs to know
+			// the comparison did not cover it — on a real 8,159-image library
+			// this was 19.2% of the files.
+			noHash++
 		}
 		if dimSlice[i][0] > 0 && dimSlice[i][1] > 0 {
 			dims[path] = dimSlice[i]
 		}
 	}
+	recordNoPerceptualHash(noHash)
 	fmt.Printf("[perf] dHash reuse:       fullData=%d headerBuf=%d reopen=%d\n",
 		hitsFullData.Load(), hitsHeaderBuf.Load(), reopenCount.Load())
 	return
@@ -530,10 +558,10 @@ func presplitByCache(paths []string, fileInfo map[string]os.FileInfo, cache *Has
 		if !ok {
 			continue // File disappeared between stat and hash phase.
 		}
-		xxh, dh, w, h, hit := cache.LookupAll(path, info)
+		xxh, dh, ph, w, h, hit := cache.LookupAll(path, info)
 		if hit {
 			hits = append(hits, ImageHash{
-				Path: path, XXHash: xxh, DHash: dh,
+				Path: path, XXHash: xxh, DHash: dh, PHash: ph,
 				Width: w, Height: h, Size: info.Size(),
 			})
 		} else {
@@ -545,7 +573,7 @@ func presplitByCache(paths []string, fileInfo map[string]os.FileInfo, cache *Has
 
 // buildFinalResults assembles the final []ImageHash in input-path order,
 // merging cache hits with the newly computed hashes and dimensions.
-func buildFinalResults(paths []string, hits []ImageHash, xxHashes, dHashes map[string]uint64, dims map[string][2]int, fileInfo map[string]os.FileInfo) []ImageHash {
+func buildFinalResults(paths []string, hits []ImageHash, xxHashes, dHashes, pHashes map[string]uint64, dims map[string][2]int, fileInfo map[string]os.FileInfo) []ImageHash {
 	hitSet := make(map[string]ImageHash, len(hits))
 	for _, h := range hits {
 		hitSet[h.Path] = h
@@ -565,6 +593,7 @@ func buildFinalResults(paths []string, hits []ImageHash, xxHashes, dHashes map[s
 		// The grouper skips XXHash=0 in Pass 1 (no exact-dup grouping).
 		result.XXHash = xxHashes[path]
 		result.DHash = dHashes[path]
+		result.PHash = pHashes[path]
 		if d, ok := dims[path]; ok {
 			result.Width = d[0]
 			result.Height = d[1]
@@ -589,7 +618,7 @@ func saveUpdatedCache(cache *HashCache, results []ImageHash, fileInfo map[string
 		if !ok {
 			continue
 		}
-		cache.StoreAll(r.Path, info, r.XXHash, r.DHash, r.Width, r.Height)
+		cache.StoreAll(r.Path, info, r.XXHash, r.DHash, r.PHash, r.Width, r.Height)
 	}
 	if err := SaveCache(cache, scanPaths[0]); err != nil {
 		fmt.Printf("[hasher] Warning: failed to save cache: %v\n", err)
@@ -602,8 +631,8 @@ func saveUpdatedCache(cache *HashCache, results []ImageHash, fileInfo map[string
 
 // HashAllImagesWithContext hashes all images using the split pipeline.
 // Convenience wrapper around HashAllImagesWithProgress with no progress callback.
-func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int, algorithm string) []ImageHash {
-	return HashAllImagesWithProgress(ctx, paths, numWorkers, algorithm, nil, nil)
+func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers int) []ImageHash {
+	return HashAllImagesWithProgress(ctx, paths, numWorkers, nil, nil)
 }
 
 // HashAllImagesWithProgress is the main entry point for the hash pipeline.
@@ -611,7 +640,10 @@ func HashAllImagesWithContext(ctx context.Context, paths []string, numWorkers in
 //
 // The function is called from app.go's runScan goroutine. The progressFn
 // callback keeps the UI's progress bar updated throughout the scan.
-func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers int, algorithm string, progressFn ProgressCallback, scanPaths []string) []ImageHash {
+// The algorithm setting is deliberately absent: every file gets both a dHash
+// and a pHash, and the choice between them is made by the grouper at match
+// time. That keeps the cache valid across settings.
+func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers int, progressFn ProgressCallback, scanPaths []string) []ImageHash {
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
 	}
@@ -625,7 +657,7 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 			progressFn(phase, cur, tot)
 		}
 	}
-	fmt.Printf("[hasher] Optimised pipeline: %d images, %d workers, alg=%s\n", total, numWorkers, algorithm)
+	fmt.Printf("[hasher] Optimised pipeline: %d images, %d workers (dHash + pHash per file)\n", total, numWorkers)
 
 	// Phase 1: Load + merge persistent caches.
 	t0 := time.Now()
@@ -660,7 +692,7 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 
 	// Phase 3b: Perceptual hash for all cache misses (EXIF thumbnail fast-path).
 	t0 = time.Now()
-	dHashes, percDims := computePerceptualHashes(ctx, misses, fullData, headerBytes, numWorkers, algorithm, progressFn, len(hits))
+	dHashes, pHashes, percDims := computePerceptualHashes(ctx, misses, fullData, headerBytes, numWorkers, progressFn, len(hits))
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -677,7 +709,7 @@ func HashAllImagesWithProgress(ctx context.Context, paths []string, numWorkers i
 	}
 
 	// Assemble the final results slice.
-	allResults := buildFinalResults(paths, hits, xxHashes, dHashes, exactDims, fileInfo)
+	allResults := buildFinalResults(paths, hits, xxHashes, dHashes, pHashes, exactDims, fileInfo)
 
 	// Phase 4: Persist updated cache (now includes Width/Height per entry).
 	t0 = time.Now()

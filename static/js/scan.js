@@ -5,6 +5,13 @@ import { apiScan, apiResults, apiProgress, apiCancel, clearThumbnailCache } from
 import { showToast } from './components.js';
 import { renderResults, toggleAllGroups } from './table.js';
 
+/**
+ * Width of the perceptual hash in bits — mirrors perceptualHashBits in
+ * grouper.go. Only used to show the slider's percentage as a bit count; the
+ * backend does the real conversion.
+ */
+const HASH_BITS = 64;
+
 /** Wire up scan, cancel, refresh button event listeners. */
 export function initScan() {
   document.getElementById('scan-btn').addEventListener('click', startScan);
@@ -13,10 +20,19 @@ export function initScan() {
   document.getElementById('collapse-all-btn').addEventListener('click', toggleAllGroups);
 
   // Threshold slider: update value label in real time.
+  // The label shows the percentage AND the Hamming distance it resolves to,
+  // because the two were silently confused before: the slider read "25%" while
+  // the grouper received a radius of 25 bits, which is 39% of a 64-bit hash.
   const slider = document.getElementById('scan-threshold');
   const label = document.getElementById('threshold-value');
   if (slider && label) {
-    slider.addEventListener('input', () => { label.textContent = slider.value + '%'; });
+    const render = () => {
+      const pct = parseInt(slider.value, 10) || 0;
+      const bits = Math.floor(pct * HASH_BITS / 100);
+      label.textContent = `${pct}% · ${bits} bit${bits === 1 ? '' : 's'}`;
+    };
+    slider.addEventListener('input', render);
+    render();
   }
 }
 

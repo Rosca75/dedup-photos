@@ -66,6 +66,28 @@ function updateStatsBar(stats) {
   document.getElementById('stat-groups').textContent = (stats.duplicate_groups || 0).toLocaleString();
   document.getElementById('stat-savings').textContent = formatBytes(stats.wasted_bytes || 0);
   document.getElementById('stat-duration').textContent = formatDuration(stats.duration_ms);
+
+  // Files the scan could not fully compare. Without this, a file that was never
+  // perceptually compared looks identical to one that simply had no duplicates.
+  const skipped = (stats.skipped_perceptual || 0) + (stats.unreadable || 0);
+  const wrap = document.getElementById('stat-skipped-wrap');
+  const value = document.getElementById('stat-skipped');
+  if (wrap && value) {
+    if (skipped > 0) {
+      value.textContent = skipped.toLocaleString();
+      const parts = [];
+      if (stats.skipped_perceptual) {
+        parts.push(`${stats.skipped_perceptual.toLocaleString()} with no perceptual fingerprint (exact matches only)`);
+      }
+      if (stats.unreadable) {
+        parts.push(`${stats.unreadable.toLocaleString()} that could not be read`);
+      }
+      wrap.title = `Not compared for visual similarity: ${parts.join('; ')}.`;
+      wrap.style.display = '';
+    } else {
+      wrap.style.display = 'none';
+    }
+  }
 }
 
 /** Show the empty state message. */
